@@ -1,0 +1,11 @@
+{
+  "name": "@tintin/pi-extensions",
+  "version": "0.1.0",
+  "description": "pi extensions for the TinTin setup: AI quota status (ai-cost MCP) + web search (Tavily/Exa/DuckDuckGo fallback)",
+  "keywords": ["pi-package"],
+  "license": "UNLICENSED",
+  "private": true,
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}
