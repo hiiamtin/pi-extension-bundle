@@ -178,43 +178,48 @@ export default function extToggleExtension(pi: ExtensionAPI): void {
           .map((i) => ({ ...i, enabled: pending.get(i.key) ?? i.enabled }))
           .filter((i) => !filter || i.name.toLowerCase().includes(filter.toLowerCase()));
 
-        const options: string[] = [EXT_HEADER];
-        for (const i of effective.filter((i) => i.kind === "extension")) options.push(`${i.enabled ? "✓" : "✗"} ${i.name}`);
-        options.push(SKILL_HEADER);
-        for (const i of effective.filter((i) => i.kind === "skill")) options.push(`${i.enabled ? "✓" : "✗"} ${i.name}`);
-        if (filter) options.push(CLEAR_OPTION);
-        options.push(SEARCH_OPTION);
-        if (dirty()) options.push(`${SAVE_OPTION} (${pending.size})`);
-        options.push(DONE_OPTION);
+        // options and map stay index-aligned: headers are null, actions are {action}
+        type Pickable = ToggleItem | { action: "search" | "clear" | "save" };
+        const options: string[] = [];
+        const map: Array<Pickable | null> = [];
+        const push = (option: string, pickable: Pickable | null = null) => { options.push(option); map.push(pickable); };
+        push(EXT_HEADER);
+        for (const i of effective.filter((i) => i.kind === "extension")) push(`${i.enabled ? "✓" : "✗"} ${i.name}`, i);
+        push(SKILL_HEADER);
+        for (const i of effective.filter((i) => i.kind === "skill")) push(`${i.enabled ? "✓" : "✗"} ${i.name}`, i);
+        if (filter) push(CLEAR_OPTION, { action: "clear" });
+        push(SEARCH_OPTION, { action: "search" });
+        if (dirty()) push(`${SAVE_OPTION} (${pending.size})`, { action: "save" });
+        push(DONE_OPTION);
 
         const title = `Toggle extensions/skills${filter ? ` — filter: "${filter}"` : ""}${dirty() ? ` — ${pending.size} unsaved` : ""}`;
         const choice = await ctx.ui.select(title, options);
         if (!choice || choice === DONE_OPTION) break;
 
-        if (choice === EXT_HEADER || choice === SKILL_HEADER) continue;
-        if (choice === SEARCH_OPTION) {
-          const q = await ctx.ui.input?.("Filter by name (empty = show all)", filter);
-          filter = (q ?? "").trim();
+        const picked = map[options.indexOf(choice)];
+        if (!picked) continue; // section header
+        if ("action" in picked) {
+          if (picked.action === "search") {
+            const q = await ctx.ui.input?.("Filter by name (empty = show all)", filter);
+            filter = (q ?? "").trim();
+          } else if (picked.action === "clear") {
+            filter = "";
+          } else {
+            applyPending(pending);
+            ctx.ui.notify(`${pending.size} change(s) saved — reloading…`, "info");
+            await ctx.reload();
+            return;
+          }
           continue;
         }
-        if (choice === CLEAR_OPTION) {
-          filter = "";
-          continue;
-        }
-        if (choice.startsWith(SAVE_OPTION)) {
-          applyPending(pending);
-          ctx.ui.notify(`${pending.size} change(s) saved — reloading…`, "info");
-          await ctx.reload();
-          return;
-        }
-
-        const picked = effective[options.indexOf(choice)];
-        if (!picked) continue;
         if (picked.name === SELF_NAME) {
           ctx.ui.notify("cannot disable /ext itself (it is the toggle UI)", "warning");
           continue;
         }
-        pending.set(picked.key, !(pending.get(picked.key) ?? picked.enabled));
+        const next = !picked.enabled;
+        // toggling back to the on-disk value cancels the pending change
+        if (next === (items.find((i) => i.key === picked.key)?.enabled ?? picked.enabled)) pending.delete(picked.key);
+        else pending.set(picked.key, next);
       }
 
       if (dirty()) {
