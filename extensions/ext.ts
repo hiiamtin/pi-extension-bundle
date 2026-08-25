@@ -17,7 +17,10 @@ type Ui = { notify: (msg: string, level: string) => void; select?: (title: strin
 type PackageEntry = string | { source: string; extensions?: string[] };
 
 const SETTINGS_FILE = () => path.join(os.homedir(), ".pi/agent/settings.json");
-const SKILLS_DIR = () => path.join(os.homedir(), ".pi/agent/skills");
+// pi's user-level skills root is the cross-agent convention dir ~/.agents/skills
+// (NOT ~/.pi/agent/skills). Settings overrides use "-skills/<name>/SKILL.md"
+// relative to that root.
+const SKILLS_DIR = () => path.join(os.homedir(), ".agents", "skills");
 const DONE_OPTION = "── done ──";
 
 type ToggleItem = { key: string; name: string; kind: "extension" | "skill"; enabled: boolean };
