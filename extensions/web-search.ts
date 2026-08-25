@@ -11,8 +11,9 @@
 // (synced from Infisical by `task pi-web-search-keys`; hand-edit works too)
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { extractToolArgs, requireString, textResult } from "./tool-compat.ts";
 import { Type } from "typebox";
-import { readFileSync, appendFileSync } from "node:fs";
+import { readFileSync, appendFileSync, statSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -29,9 +30,24 @@ type Ui = { notify: (msg: string, level: string) => void };
 const DEBUG_LOG = path.join(os.homedir(), ".pi/agent/web-search-debug.log");
 
 // Append a timestamped line to ~/.pi/agent/web-search-debug.log (best-effort).
+// Self-capping: file is truncated to its last DEBUG_TAIL bytes once it exceeds
+// DEBUG_MAX, so it can never grow unbounded.
+const DEBUG_MAX = 128 * 1024;
+const DEBUG_TAIL = 32 * 1024;
+
 function dbg(msg: string): void {
   try {
-    appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
+    if (!DEBUG_LOG.endsWith("debug.log")) return; // sanity guard
+    let line = `[${new Date().toISOString()}] ${msg}\n`;
+    try {
+      if (statSync(DEBUG_LOG).size + line.length > DEBUG_MAX) {
+        const tail = readFileSync(DEBUG_LOG).slice(-DEBUG_TAIL);
+        line = `[…truncated…]\n${tail}${line}`;
+        writeFileSync(DEBUG_LOG, line);
+        return;
+      }
+    } catch { /* first write */ }
+    appendFileSync(DEBUG_LOG, line);
   } catch {
     /* never break search over logging */
   }
@@ -179,29 +195,19 @@ export default function webSearchExtension(pi: ExtensionAPI): void {
       query: Type.String({ description: "Search query" }),
       numResults: Type.Optional(Type.Number({ description: `Number of results (default ${DEFAULT_RESULTS}, max 10)`, minimum: 1, maximum: 10 })),
     }),
-    // pi ≥0.84 calls execute(toolCallId, params, signal, onUpdate, context);
-    // older builds called execute(params). Support both for compatibility.
+    // Uses extractToolArgs(): compatible with pi <0.84 execute(params) and
+    // pi >=0.84 execute(toolCallId, params, ...). See tool-compat.ts.
     async execute(...cbArgs) {
-      const args = typeof cbArgs[0] === "string" ? cbArgs[1] : cbArgs[0];
-      const query = String((args as { query?: unknown })?.query ?? "").trim();
-      if (!query) {
-        return {
-          content: [{ type: "text" as const, text: "web_search error: missing required parameter 'query'" }],
-          details: {},
-        };
-      }
-      const numResults = Math.min(10, Math.max(1, Math.round(Number((args as { numResults?: unknown })?.numResults) || DEFAULT_RESULTS)));
+      const args = extractToolArgs(cbArgs);
+      const missing = requireString(args, "query");
+      if (missing) return textResult(`web_search ${missing.errorText}`);
+      const query = (args.query as string).trim();
+      const numResults = Math.min(10, Math.max(1, Math.round(Number(args.numResults) || DEFAULT_RESULTS)));
       const { provider, results, errors } = await webSearch(query, numResults);
       if (results.length === 0) {
-        return {
-          content: [{ type: "text" as const, text: `web_search failed for all providers: ${errors.join("; ")}` }],
-          details: {},
-        };
+        return textResult(`web_search failed for all providers: ${errors.join("; ")}`);
       }
-      return {
-        content: [{ type: "text" as const, text: formatResults(query, provider, results) }],
-        details: {},
-      };
+      return textResult(formatResults(query, provider, results));
     },
   });
 
