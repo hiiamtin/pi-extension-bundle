@@ -1,19 +1,24 @@
-// pi extension: /ext — toggle sibling extensions AND local skills on/off
+// pi extension: /ext — toggle sibling extensions AND local skills
 // (pi config compatible — edits the same settings.json structures:
 //   extensions → packages[] object form with "-extensions/<name>.ts"
 //   skills     → top-level skills[] with "-skills/<name>/SKILL.md")
 //
-// Bare /ext opens an interactive picker (works in TUI and pi-web): pick an
-// entry to toggle it; settings are saved per pick and ONE reload runs when
-// the picker closes (reload tears down the running runtime, so it must be
-// the last step). /ext <name> on|off stays for fast/scripted use.
+// Bare /ext opens a grouped picker (works in TUI and pi-web): pick entries to
+// toggle them as PENDING changes, "💾 Save & reload" applies + reloads once,
+// and closing with pending changes asks save/discard. /ext <name> on|off stays
+// for direct toggling. ext.ts cannot disable itself.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-type Ui = { notify: (msg: string, level: string) => void; select?: (title: string, options: string[]) => Promise<string | undefined> };
+type Ui = {
+  notify: (msg: string, level: string) => void;
+  select?: (title: string, options: string[]) => Promise<string | undefined>;
+  input?: (title: string, placeholder?: string) => Promise<string | undefined>;
+  confirm?: (title: string, message: string) => Promise<boolean>;
+};
 type PackageEntry = string | { source: string; extensions?: string[] };
 
 const SETTINGS_FILE = () => path.join(os.homedir(), ".pi/agent/settings.json");
@@ -21,7 +26,13 @@ const SETTINGS_FILE = () => path.join(os.homedir(), ".pi/agent/settings.json");
 // (NOT ~/.pi/agent/skills). Settings overrides use "-skills/<name>/SKILL.md"
 // relative to that root.
 const SKILLS_DIR = () => path.join(os.homedir(), ".agents", "skills");
+const SELF_NAME = "ext";
 const DONE_OPTION = "── done ──";
+const SAVE_OPTION = "💾 Save & reload";
+const SEARCH_OPTION = "🔍 Search…";
+const CLEAR_OPTION = "✏️ Clear filter";
+const EXT_HEADER = "── Extensions ──";
+const SKILL_HEADER = "── Skills ──";
 
 type ToggleItem = { key: string; name: string; kind: "extension" | "skill"; enabled: boolean };
 
@@ -104,6 +115,18 @@ function collectItems(packages: PackageEntry[], skills: string[]): { root: strin
   return { root, items };
 }
 
+function applyPending(pending: Map<string, boolean>): void {
+  const settings = readSettings();
+  const root = findOwnPackageRoot(settings.packages);
+  if (!root) throw new Error("cannot locate own package root in settings.json");
+  for (const [key, enabled] of pending) {
+    const [kind, name] = key.split(":") as ["extension" | "skill", string];
+    if (kind === "extension") setExtension(settings.packages, root, name, enabled);
+    else setSkill(settings.skills, name, enabled);
+  }
+  writeSettings(settings);
+}
+
 export default function extToggleExtension(pi: ExtensionAPI): void {
   pi.registerCommand("ext", {
     description: "Enable/disable extensions and skills (same store as pi config). /ext opens a picker; /ext <name> on|off for direct toggle",
@@ -112,6 +135,10 @@ export default function extToggleExtension(pi: ExtensionAPI): void {
 
       // direct toggle path
       if (name) {
+        if (name === SELF_NAME) {
+          ctx.ui.notify("cannot disable /ext itself (it is the toggle UI)", "error");
+          return;
+        }
         const { packages, skills } = readSettings();
         const { root, items } = collectItems(packages, skills);
         const item = items.find((i) => i.name === name);
@@ -141,33 +168,64 @@ export default function extToggleExtension(pi: ExtensionAPI): void {
         return;
       }
       const pending = new Map<string, boolean>();
-      let changed = false;
+      let filter = "";
+      let dirty = () => pending.size > 0;
+
       for (;;) {
         const { packages, skills } = readSettings();
         const { items } = collectItems(packages, skills);
-        const effective = items.map((i) => ({ ...i, enabled: pending.get(i.key) ?? i.enabled }));
-        const options = effective.map((i) => `${i.enabled ? "✓" : "✗"} ${i.name}  (${i.kind})`);
-        options.push(DONE_OPTION);
-        const choice = await ctx.ui.select("Toggle — pick to switch, done to apply", options);
-        if (!choice || choice === DONE_OPTION) break;
-        const item = effective[options.indexOf(choice)];
-        const next = !item.enabled;
-        pending.set(item.key, next);
+        const effective = items
+          .map((i) => ({ ...i, enabled: pending.get(i.key) ?? i.enabled }))
+          .filter((i) => !filter || i.name.toLowerCase().includes(filter.toLowerCase()));
 
-        const fresh = readSettings();
-        if (item.kind === "extension") {
-          const root = findOwnPackageRoot(fresh.packages);
-          if (!root) throw new Error("cannot locate own package root in settings.json");
-          setExtension(fresh.packages, root, item.name, next);
-        } else {
-          setSkill(fresh.skills, item.name, next);
+        const options: string[] = [EXT_HEADER];
+        for (const i of effective.filter((i) => i.kind === "extension")) options.push(`${i.enabled ? "✓" : "✗"} ${i.name}`);
+        options.push(SKILL_HEADER);
+        for (const i of effective.filter((i) => i.kind === "skill")) options.push(`${i.enabled ? "✓" : "✗"} ${i.name}`);
+        if (filter) options.push(CLEAR_OPTION);
+        options.push(SEARCH_OPTION);
+        if (dirty()) options.push(`${SAVE_OPTION} (${pending.size})`);
+        options.push(DONE_OPTION);
+
+        const title = `Toggle extensions/skills${filter ? ` — filter: "${filter}"` : ""}${dirty() ? ` — ${pending.size} unsaved` : ""}`;
+        const choice = await ctx.ui.select(title, options);
+        if (!choice || choice === DONE_OPTION) break;
+
+        if (choice === EXT_HEADER || choice === SKILL_HEADER) continue;
+        if (choice === SEARCH_OPTION) {
+          const q = await ctx.ui.input?.("Filter by name (empty = show all)", filter);
+          filter = (q ?? "").trim();
+          continue;
         }
-        writeSettings(fresh);
-        changed = true;
+        if (choice === CLEAR_OPTION) {
+          filter = "";
+          continue;
+        }
+        if (choice.startsWith(SAVE_OPTION)) {
+          applyPending(pending);
+          ctx.ui.notify(`${pending.size} change(s) saved — reloading…`, "info");
+          await ctx.reload();
+          return;
+        }
+
+        const picked = effective[options.indexOf(choice)];
+        if (!picked) continue;
+        if (picked.name === SELF_NAME) {
+          ctx.ui.notify("cannot disable /ext itself (it is the toggle UI)", "warning");
+          continue;
+        }
+        pending.set(picked.key, !(pending.get(picked.key) ?? picked.enabled));
       }
-      if (changed) {
-        ctx.ui.notify("changes saved — reloading…", "info");
-        await ctx.reload();
+
+      if (dirty()) {
+        const save = await ctx.ui.confirm?.("Unsaved changes", `${pending.size} toggle(s) not saved — save & reload now?`);
+        if (save) {
+          applyPending(pending);
+          ctx.ui.notify(`${pending.size} change(s) saved — reloading…`, "info");
+          await ctx.reload();
+          return;
+        }
+        ctx.ui.notify("discarded (settings unchanged)", "info");
       }
     },
   });
