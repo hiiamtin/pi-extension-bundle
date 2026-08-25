@@ -27,7 +27,6 @@ const SETTINGS_FILE = () => path.join(os.homedir(), ".pi/agent/settings.json");
 // relative to that root.
 const SKILLS_DIR = () => path.join(os.homedir(), ".agents", "skills");
 const SELF_NAME = "ext";
-const DONE_OPTION = "── done ──";
 const SAVE_OPTION = "💾 Save & reload";
 const SEARCH_OPTION = "🔍 Search…";
 const CLEAR_OPTION = "✏️ Clear filter";
@@ -190,11 +189,10 @@ export default function extToggleExtension(pi: ExtensionAPI): void {
         if (filter) push(CLEAR_OPTION, { action: "clear" });
         push(SEARCH_OPTION, { action: "search" });
         if (dirty()) push(`${SAVE_OPTION} (${pending.size})`, { action: "save" });
-        push(DONE_OPTION);
 
         const title = `Toggle extensions/skills${filter ? ` — filter: "${filter}"` : ""}${dirty() ? ` — ${pending.size} unsaved` : ""}`;
         const choice = await ctx.ui.select(title, options);
-        if (!choice || choice === DONE_OPTION) break;
+        if (!choice) break;
 
         const picked = map[options.indexOf(choice)];
         if (!picked) continue; // section header
