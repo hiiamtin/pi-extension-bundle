@@ -27,7 +27,8 @@ type SearchConfig = { tavilyApiKey?: string; exaApiKey?: string };
 
 type Ui = { notify: (msg: string, level: string) => void };
 
-const DEBUG_LOG = path.join(os.homedir(), ".pi/agent/web-search-debug.log");
+const DEBUG_LOG = process.env.PI_WEBSEARCH_DEBUG_LOG
+  || path.join(os.homedir(), ".pi/agent/web-search-debug.log");
 
 // Append a timestamped line to ~/.pi/agent/web-search-debug.log (best-effort).
 // Self-capping: file is truncated to its last DEBUG_TAIL bytes once it exceeds
