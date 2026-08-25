@@ -179,9 +179,19 @@ export default function webSearchExtension(pi: ExtensionAPI): void {
       query: Type.String({ description: "Search query" }),
       numResults: Type.Optional(Type.Number({ description: `Number of results (default ${DEFAULT_RESULTS}, max 10)`, minimum: 1, maximum: 10 })),
     }),
-    async execute(args: { query: string; numResults?: number }) {
-      const numResults = Math.min(10, Math.max(1, Math.round(args.numResults ?? DEFAULT_RESULTS)));
-      const { provider, results, errors } = await webSearch(args.query, numResults);
+    // pi ≥0.84 calls execute(toolCallId, params, signal, onUpdate, context);
+    // older builds called execute(params). Support both for compatibility.
+    async execute(...cbArgs) {
+      const args = typeof cbArgs[0] === "string" ? cbArgs[1] : cbArgs[0];
+      const query = String((args as { query?: unknown })?.query ?? "").trim();
+      if (!query) {
+        return {
+          content: [{ type: "text" as const, text: "web_search error: missing required parameter 'query'" }],
+          details: {},
+        };
+      }
+      const numResults = Math.min(10, Math.max(1, Math.round(Number((args as { numResults?: unknown })?.numResults) || DEFAULT_RESULTS)));
+      const { provider, results, errors } = await webSearch(query, numResults);
       if (results.length === 0) {
         return {
           content: [{ type: "text" as const, text: `web_search failed for all providers: ${errors.join("; ")}` }],
@@ -189,7 +199,7 @@ export default function webSearchExtension(pi: ExtensionAPI): void {
         };
       }
       return {
-        content: [{ type: "text" as const, text: formatResults(args.query, provider, results) }],
+        content: [{ type: "text" as const, text: formatResults(query, provider, results) }],
         details: {},
       };
     },
