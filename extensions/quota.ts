@@ -48,6 +48,8 @@ type Ui = {
   setStatus?: (key: string, text: string) => void;
   setWidget?: (key: string, lines: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }) => void;
   notify: (msg: string, level: string) => void;
+  select?: (title: string, options: string[]) => Promise<string | undefined>;
+  confirm?: (title: string, message: string) => Promise<boolean>;
 };
 
 const DEFAULT_SETTINGS: Settings = { statusMode: "all", toolsEnabled: false };
@@ -303,11 +305,82 @@ export default function quotaExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("quota", {
-    description: "AI provider quotas (ai-cost). /quota [refresh|tools on|off|status all|current|off]",
+    description: "AI provider quotas (ai-cost). /quota [setting|refresh|tools on|off|status all|current|off]",
     handler: async (args: string, ctx: { ui: Ui }) => {
-      ui = ctx.ui;
-      const [sub, value] = args.trim().split(/\s+/).filter(Boolean);
-      if (sub === "refresh") {
+       ui = ctx.ui;
+       const [sub, value] = args.trim().split(/\s+/).filter(Boolean);
+       if (sub === "setting") {
+         if (!ctx.ui.select) {
+           ctx.ui.notify("interactive settings picker unavailable in this mode — use /quota tools or /quota status", "error");
+           return;
+         }
+
+         type PendingSetting = { key: "statusMode"; value: Settings["statusMode"] } | { key: "toolsEnabled"; value: boolean };
+         type Pickable = PendingSetting | { key: "save" };
+         const pending = new Map<PendingSetting["key"], PendingSetting["value"]>();
+         const isDirty = () => pending.size > 0;
+         const onDiskValue = (key: PendingSetting["key"]): PendingSetting["value"] => settings[key];
+
+         for (;;) {
+           const statusMode = pending.get("statusMode") ?? settings.statusMode;
+           const toolsEnabled = pending.get("toolsEnabled") ?? settings.toolsEnabled;
+           const options: string[] = [];
+           const map: Pickable[] = [];
+           const add = (label: string, picked: Pickable) => { options.push(label); map.push(picked); };
+           add(`${statusMode === "all" ? "✓" : "○"} statusMode: all`, { key: "statusMode", value: "all" });
+           add(`${statusMode === "current" ? "✓" : "○"} statusMode: current`, { key: "statusMode", value: "current" });
+           add(`${statusMode === "off" ? "✓" : "○"} statusMode: off`, { key: "statusMode", value: "off" });
+           add(`${toolsEnabled ? "✓" : "○"} toolsEnabled: on`, { key: "toolsEnabled", value: true });
+           add(`${toolsEnabled ? "○" : "✓"} toolsEnabled: off`, { key: "toolsEnabled", value: false });
+           if (isDirty()) add(`💾 Save (${pending.size} change(s))`, { key: "save" });
+
+           const choice = await ctx.ui.select(`Quota settings${isDirty() ? ` — ${pending.size} unsaved` : ""}`, options);
+           if (!choice) break;
+           const picked = map[options.indexOf(choice)];
+           if (!picked) continue;
+           if (picked.key === "save") {
+             const nextStatusMode = pending.get("statusMode");
+             const nextToolsEnabled = pending.get("toolsEnabled");
+             if (nextStatusMode !== undefined) settings.statusMode = nextStatusMode;
+             if (nextToolsEnabled !== undefined) settings.toolsEnabled = nextToolsEnabled;
+             save();
+             applyToolsEnabled();
+             if (settings.statusMode === "off") ctx.ui.setStatus?.("quota", "");
+             else await refreshStatus();
+             const count = pending.size;
+             pending.clear();
+             ctx.ui.notify(`${count} quota setting change(s) saved`, "info");
+             return;
+           }
+           if (picked.value === onDiskValue(picked.key)) pending.delete(picked.key);
+           else pending.set(picked.key, picked.value);
+         }
+
+         if (isDirty()) {
+           if (!ctx.ui.confirm) {
+             ctx.ui.notify("settings picker confirmation unavailable — discarded (settings unchanged)", "info");
+             return;
+           }
+           const shouldSave = await ctx.ui.confirm("Unsaved quota settings", `${pending.size} change(s) not saved — save now?`);
+           if (shouldSave) {
+             const nextStatusMode = pending.get("statusMode");
+             const nextToolsEnabled = pending.get("toolsEnabled");
+             if (nextStatusMode !== undefined) settings.statusMode = nextStatusMode;
+             if (nextToolsEnabled !== undefined) settings.toolsEnabled = nextToolsEnabled;
+             save();
+             applyToolsEnabled();
+             if (settings.statusMode === "off") ctx.ui.setStatus?.("quota", "");
+             else await refreshStatus();
+             const count = pending.size;
+             pending.clear();
+             ctx.ui.notify(`${count} quota setting change(s) saved`, "info");
+           } else {
+             ctx.ui.notify("discarded (settings unchanged)", "info");
+           }
+         }
+         return;
+       }
+       if (sub === "refresh") {
         cached = null;
         const res = await getQuota(true);
         showQuotaWidget(ctx.ui, res);
