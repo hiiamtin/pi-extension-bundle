@@ -12,7 +12,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { readFileSync } from "node:fs";
+import { readFileSync, appendFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -25,6 +25,17 @@ type SearchResult = { title: string; url: string; snippet: string };
 type SearchConfig = { tavilyApiKey?: string; exaApiKey?: string };
 
 type Ui = { notify: (msg: string, level: string) => void };
+
+const DEBUG_LOG = path.join(os.homedir(), ".pi/agent/web-search-debug.log");
+
+// Append a timestamped line to ~/.pi/agent/web-search-debug.log (best-effort).
+function dbg(msg: string): void {
+  try {
+    appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch {
+    /* never break search over logging */
+  }
+}
 
 function loadConfig(): SearchConfig {
   try {
@@ -49,13 +60,19 @@ function dedupe(results: SearchResult[]): SearchResult[] {
 }
 
 async function searchTavily(query: string, numResults: number, key: string): Promise<SearchResult[]> {
+  dbg(`tavily: query=${JSON.stringify(query)} numResults=${numResults} key=${key.slice(0, 12)}…`);
   const res = await fetch("https://api.tavily.com/search", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ api_key: key, query, max_results: numResults }),
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`tavily HTTP ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "<unreadable>");
+    dbg(`tavily: HTTP ${res.status} body=${body.slice(0, 500)}`);
+    throw new Error(`tavily HTTP ${res.status}: ${body.slice(0, 200)}`);
+  }
+  dbg("tavily: OK");
   const data = (await res.json()) as { results?: Array<{ title?: string; url?: string; content?: string }> };
   const out = (data.results ?? []).map((r) => ({
     title: r.title ?? "",
@@ -67,13 +84,19 @@ async function searchTavily(query: string, numResults: number, key: string): Pro
 }
 
 async function searchExa(query: string, numResults: number, key: string): Promise<SearchResult[]> {
+  dbg(`exa: query=${JSON.stringify(query)} numResults=${numResults} key=${key.slice(0, 8)}…`);
   const res = await fetch("https://api.exa.ai/search", {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": key },
     body: JSON.stringify({ query, numResults, contents: { text: { maxCharacters: SNIPPET_MAX } } }),
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`exa HTTP ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "<unreadable>");
+    dbg(`exa: HTTP ${res.status} body=${body.slice(0, 500)}`);
+    throw new Error(`exa HTTP ${res.status}: ${body.slice(0, 200)}`);
+  }
+  dbg("exa: OK");
   const data = (await res.json()) as { results?: Array<{ title?: string; url?: string; text?: string }> };
   const out = (data.results ?? []).map((r) => ({
     title: r.title ?? "",
@@ -86,6 +109,7 @@ async function searchExa(query: string, numResults: number, key: string): Promis
 
 // Keyless last resort: DDG's HTML endpoint. hrefs arrive as /l/?uddg=<urlencoded>.
 async function searchDuckDuckGo(query: string, numResults: number): Promise<SearchResult[]> {
+  dbg(`ddg: query=${JSON.stringify(query)}`);
   const res = await fetch("https://html.duckduckgo.com/html/", {
     method: "POST",
     headers: {
@@ -95,7 +119,11 @@ async function searchDuckDuckGo(query: string, numResults: number): Promise<Sear
     body: new URLSearchParams({ q: query }).toString(),
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`duckduckgo HTTP ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "<unreadable>");
+    dbg(`ddg: HTTP ${res.status} body=${body.slice(0, 300)}`);
+    throw new Error(`duckduckgo HTTP ${res.status}`);
+  }
   const html = await res.text();
   const out: SearchResult[] = [];
   const anchor = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
@@ -108,6 +136,7 @@ async function searchDuckDuckGo(query: string, numResults: number): Promise<Sear
     const title = m[2].replace(/<[^>]+>/g, "");
     out.push({ title: clip(title, 120), url, snippet: "" });
   }
+  dbg(`ddg: parsed ${out.length} results (httpBody ${(html ?? "").length} bytes)`);
   if (out.length === 0) throw new Error("duckduckgo returned no results");
   return out;
 }
