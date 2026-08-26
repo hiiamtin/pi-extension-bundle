@@ -11,7 +11,7 @@
 // (synced from Infisical by `task pi-web-search-keys`; hand-edit works too)
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { extractToolArgs, requireString, textResult } from "./tool-compat.ts";
+import { extractToolArgs, requireString, textResult } from "../lib/tool-compat.ts";
 import { Type } from "typebox";
 import { readFileSync, appendFileSync, statSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
