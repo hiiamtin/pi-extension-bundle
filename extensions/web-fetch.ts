@@ -202,9 +202,10 @@ async function fetchScrapling(url: string): Promise<FetchedPage> {
   return { title: parsed.title || url, content: text, url };
 }
 
-async function webFetch(url: string, provider?: string): Promise<{ provider: string; page: FetchedPage; errors: string[] }> {
+async function webFetch(url: string, provider?: string): Promise<{ provider: string; page: FetchedPage; errors: string[]; quotaWarnings: string[] }> {
   const config = loadConfig();
   const errors: string[] = [];
+  const quotaWarnings: string[] = [];
 
   type Attempt = { name: ProviderName; run: () => Promise<FetchedPage>; needs: string | null };
   const attempts: Attempt[] = [
@@ -219,8 +220,13 @@ async function webFetch(url: string, provider?: string): Promise<{ provider: str
     : attempts;
 
   if (selected.length === 0) {
-    return { provider: "none", page: { title: "", content: "", url }, errors: [`unknown provider '${provider}' (use: jina | exa | tavily | scrapling)`] };
+    return { provider: "none", page: { title: "", content: "", url }, errors: [`unknown provider '${provider}' (use: jina | exa | tavily | scrapling)`], quotaWarnings };
   }
+
+  // HTTP 402 / quota / balance errors mean the key is out of credit — surface
+  // these in the tool result (not just the debug log) so the operator learns
+  // the key needs top-up or removal instead of silently burning fallback quota.
+  const isQuotaError = (msg: string) => /\b402\b|insufficient|out of (credit|token|quota)|quota.*(exhaust|exceed)|payment required/i.test(msg);
 
   for (const attempt of selected) {
     if (attempt.needs) {
@@ -230,13 +236,18 @@ async function webFetch(url: string, provider?: string): Promise<{ provider: str
     }
     try {
       const page = await attempt.run();
-      if (page.content) return { provider: attempt.name, page, errors };
+      if (page.content) return { provider: attempt.name, page, errors, quotaWarnings };
       errors.push(`${attempt.name}: empty content`);
     } catch (e) {
-      errors.push(`${attempt.name}: ${e instanceof Error ? e.message : String(e)}`);
+      const msg = e instanceof Error ? e.message : String(e);
+      errors.push(`${attempt.name}: ${msg}`);
+      if (isQuotaError(msg)) {
+        quotaWarnings.push(`${attempt.name} quota exhausted — top up or remove its key to stop burning fallback quota`);
+        dbg(`${attempt.name}: QUOTA WARNING ${msg}`);
+      }
     }
   }
-  return { provider: "none", page: { title: "", content: "", url }, errors };
+  return { provider: "none", page: { title: "", content: "", url }, errors, quotaWarnings };
 }
 
 function formatPage(provider: string, page: FetchedPage, chars: number): string {
@@ -268,11 +279,13 @@ export default function webFetchExtension(pi: ExtensionAPI): void {
       const provider = typeof args.provider === "string" && args.provider.trim() ? args.provider.trim().toLowerCase() : undefined;
       const maxChars = Math.min(HARD_MAX_CHARS, Math.max(500, Math.round(Number(args.maxChars) || DEFAULT_MAX_CHARS)));
 
-      const { provider: used, page, errors } = await webFetch(url, provider);
+      const { provider: used, page, errors, quotaWarnings } = await webFetch(url, provider);
       if (!page.content) {
         return textResult(`web_fetch failed${provider ? ` (provider=${provider})` : " for all providers"}: ${errors.join("; ")}`);
       }
-      return textResult(formatPage(used, page, maxChars));
+      let out = formatPage(used, page, maxChars);
+      if (quotaWarnings.length > 0) out += `\n\n⚠ ${quotaWarnings.join(" | ")}`;
+      return textResult(out);
     },
   });
 
