@@ -29,6 +29,42 @@ Tavily (if key) → Exa (if key) → DuckDuckGo (keyless, always available)
   ```
 - `/websearch [query]` — human test command showing which provider served.
 
+### web-fetch.ts — web fetch for the model
+
+Registers the `web_fetch` tool: fetch a URL, return clean markdown/text for LLM
+consumption. Optional `provider` param forces one provider; default runs the
+fallback chain:
+
+```
+Jina Reader (key optional) → Exa (if key) → Tavily (if key) → Scrapling (local python)
+```
+
+- Params: `url` (required), `provider?` (`jina|exa|tavily|scrapling`), `maxChars?`
+  (default 20000, max 60000).
+- Jina works keyless (free tier, ~20 RPM); `JINA_API_KEY` raises limits and
+  avoids anonymous blocks.
+- Keys (env vars take priority, then the shared config file):
+  `JINA_API_KEY`, `EXA_API_KEY`, `TAVILY_API_KEY` — synced from Infisical (omo
+  project) via `task omo-sync` + `~/.bashrc` export.
+- `/webfetch [url]` — human test command showing which provider served.
+- Debug log: `~/.pi/agent/web-fetch-debug.log` (same self-cap pattern;
+  override with `PI_WEBFETCH_DEBUG_LOG=/path`).
+
+#### Scrapling tier (optional, one-time setup)
+
+The last-resort tier spawns `python3` with an inline script — the extension
+does NOT install Scrapling itself. Missing setup only breaks this tier
+(graceful error; jina/exa/tavily still cover the chain). One-time install:
+
+```bash
+pip install --user --break-system-packages "scrapling[fetchers]" "camoufox[geoip]"
+python3 -m camoufox fetch          # stealth browser (~150MB)
+python3 -m playwright install chromium
+```
+
+The script itself double-falls-back: StealthyFetcher (Camoufox, bypasses
+Cloudflare Turnstile) → Fetcher (TLS-spoofed HTTP, fast) → JSON error.
+
 #### pi-version compatibility (IMPORTANT)
 
 pi ≥0.84 changed the tool calling convention from `execute(params)` to
@@ -55,6 +91,7 @@ extensions/
   ext.ts           /ext — manage extensions from within pi
   quota.ts         AI provider quota status + quota_check tool
   web-search.ts    web_search tool (Tavily/Exa/DuckDuckGo fallback)
+  web-fetch.ts     web_fetch tool (Jina/Exa/Tavily/Scrapling fallback)
   tool-compat.ts   shared helpers: signature normalization + loud param validation
 scripts/
   smoke-test.mjs   run after any pi upgrade (see web-search section above)
