@@ -4,6 +4,25 @@ pi coding agent extensions for the TinTin setup. Installed as a pi package.
 
 ## Extensions
 
+### code-search.ts — instant code search via semble
+
+Registers `code_search` + `code_find_related` tools wrapping semble's CLI
+(uvx, JSON output on stdout) — no MCP needed:
+
+- `code_search`: natural-language / symbol query over a local dir or https
+git URL → file paths + exact line ranges.
+- `code_find_related`: find similar code from a known location (all
+implementations of an interface, callers of a function, tests for a class).
+- Both accept `repo?` (default `pi.cwd`), `top_k?`, `max_snippet_lines?`
+(0 = locations only, null = full chunk), `content?` (`code|docs|config|all`
+— extra surface the MCP server lacks).
+- Version pinned via `SEMBLE_VERSION` env (default `0.5.5`).
+- `/codesearch <query>` — human test command.
+
+Why native instead of the semble MCP server: tools appear directly in the
+model's toolset (1-step, no proxy search+execute round trip), no
+lazy-connect lifecycle, process spawns only when actually called.
+
 ### quota.ts — AI provider quota status
 
 Bridges the ai-cost MCP server (`get_quota`):
@@ -88,14 +107,19 @@ missing param fails loudly instead of silently sending `undefined` upstream.
 
 ```
 extensions/
-  ext.ts           /ext — manage extensions from within pi
+  ext.ts           /ext — manage extensions, packages & skills from within pi
+  code-search.ts   code_search / code_find_related tools (semble CLI bridge)
   quota.ts         AI provider quota status + quota_check tool
   web-search.ts    web_search tool (Tavily/Exa/DuckDuckGo fallback)
   web-fetch.ts     web_fetch tool (Jina/Exa/Tavily/Scrapling fallback)
+lib/
   tool-compat.ts   shared helpers: signature normalization + loud param validation
 scripts/
   smoke-test.mjs   run after any pi upgrade (see web-search section above)
 ```
+
+Note: tool-compat.ts lives under `lib/` (extensions import it as
+`../lib/tool-compat.ts`).
 
 ## Install
 
