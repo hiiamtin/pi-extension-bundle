@@ -41,9 +41,13 @@ const fakePi = {
 };
 
 // --- load every extension file --------------------------------------------
+// Auto-discovers *.ts in extensions/ (or override by passing filenames as args).
 const files = process.argv.slice(2).length
   ? process.argv.slice(2)
-  : ["web-search.ts", "quota.ts"];
+  : execSync(`ls ${path.join(pkgRoot, "extensions")}/*.ts`, { encoding: "utf8" })
+      .split("\n")
+      .filter(Boolean)
+      .map((p) => path.basename(p));
 for (const f of files) {
   const mod = await import(path.join(pkgRoot, "extensions", f));
   mod.default(fakePi);
@@ -56,6 +60,7 @@ if (names.length === 0) process.exit(1);
 const MIN_ARGS = {
   web_search: { query: "pi extension smoke test", numResults: 1 },
   quota_check: {},
+  web_fetch: { url: "https://example.com" },
 };
 
 let failures = 0;
