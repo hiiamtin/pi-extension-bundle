@@ -20,7 +20,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { extractToolArgs, requireString, textResult } from "../lib/tool-compat.ts";
 import { Type } from "typebox";
 import { execFile } from "node:child_process";
-import { readFileSync, appendFileSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, appendFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -37,15 +37,20 @@ type ProviderName = "jina" | "exa" | "tavily" | "scrapling";
 type Ui = { notify: (msg: string, level: string) => void };
 
 const DEBUG_LOG = process.env.PI_WEBFETCH_DEBUG_LOG
-  || path.join(os.homedir(), ".pi/agent/web-fetch-debug.log");
+  || path.join(os.homedir(), ".pi/agent/log/web-fetch-debug.log");
 
 // Same self-capping debug log pattern as web-search.ts (128KB max, keeps 32KB tail).
 const DEBUG_MAX = 128 * 1024;
 const DEBUG_TAIL = 32 * 1024;
 
+let debugDirReady = false;
 function dbg(msg: string): void {
   try {
     if (!DEBUG_LOG.endsWith("debug.log")) return;
+    if (!debugDirReady) {
+      mkdirSync(path.dirname(DEBUG_LOG), { recursive: true });
+      debugDirReady = true;
+    }
     let line = `[${new Date().toISOString()}] ${msg}\n`;
     try {
       if (statSync(DEBUG_LOG).size + line.length > DEBUG_MAX) {

@@ -13,7 +13,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { extractToolArgs, requireString, textResult } from "../lib/tool-compat.ts";
 import { Type } from "typebox";
-import { readFileSync, appendFileSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, appendFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -28,17 +28,22 @@ type SearchConfig = { tavilyApiKey?: string; exaApiKey?: string };
 type Ui = { notify: (msg: string, level: string) => void };
 
 const DEBUG_LOG = process.env.PI_WEBSEARCH_DEBUG_LOG
-  || path.join(os.homedir(), ".pi/agent/web-search-debug.log");
+  || path.join(os.homedir(), ".pi/agent/log/web-search-debug.log");
 
-// Append a timestamped line to ~/.pi/agent/web-search-debug.log (best-effort).
+// Append a timestamped line to the debug log (best-effort, dir auto-created).
 // Self-capping: file is truncated to its last DEBUG_TAIL bytes once it exceeds
 // DEBUG_MAX, so it can never grow unbounded.
 const DEBUG_MAX = 128 * 1024;
 const DEBUG_TAIL = 32 * 1024;
 
+let debugDirReady = false;
 function dbg(msg: string): void {
   try {
     if (!DEBUG_LOG.endsWith("debug.log")) return; // sanity guard
+    if (!debugDirReady) {
+      mkdirSync(path.dirname(DEBUG_LOG), { recursive: true });
+      debugDirReady = true;
+    }
     let line = `[${new Date().toISOString()}] ${msg}\n`;
     try {
       if (statSync(DEBUG_LOG).size + line.length > DEBUG_MAX) {

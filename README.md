@@ -47,7 +47,7 @@ Jina Reader (key optional) → Exa (if key) → Tavily (if key) → Scrapling (l
   `JINA_API_KEY`, `EXA_API_KEY`, `TAVILY_API_KEY` — synced from Infisical (omo
   project) via `task omo-sync` + `~/.bashrc` export.
 - `/webfetch [url]` — human test command showing which provider served.
-- Debug log: `~/.pi/agent/web-fetch-debug.log` (same self-cap pattern;
+- Debug log: `~/.pi/agent/log/web-fetch-debug.log` (same self-cap pattern;
   override with `PI_WEBFETCH_DEBUG_LOG=/path`).
 
 #### Scrapling tier (optional, one-time setup)
@@ -73,7 +73,7 @@ package go through `extensions/tool-compat.ts::extractToolArgs()`, which works
 with BOTH conventions, and validate required params via `requireString()` so a
 missing param fails loudly instead of silently sending `undefined` upstream.
 
-- Debug log: `~/.pi/agent/web-search-debug.log` (self-capped at 128KB,
+- Debug log: `~/.pi/agent/log/web-search-debug.log` (self-capped at 128KB,
   truncates to last 32KB). Override location with `PI_WEBSEARCH_DEBUG_LOG=/path`.
 - **After every `pi` upgrade, run the smoke test:**
   ```bash
