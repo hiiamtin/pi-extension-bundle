@@ -1,7 +1,8 @@
-// pi extension: /ext — toggle sibling extensions AND local skills
+// pi extension: /ext — toggle sibling extensions, external packages, AND local skills
 // (pi config compatible — edits the same settings.json structures:
-//   extensions → packages[] object form with "-extensions/<name>.ts"
-//   skills     → top-level skills[] with "-skills/<name>/SKILL.md")
+//   sibling extensions → packages[] object form with "-extensions/<name>.ts"
+//   external packages  → packages[] object form with { source, extensions: [], skills: [], ... }
+//   skills             → top-level skills[] with "-skills/<name>/SKILL.md")
 //
 // Bare /ext opens a grouped picker (works in TUI and pi-web): pick entries to
 // toggle them as PENDING changes, "💾 Save & reload" applies + reloads once,
@@ -19,7 +20,15 @@ type Ui = {
   input?: (title: string, placeholder?: string) => Promise<string | undefined>;
   confirm?: (title: string, message: string) => Promise<boolean>;
 };
-type PackageEntry = string | { source: string; extensions?: string[] };
+type PackageEntry =
+  | string
+  | {
+      source: string;
+      extensions?: string[];
+      skills?: string[];
+      prompts?: string[];
+      themes?: string[];
+    };
 
 const SETTINGS_FILE = () => path.join(os.homedir(), ".pi/agent/settings.json");
 // pi's user-level skills root is the cross-agent convention dir ~/.agents/skills
@@ -31,9 +40,16 @@ const SAVE_OPTION = "💾 Save & reload";
 const SEARCH_OPTION = "🔍 Search…";
 const CLEAR_OPTION = "✏️ Clear filter";
 const EXT_HEADER = "── Extensions ──";
+const PKG_HEADER = "── Packages (External) ──";
 const SKILL_HEADER = "── Skills ──";
 
-type ToggleItem = { key: string; name: string; kind: "extension" | "skill"; enabled: boolean };
+type ToggleItem = {
+  key: string;
+  name: string;
+  kind: "extension" | "package" | "skill";
+  enabled: boolean;
+  packageSource?: string;
+};
 
 // Our own package root: the packages[] entry containing extensions/ext.ts.
 // Works for local-path (VM) and git installs (~/.pi/agent/git/...) alike.
@@ -70,16 +86,27 @@ function writeSettings(settings: { packages?: PackageEntry[]; skills?: string[] 
   writeFileSync(SETTINGS_FILE(), JSON.stringify(raw, null, 2) + "\n");
 }
 
-function findPackageEntry(packages: PackageEntry[], root: string): { index: number; entry: { source: string; extensions: string[] } } | null {
+function findPackageEntry(packages: PackageEntry[], root: string): { index: number; entry: PackageEntry } | null {
   const index = packages.findIndex((p) => (typeof p === "string" ? p : p.source) === root);
   if (index === -1) return null;
-  const raw = packages[index];
-  const entry = typeof raw === "string" ? { source: raw, extensions: [] } : { source: raw.source, extensions: raw.extensions ?? [] };
-  return { index, entry };
+  return { index, entry: packages[index] };
 }
 
-function extensionEnabled(entry: { extensions: string[] } | null, name: string): boolean {
-  return !entry || !entry.extensions.includes(`-extensions/${name}.ts`);
+function extensionEnabled(packages: PackageEntry[], root: string | null, name: string): boolean {
+  if (!root) return true;
+  const found = findPackageEntry(packages, root);
+  if (!found) return true;
+  const raw = found.entry;
+  if (typeof raw === "string") return true;
+  return !(raw.extensions ?? []).includes(`-extensions/${name}.ts`);
+}
+
+function packageEnabled(entry: PackageEntry): boolean {
+  if (typeof entry === "string") return true;
+  // If all resources are explicitly empty arrays, it's fully disabled
+  const extDisabled = Array.isArray(entry.extensions) && entry.extensions.length === 0;
+  const skillDisabled = Array.isArray(entry.skills) && entry.skills.length === 0;
+  return !(extDisabled && skillDisabled);
 }
 
 function skillEnabled(skills: string[], name: string): boolean {
@@ -89,12 +116,36 @@ function skillEnabled(skills: string[], name: string): boolean {
 function setExtension(packages: PackageEntry[], root: string, name: string, enabled: boolean): void {
   const found = findPackageEntry(packages, root);
   if (!found) throw new Error(`package ${root} not found in settings.json`);
-  const { index, entry } = found;
+  const { index, entry: raw } = found;
+  const entry = typeof raw === "string" ? { source: raw, extensions: [] as string[] } : { ...raw, extensions: [...(raw.extensions ?? [])] };
   const marker = `-extensions/${name}.ts`;
   if (enabled) entry.extensions = entry.extensions.filter((e) => e !== marker);
   else if (!entry.extensions.includes(marker)) entry.extensions.push(marker);
+  
   // object form with no exclusions == plain string form; keep it canonical
-  packages[index] = entry.extensions.length > 0 ? entry : entry.source;
+  const hasOtherExclusions = Boolean(
+    (entry.skills && entry.skills.length > 0) ||
+    (entry.prompts && entry.prompts.length > 0) ||
+    (entry.themes && entry.themes.length > 0)
+  );
+  packages[index] = (entry.extensions.length > 0 || hasOtherExclusions) ? entry : entry.source;
+}
+
+function setPackage(packages: PackageEntry[], source: string, enabled: boolean): void {
+  const found = findPackageEntry(packages, source);
+  if (!found) throw new Error(`package ${source} not found in settings.json`);
+  const { index } = found;
+  if (enabled) {
+    packages[index] = source;
+  } else {
+    packages[index] = {
+      source,
+      extensions: [],
+      skills: [],
+      prompts: [],
+      themes: [],
+    };
+  }
 }
 
 function setSkill(skills: string[], name: string, enabled: boolean): void {
@@ -105,30 +156,78 @@ function setSkill(skills: string[], name: string, enabled: boolean): void {
   skills.push(...filtered);
 }
 
+function getPackageDisplayName(source: string): string {
+  if (source.startsWith("npm:")) return source.slice(4);
+  if (source.startsWith("git:")) return source.slice(4).split("/").pop() ?? source;
+  return path.basename(source);
+}
+
 function collectItems(packages: PackageEntry[], skills: string[]): { root: string | null; items: ToggleItem[] } {
   const root = findOwnPackageRoot(packages);
-  const entry = root ? findPackageEntry(packages, root)?.entry ?? null : null;
   const items: ToggleItem[] = [];
-  for (const n of listExtensions(root)) items.push({ key: `ext:${n}`, name: n, kind: "extension", enabled: extensionEnabled(entry, n) });
-  for (const n of listSkills()) items.push({ key: `skill:${n}`, name: n, kind: "skill", enabled: skillEnabled(skills, n) });
+
+  // 1. Sibling extensions in own package
+  for (const n of listExtensions(root)) {
+    items.push({
+      key: `ext:${n}`,
+      name: n,
+      kind: "extension",
+      enabled: extensionEnabled(packages, root, n),
+    });
+  }
+
+  // 2. External packages (other than our own package root)
+  for (const p of packages) {
+    const src = typeof p === "string" ? p : p.source;
+    if (src === root) continue;
+    const name = getPackageDisplayName(src);
+    items.push({
+      key: `pkg:${src}`,
+      name,
+      kind: "package",
+      enabled: packageEnabled(p),
+      packageSource: src,
+    });
+  }
+
+  // 3. Top-level skills in ~/.agents/skills
+  // (package skills like the adapter's mcp-scripting live under the package and are
+  //  toggled together with that package; package-level skills options would need
+  //  glob support and are intentionally out of scope for the picker)
+  for (const n of listSkills()) {
+    items.push({
+      key: `skill:${n}`,
+      name: n,
+      kind: "skill",
+      enabled: skillEnabled(skills, n),
+    });
+  }
+
   return { root, items };
 }
 
 function applyPending(pending: Map<string, boolean>): void {
   const settings = readSettings();
   const root = findOwnPackageRoot(settings.packages);
-  if (!root) throw new Error("cannot locate own package root in settings.json");
   for (const [key, enabled] of pending) {
-    const [kind, name] = key.split(":") as ["extension" | "skill", string];
-    if (kind === "extension") setExtension(settings.packages, root, name, enabled);
-    else setSkill(settings.skills, name, enabled);
+    const colonIdx = key.indexOf(":");
+    const prefix = key.slice(0, colonIdx);
+    const nameOrSrc = key.slice(colonIdx + 1);
+    if (prefix === "ext") {
+      if (!root) throw new Error("cannot locate own package root in settings.json");
+      setExtension(settings.packages, root, nameOrSrc, enabled);
+    } else if (prefix === "pkg") {
+      setPackage(settings.packages, nameOrSrc, enabled);
+    } else if (prefix === "skill") {
+      setSkill(settings.skills, nameOrSrc, enabled);
+    }
   }
   writeSettings(settings);
 }
 
 export default function extToggleExtension(pi: ExtensionAPI): void {
   pi.registerCommand("ext", {
-    description: "Enable/disable extensions and skills (same store as pi config). /ext opens a picker; /ext <name> on|off for direct toggle",
+    description: "Enable/disable extensions, packages, and skills (same store as pi config). /ext opens a picker; /ext <name> on|off for direct toggle",
     handler: async (args: string, ctx: { ui: Ui; reload: () => Promise<void> }) => {
       const [name, action] = args.trim().split(/\s+/).filter(Boolean);
 
@@ -140,7 +239,7 @@ export default function extToggleExtension(pi: ExtensionAPI): void {
         }
         const { packages, skills } = readSettings();
         const { root, items } = collectItems(packages, skills);
-        const item = items.find((i) => i.name === name);
+        const item = items.find((i) => i.name === name || (i.packageSource && i.packageSource === name));
         if (!item) {
           ctx.ui.notify(`unknown: ${name} (${items.map((i) => i.name).join(", ") || "none"})`, "error");
           return;
@@ -151,12 +250,14 @@ export default function extToggleExtension(pi: ExtensionAPI): void {
         }
         if (item.kind === "extension") {
           if (!root) throw new Error("cannot locate own package root in settings.json");
-          setExtension(packages, root, name, action === "on");
+          setExtension(packages, root, item.name, action === "on");
+        } else if (item.kind === "package") {
+          setPackage(packages, item.packageSource!, action === "on");
         } else {
-          setSkill(skills, name, action === "on");
+          setSkill(skills, item.name, action === "on");
         }
         writeSettings({ packages, skills });
-        ctx.ui.notify(`${name}: ${action === "on" ? "enabled" : "disabled"} — reloading…`, "info");
+        ctx.ui.notify(`${item.name}: ${action === "on" ? "enabled" : "disabled"} — reloading…`, "info");
         await ctx.reload();
         return;
       }
@@ -168,7 +269,7 @@ export default function extToggleExtension(pi: ExtensionAPI): void {
       }
       const pending = new Map<string, boolean>();
       let filter = "";
-      let dirty = () => pending.size > 0;
+      const dirty = () => pending.size > 0;
 
       for (;;) {
         const { packages, skills } = readSettings();
@@ -182,15 +283,30 @@ export default function extToggleExtension(pi: ExtensionAPI): void {
         const options: string[] = [];
         const map: Array<Pickable | null> = [];
         const push = (option: string, pickable: Pickable | null = null) => { options.push(option); map.push(pickable); };
-        push(EXT_HEADER);
-        for (const i of effective.filter((i) => i.kind === "extension")) push(`${i.enabled ? "✓" : "✗"} ${i.name}`, i);
-        push(SKILL_HEADER);
-        for (const i of effective.filter((i) => i.kind === "skill")) push(`${i.enabled ? "✓" : "✗"} ${i.name}`, i);
+
+        const exts = effective.filter((i) => i.kind === "extension");
+        if (exts.length > 0) {
+          push(EXT_HEADER);
+          for (const i of exts) push(`${i.enabled ? "✓" : "✗"} ${i.name}`, i);
+        }
+
+        const pkgs = effective.filter((i) => i.kind === "package");
+        if (pkgs.length > 0) {
+          push(PKG_HEADER);
+          for (const i of pkgs) push(`${i.enabled ? "✓" : "✗"} ${i.name}`, i);
+        }
+
+        const skls = effective.filter((i) => i.kind === "skill");
+        if (skls.length > 0) {
+          push(SKILL_HEADER);
+          for (const i of skls) push(`${i.enabled ? "✓" : "✗"} ${i.name}`, i);
+        }
+
         if (filter) push(CLEAR_OPTION, { action: "clear" });
         push(SEARCH_OPTION, { action: "search" });
         if (dirty()) push(`${SAVE_OPTION} (${pending.size})`, { action: "save" });
 
-        const title = `Toggle extensions/skills${filter ? ` — filter: "${filter}"` : ""}${dirty() ? ` — ${pending.size} unsaved` : ""}`;
+        const title = `Toggle extensions/packages/skills${filter ? ` — filter: "${filter}"` : ""}${dirty() ? ` — ${pending.size} unsaved` : ""}`;
         const choice = await ctx.ui.select(title, options);
         if (!choice) break;
 
