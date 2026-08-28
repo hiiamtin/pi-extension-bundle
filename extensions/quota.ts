@@ -306,6 +306,34 @@ export default function quotaExtension(pi: ExtensionAPI): void {
 
   pi.registerCommand("quota", {
     description: "AI provider quotas (ai-cost). /quota [setting|refresh|tools on|off|status all|current|off]",
+    getArgumentCompletions: (prefix: string) => {
+      const normalized = prefix.trimStart();
+      const argumentMatch = normalized.match(/^(\S+)\s+(.*)$/);
+      if (!argumentMatch) {
+        const subcommands = [
+          { value: "setting", label: "setting — Open settings picker" },
+          { value: "refresh", label: "refresh — Bypass the 5-min cache" },
+          { value: "tools", label: "tools — Expose quota_check tool to the model" },
+          { value: "status", label: "status — Set footer status mode" },
+        ].filter(({ value }) => value.startsWith(normalized));
+        return subcommands.length > 0 ? subcommands : null;
+      }
+      const [, subcommand, argumentPrefix] = argumentMatch;
+      if (argumentPrefix === undefined) return null;
+      if (subcommand === "tools") {
+        const values = ["on", "off"]
+          .filter((v) => v.startsWith(argumentPrefix.trimStart()))
+          .map((v) => ({ value: `tools ${v}`, label: `${v} — ${v === "on" ? "Show quota_check to model" : "Hide quota_check from model"}` }));
+        return values.length > 0 ? values : null;
+      }
+      if (subcommand === "status") {
+        const values = ["all", "current", "off"]
+          .filter((v) => v.startsWith(argumentPrefix.trimStart()))
+          .map((v) => ({ value: `status ${v}`, label: `${v} — ${v === "off" ? "Hide footer status" : `Footer: ${v}`} ` }));
+        return values.length > 0 ? values : null;
+      }
+      return null;
+    },
     handler: async (args: string, ctx: { ui: Ui }) => {
       ui = ctx.ui;
       const [sub, value] = args.trim().split(/\s+/).filter(Boolean);

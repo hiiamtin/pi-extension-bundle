@@ -228,6 +228,29 @@ function applyPending(pending: Map<string, boolean>): void {
 export default function extToggleExtension(pi: ExtensionAPI): void {
   pi.registerCommand("ext", {
     description: "Enable/disable extensions, packages, and skills (same store as pi config). /ext opens a picker; /ext <name> on|off for direct toggle",
+    getArgumentCompletions: (prefix: string) => {
+      const normalized = prefix.trimStart();
+      const argumentMatch = normalized.match(/^(\S+)\s+(\S*)$/);
+      if (!argumentMatch) {
+        // Level 1: item names (extensions, packages, skills) from the current settings
+        const { packages, skills } = readSettings();
+        const { items } = collectItems(packages, skills);
+        const entries = items
+          .filter((i) => i.name.startsWith(normalized))
+          .map((i) => ({
+            value: i.name,
+            label: `${i.name} — ${i.kind}${i.enabled ? " (enabled)" : " (disabled)"}`,
+          }));
+        return entries.length > 0 ? entries : null;
+      }
+      // Level 2: on|off for the chosen item
+      const [, name, actionPrefix] = argumentMatch;
+      if (actionPrefix === undefined) return null;
+      const values = ["on", "off"]
+        .filter((v) => v.startsWith(actionPrefix.trimStart()))
+        .map((v) => ({ value: `${name} ${v}`, label: `${v} — ${v === "on" ? "Enable" : "Disable"} ${name}` }));
+      return values.length > 0 ? values : null;
+    },
     handler: async (args: string, ctx: { ui: Ui; reload: () => Promise<void> }) => {
       const [name, action] = args.trim().split(/\s+/).filter(Boolean);
 
