@@ -61,6 +61,12 @@ const MIN_ARGS = {
   web_search: { query: "pi extension smoke test", numResults: 1 },
   quota_check: {},
   web_fetch: { url: "https://example.com" },
+  code_search: { query: "hello world" },
+  code_find_related: { file_path: "extensions/ext.ts", line: 1 },
+  bg_run: { command: "echo smoke-bg-ok" },
+  bg_status: {},
+  bg_log: { id: "nope-smoke" },
+  bg_kill: { id: "nope-smoke" },
 };
 
 let failures = 0;

@@ -94,7 +94,7 @@ export default function codeSearchExtension(pi: ExtensionAPI): void {
       const missing = requireString(args, "query");
       if (missing) return textResult(`code_search ${missing.errorText}`);
       const query = (args.query as string).trim();
-      const repo = (args.repo as string | undefined)?.trim() || pi.cwd;
+      const repo = (args.repo as string | undefined)?.trim() || pi.cwd || process.cwd();
       const topK = Math.max(1, Math.min(20, Math.round(Number(args.top_k) || DEFAULT_TOP_K)));
       const snippetLines = args.max_snippet_lines === undefined || args.max_snippet_lines === null
         ? DEFAULT_SNIPPET_LINES
@@ -124,7 +124,7 @@ export default function codeSearchExtension(pi: ExtensionAPI): void {
       if (missing) return textResult(`code_find_related ${missing.errorText}`);
       const filePath = (args.file_path as string).trim();
       const line = Math.max(1, Math.round(Number(args.line) || 1));
-      const repo = (args.repo as string | undefined)?.trim() || pi.cwd;
+      const repo = (args.repo as string | undefined)?.trim() || pi.cwd || process.cwd();
       const topK = Math.max(1, Math.min(20, Math.round(Number(args.top_k) || DEFAULT_TOP_K)));
       const snippetLines = args.max_snippet_lines === undefined || args.max_snippet_lines === null
         ? DEFAULT_SNIPPET_LINES

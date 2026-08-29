@@ -84,6 +84,41 @@ python3 -m playwright install chromium
 The script itself double-falls-back: StealthyFetcher (Camoufox, bypasses
 Cloudflare Turnstile) → Fetcher (TLS-spoofed HTTP, fast) → JSON error.
 
+### bg-task.ts — background task runner
+
+Keeps the conversation responsive while long jobs run (real-world trigger: a
+brute-force node solver pinned a session for 10+ minutes; `task logs-*` with
+`logs -f` never exits). The model gets non-blocking tools:
+
+- `bg_run(command, name?, timeout_min?)` — spawn detached in its own process
+  group at `nice 15 / ionice -c3` (can never starve the docker stack); returns
+  a task id immediately. Warns (in the tool result) when the command looks like
+  follow mode (`-f`/`--follow`/`watch`) so the model can decide to kill it
+  later — it never blocks the chat either way.
+- `bg_status(id?)` — one task or ALL tasks **across every pi session on the
+  machine** (shared state dir), incl. orphans from dead sessions.
+- `bg_log(id, tail_lines?)` — cheap tail of the rolling log (rotates at
+  `PI_BG_LOG_CAP_MB`, keeps one old file; fixed memory, bounded disk).
+- `bg_kill(id)` — SIGTERM the whole process group, SIGKILL after 5s — verified
+  zero leftover children in e2e (`pgrep -g` = 0 after kill).
+
+On exit, the owning session gets a `bg-task` custom message with
+`triggerTurn: true`, so the model announces the result proactively (elapsed,
+exit code, last output, log path) instead of the user polling.
+
+Human commands: `/bg` (panel), `/bg kill <id>` (confirm), `/bg on|off`
+(expose tools to the model, default on).
+
+- State: `~/.pi/agent/bg-tasks/<id>/{meta.json,out.log,out.1.log}` with
+  heartbeats (stale heartbeat + live process ⇒ `orphan`), auto-prune after
+  `PI_BG_PRUNE_HOURS` (24).
+- Config: `PI_BG_STATE_DIR`, `PI_BG_MAX_CONCURRENT` (8), `PI_BG_LOG_CAP_MB`
+  (2), `PI_BG_PRUNE_HOURS` (24), `PI_BG_DEFAULT_TIMEOUT_MIN` (0 = none).
+- Limitation: a task whose output exceeds the pipe buffer dies if the pi
+  process itself exits mid-run (marked `gone` on the next scan).
+- `/bg` commands in pi-web work too (widget renders above the editor in both
+  TUI and pi-web).
+
 #### pi-version compatibility (IMPORTANT)
 
 pi ≥0.84 changed the tool calling convention from `execute(params)` to
@@ -112,6 +147,7 @@ extensions/
   quota.ts         AI provider quota status + quota_check tool
   web-search.ts    web_search tool (Tavily/Exa/DuckDuckGo fallback)
   web-fetch.ts     web_fetch tool (Jina/Exa/Tavily/Scrapling fallback)
+  bg-task.ts       bg_run / bg_status / bg_log / bg_kill background tasks + /bg
 lib/
   tool-compat.ts   shared helpers: signature normalization + loud param validation
 scripts/
