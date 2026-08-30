@@ -694,7 +694,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     name: "bg_run",
     label: "Background run",
     description:
-      "Run a shell command in the BACKGROUND without blocking the conversation. Returns a task id immediately; keep chatting and you will be notified when it exits. Use for long jobs (builds, test suites, searches, log following). Commands run via bash with low priority (nice/ionice) in their own process group. Check progress with bg_status / bg_log; stop with bg_kill.",
+      "Run a shell command in the BACKGROUND without blocking the conversation. Returns a task id immediately and you will be notified when it exits. Use for long jobs (builds, test suites, searches, log following); monitor with bg_status / bg_log, stop with bg_kill.",
     parameters: Type.Object({
       command: Type.String({ description: "Shell command to run in the background" }),
       name: Type.Optional(Type.String({ description: "Short label for the task (shown in the status widget)" })),
@@ -724,7 +724,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     name: "bg_status",
     label: "Background status",
     description:
-      "Check background task status. With id: details for that task (state, elapsed, exit code, last output). Without id: list ALL tasks across every pi session on this machine (marked [this session] where applicable). CPU/memory friendly: reads a few small files.",
+      "Check background tasks. With id: state, elapsed, exit code, last output. Without id: list ALL tasks across every pi session on this machine (marked [this session] where applicable).",
     parameters: Type.Object({
       id: Type.Optional(Type.String({ description: "Task id from bg_run (omit to list all tasks)" })),
     }),
@@ -762,7 +762,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     name: "bg_artifact",
     label: "Background artifact",
     description:
-      "Token-safe summary of a result file produced by a background task (or any file). JSON → array length + item shape + first entries; JSONL → record count + shape; CSV → columns + row count + sample rows; text → line count + head/tail. Never dumps the whole file. Use instead of reading large outputs into context.",
+      "Token-safe summary of a result file: JSON → array length + item shape + first entries; JSONL → record count; CSV → columns + rows + samples; text → head/tail. Never dumps the whole file — use instead of reading large outputs into context.",
     parameters: Type.Object({
       path: Type.Optional(Type.String({ description: "Path to the file (required unless id points at the task's output log)" })),
       id: Type.Optional(Type.String({ description: "Task id from bg_run — with no path, summarizes that task's captured output" })),
@@ -797,7 +797,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     name: "bg_kill",
     label: "Background kill",
     description:
-      "Stop a background task by id. Kills the ENTIRE process group (SIGTERM, then SIGKILL after 5s) — no orphaned children left behind. Works on tasks from any pi session, including orphans whose session is gone.",
+      "Stop a background task by id. Kills the ENTIRE process group — no orphaned children. Works on tasks from any pi session, including orphans whose session is gone.",
     parameters: Type.Object({
       id: Type.String({ description: "Task id from bg_run" }),
     }),
