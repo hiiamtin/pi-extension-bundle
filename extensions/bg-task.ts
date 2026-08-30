@@ -42,6 +42,12 @@
 //     process itself exits mid-run (marked "gone" on next scan).
 //   - On exit the owning session gets pi.sendMessage(..., triggerTurn) so the
 //     model announces the result proactively instead of the user polling.
+//     pi.sendMessage is read AT CALL TIME (late-bound): at load pi hands a
+//     notInitialized placeholder, so capturing it early silently broke every
+//     notification (the bug behind lost notices). If the watcher dies anyway
+//     (reload/restart), meta.notifiedAt stays unset and the next live session
+//     surfaces the finished task at its session_start — data never gets lost.
+//     All spawn/exit/notify attempts are logged to bg-task-debug.log.
 //   - Auto-prune: finished/orphan/gone dirs older than PI_BG_PRUNE_HOURS (24).
 //
 // Human commands:  /bg            — interactive task picker (inspect/kill)
@@ -49,7 +55,8 @@
 //                  /bg on|off     — expose bg_* tools AND gate the interceptor
 //
 // Config (env): PI_BG_STATE_DIR, PI_BG_MAX_CONCURRENT (8), PI_BG_LOG_CAP_MB (2),
-//               PI_BG_PRUNE_HOURS (24), PI_BG_DEFAULT_TIMEOUT_MIN (0 = none).
+//               PI_BG_PRUNE_HOURS (24), PI_BG_DEFAULT_TIMEOUT_MIN (0 = none),
+//               PI_BG_TICK_MS (5000 — scan/heartbeat cadence while tasks run).
 // After any pi upgrade run: node scripts/smoke-test.mjs
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -87,7 +94,7 @@ const PRUNE_MS = envInt("PI_BG_PRUNE_HOURS", 24, 1, 24 * 30) * 3_600_000;
 const DEFAULT_TIMEOUT_MIN = envInt("PI_BG_DEFAULT_TIMEOUT_MIN", 0, 0, 24 * 60); // 0 = no timeout
 const KILL_ESCALATE_MS = 5_000;
 const ORPHAN_MS = 15_000; // heartbeat older than this + still running => orphan
-const WIDGET_MS = 3_000;
+const WIDGET_MS = envInt("PI_BG_TICK_MS", 5_000, 1_000, 300_000); // scan/heartbeat cadence while tasks are running
 const SETTINGS_FILE = path.join(os.homedir(), ".pi/agent/bg-task-settings.json");
 const MAX_OUTPUT_CHARS = 8_000;
 const INTERCEPTOR_MODE = (process.env.PI_BG_INTERCEPTOR || "auto-bg").toLowerCase(); // auto-bg | warn | off
@@ -112,6 +119,8 @@ interface Meta {
   heartbeat?: number; // updated every widget tick by the owning instance
   bytes?: number; // total output bytes written (across rotations)
   detach?: boolean; // fd-redirected output: survives pi restart (no live rotation)
+  notifiedAt?: number; // set once the finish notice was delivered to a session
+  notifyTries?: number;
 }
 
 interface OwnTask {
@@ -231,7 +240,24 @@ let settings = { toolsEnabled: true };
 let cachedUi: { setWidget?: (k: string, lines: string[] | undefined) => void; setStatus?: (k: string, t: string) => void } | null = null;
 let widgetTimer: NodeJS.Timeout | null = null;
 let notify: ((msg: string, level: string) => void) | null = null;
-let sendMessageFn: ((msg: unknown, opts: unknown) => void) | null = null;
+let piApi: ExtensionAPI | null = null;
+
+const DEBUG_LOG = path.join(os.homedir(), ".pi/agent/log/bg-task-debug.log");
+// self-capped (~48KB) diagnostics for spawn/exit/notify — never fatal
+function debugLog(line: string): void {
+  try {
+    mkdirSync(path.dirname(DEBUG_LOG), { recursive: true });
+    let text = `${new Date().toISOString()} ${line}\n`;
+    try {
+      text = readFileSync(DEBUG_LOG, "utf8").slice(-48_000) + text;
+    } catch {
+      /* first write */
+    }
+    writeFileSync(DEBUG_LOG, text);
+  } catch {
+    /* ignore */
+  }
+}
 
 function loadSettings(): void {
   try {
@@ -255,9 +281,9 @@ function exitPath(id: string): string {
   return path.join(dirOf(id), "exitcode");
 }
 
-function refreshScan(): void {
+function refreshScan(metas?: Meta[]): void {
   const now = Date.now();
-  for (const m of listDiskMetas()) {
+  for (const m of metas ?? listDiskMetas()) {
     if (own.has(m.id)) continue; // our tasks are handled by their own exit handlers
     if (m.state !== "running") {
       if (m.finishedAt && now - m.finishedAt > PRUNE_MS) rmSync(dirOf(m.id), { recursive: true, force: true });
@@ -272,6 +298,7 @@ function refreshScan(): void {
         const code = Number.parseInt(readFileSync(exitPath(m.id), "utf8").trim(), 10);
         if (Number.isFinite(code)) {
           writeMeta({ ...m, state: code === 0 ? "done" : "failed", exitCode: code, finishedAt: st.mtimeMs });
+          attemptNotify(m, "scan"); // owner session is gone — surface it here instead
           continue;
         }
       } catch {
@@ -303,10 +330,10 @@ function pruneOld(): void {
   }
 }
 
-function runningCount(): { total: number; mine: number } {
+function runningCount(metas: Meta[] = listDiskMetas()): { total: number; mine: number } {
   let total = 0;
   let mine = 0;
-  for (const m of listDiskMetas()) {
+  for (const m of metas) {
     if (m.state !== "running") continue;
     total++;
     if (own.has(m.id)) mine++;
@@ -316,7 +343,7 @@ function runningCount(): { total: number; mine: number } {
 
 // --- widget / status --------------------------------------------------------
 
-function renderWidget(): string[] {
+function renderWidget(metas: Meta[]): string[] {
   const lines: string[] = [];
   const now = Date.now();
   for (const t of own.values()) {
@@ -325,7 +352,7 @@ function renderWidget(): string[] {
     else if (m.finishedAt && now - m.finishedAt < 90_000)
       lines.push(`${stateIcon(m.state)} ${m.name} · ${m.id} · ${m.state}${m.exitCode != null ? ` (exit ${m.exitCode})` : ""} · ${fmtDur((m.finishedAt ?? now) - m.startedAt)}`);
   }
-  for (const m of listDiskMetas()) {
+  for (const m of metas) {
     if (own.has(m.id) || m.state !== "running") continue;
     lines.push(`⛓ ${m.name} · ${m.id} · ${m.state} · ${fmtDur(now - m.startedAt)} (other session)`);
   }
@@ -349,10 +376,11 @@ function ensureWidgetLoop(): void {
         }
         writeMeta(t.meta);
       }
-      refreshScan();
+      const metas = listDiskMetas(); // single scan per tick, shared below
+      refreshScan(metas);
 
-      const lines = renderWidget();
-      const { total } = runningCount();
+      const lines = renderWidget(metas);
+      const { total } = runningCount(metas);
       if (cachedUi?.setWidget) cachedUi.setWidget("bg-task", lines.length ? lines : undefined);
       if (cachedUi?.setStatus) cachedUi.setStatus("bg-task", total > 0 ? `bg:${total}` : "");
       if (total === 0 && lines.length === 0) {
@@ -539,21 +567,7 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
     writeMeta(meta);
     own.delete(id);
 
-    if (typeof sendMessageFn === "function") {
-      const tail = tailLog(id, 5, 600);
-      const lines = [
-        `Background task '${meta.name}' (${meta.id}) finished: ${meta.state}${code != null ? ` exit=${code}` : ""}${signal ? ` signal=${signal}` : ""} after ${fmtDur(meta.finishedAt - meta.startedAt)}.`,
-        tail ? `Last output:\n${tail}` : "",
-        `Full log: ${dirOf(id)}/out.log — inspect with bg_log, results on disk stay until pruned.`,
-      ]
-        .filter(Boolean)
-        .join("\n");
-      try {
-        sendMessageFn({ customType: "bg-task", display: true, content: lines, details: { id, state: meta.state, exitCode: code } }, { deliverAs: "followUp", triggerTurn: true });
-      } catch {
-        /* notification is best-effort */
-      }
-    }
+    attemptNotify(meta, "exit");
     if (typeof notify === "function") notify(`${stateIcon(meta.state)} bg '${meta.name}' ${meta.state}`, meta.state === "done" ? "info" : "warning");
   });
   child.on("error", () => {
@@ -562,6 +576,39 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
 
   ensureWidgetLoop();
   return { ok: true, meta };
+}
+
+// Deliver the "task finished" notice to this session via pi.sendMessage.
+// ALWAYS late-bound (read piApi.sendMessage at call time): pi hands extensions
+// a notInitialized placeholder at load and swaps in the real one afterwards —
+// a captured reference throws silently (the bug behind lost notifications).
+function attemptNotify(m: Meta, via: string): void {
+  if (m.notifiedAt) return;
+  m.notifyTries = (m.notifyTries ?? 0) + 1;
+  const tail = tailLog(m.id, 5, 600);
+  const content = [
+    `Background task '${m.name}' (${m.id}) finished: ${m.state}${m.exitCode != null ? ` exit=${m.exitCode}` : ""} after ${fmtDur((m.finishedAt ?? Date.now()) - m.startedAt)}.`,
+    tail ? `Last output:\n${tail}` : "",
+    `Full log: ${dirOf(m.id)}/out.log — inspect with bg_log, results on disk stay until pruned.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const api = piApi;
+  let outcome = "sendMessage unavailable";
+  if (api && typeof api.sendMessage === "function") {
+    try {
+      (api.sendMessage as unknown as (msg: unknown, opts: unknown) => void)(
+        { customType: "bg-task", display: true, content, details: { id: m.id, state: m.state, exitCode: m.exitCode ?? null } },
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+      outcome = "sent";
+    } catch (e) {
+      outcome = `FAILED: ${(e as Error).message}`;
+    }
+  }
+  debugLog(`notify[${via}] id=${m.id} '${m.name}' state=${m.state} tries=${m.notifyTries} -> ${outcome}`);
+  if (outcome === "sent" || m.notifyTries >= 3) m.notifiedAt = Date.now();
+  writeMeta(m);
 }
 
 function killGroup(meta: Meta): void {
@@ -775,7 +822,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
   loadSettings();
   mkdirSync(STATE_DIR, { recursive: true });
   notify = null;
-  sendMessageFn = typeof pi.sendMessage === "function" ? (pi.sendMessage as unknown as (m: unknown, o: unknown) => void) : null;
+  piApi = pi;
 
   const disabled = () => textResult("bg tools are disabled (/bg on to enable)");
 
@@ -1023,6 +1070,35 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       }
     });
   }
+
+  // reload-proof finish notices: any live instance surfaces tasks that finished
+  // without ever being notified (their watcher died in a reload/restart)
+  pi.on("session_start", async () => {
+    try {
+      const metas = listDiskMetas();
+      refreshScan(metas);
+      const pending = metas.filter((m) => m.state !== "running" && !m.notifiedAt && m.finishedAt && Date.now() - m.finishedAt < PRUNE_MS);
+      if (!pending.length || !piApi || typeof piApi.sendMessage !== "function") return;
+      const lines = pending.slice(0, 5).map((m) => `${stateIcon(m.state)} ${m.name} (${m.id}) — ${m.state}${m.exitCode != null ? `, exit=${m.exitCode}` : ""}, ran ${fmtDur(m.finishedAt - m.startedAt)}`);
+      (piApi.sendMessage as unknown as (msg: unknown, opts: unknown) => void)(
+        {
+          customType: "bg-task",
+          display: true,
+          content: `Background task${pending.length === 1 ? "" : "s"} finished since you were away:\n${lines.join("\n")}\nInspect with bg_status / bg_log.`,
+          details: { ids: pending.map((m) => m.id) },
+        },
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+      const now = Date.now();
+      for (const m of pending) {
+        m.notifiedAt = now;
+        writeMeta(m);
+      }
+      debugLog(`session_start: surfaced ${pending.length} finished task(s)`);
+    } catch (e) {
+      debugLog(`session_start notice failed: ${(e as Error).message}`);
+    }
+  });
 
   // housekeeping on load + hourly
   refreshScan();

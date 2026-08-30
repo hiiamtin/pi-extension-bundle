@@ -146,7 +146,8 @@ gate the interceptor, default on).
   `PI_BG_PRUNE_HOURS` (24).
 - Config: `PI_BG_STATE_DIR`, `PI_BG_MAX_CONCURRENT` (8), `PI_BG_LOG_CAP_MB`
   (2), `PI_BG_PRUNE_HOURS` (24), `PI_BG_DEFAULT_TIMEOUT_MIN` (0 = none),
-  `PI_BG_INTERCEPTOR` (`auto-bg` | `warn` | `off`).
+  `PI_BG_INTERCEPTOR` (`auto-bg` | `warn` | `off`),
+  `PI_BG_TICK_MS` (5000 — scan/heartbeat cadence while tasks run).
 - Limitation: pipe-mode tasks whose output exceeds the pipe buffer die if the
   pi process itself exits mid-run (marked `gone` on the next scan) — use
   `detach: true` for jobs that must survive restarts.

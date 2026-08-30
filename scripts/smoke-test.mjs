@@ -22,6 +22,10 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pkgRoot = path.dirname(here);
 
+// isolate bg-task test tasks from the real state dir (~/.pi/agent/bg-tasks)
+import os from "node:os";
+process.env.PI_BG_STATE_DIR = path.join(os.tmpdir(), `pi-bg-smoke-${process.pid}`);
+
 // --- installed pi version -------------------------------------------------
 let piVersion = "unknown";
 try {

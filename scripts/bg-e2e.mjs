@@ -16,20 +16,26 @@
 // Exit code 0 = ALL OK.
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const here = path.dirname(new URL(import.meta.url).pathname);
 const pkgRoot = path.dirname(here);
+// isolated state dir — e2e must never touch the real ~/.pi/agent/bg-tasks
+const STATE_DIR = path.join(os.tmpdir(), `pi-bg-e2e-${process.pid}`);
+rmSync(STATE_DIR, { recursive: true, force: true });
+process.env.PI_BG_STATE_DIR = STATE_DIR;
 const mod = await import(path.join(pkgRoot, "extensions", "bg-task.ts"));
 
 const registered = {};
 const hooks = {};
+const sent = []; // captures pi.sendMessage payloads (notification assertions)
 mod.default({
   registerTool: (t) => (registered[t.name] = t),
   registerCommand: () => {},
   on: (name, fn) => (hooks[name] = fn),
+  sendMessage: (m, o) => sent.push({ m, o }),
 });
 
 const exec = async (name, params) => (await registered[name].execute("e2e", params, undefined, undefined, {})).content[0].text;
@@ -48,8 +54,7 @@ const check = (label, ok) => {
   log(`${ok ? "ok  " : "FAIL"} ${label}`);
 };
 
-// start from a clean slate (stale foreign metas would pollute assertions)
-execSync(`rm -rf ${path.join(os.homedir(), ".pi/agent/bg-tasks")/* trailing slash-less glob */}/* 2>/dev/null || true`);
+// start from a clean slate (isolated temp state dir — already empty)
 
 // --- 1-3: process group kill ---
 const r1 = await exec("bg_run", { command: "echo e2e-started; sleep 300 & sleep 300", name: "e2e-group" });
@@ -63,16 +68,17 @@ await exec("bg_kill", { id });
 await sleep(6500);
 check("kill: zero leftover group members (no zombies)", members(pgid) === 0);
 check("status after kill: killed", /killed/.test(await exec("bg_status", { id })));
+check("notify: exit notification delivered for killed task", sent.some((s) => s.m?.details?.id === id));
 
 // --- 4: detach mode ---
 const r4 = await exec("bg_run", { command: "echo detach-ok", name: "e2e-detach", detach: true });
 const id4 = r4.match(/id: ([^,)]+)/)[1];
 await sleep(1200);
-const exitFile = path.join(os.homedir(), ".pi/agent/bg-tasks", id4, "exitcode");
+const exitFile = path.join(STATE_DIR, id4, "exitcode");
 check("detach: exitcode file written by wrapper", existsSync(exitFile));
 const st4 = await exec("bg_status", { id: id4 });
 check("detach: state finalized as done", /done/.test(st4));
-check("detach: log captured", /detach-ok/.test(readFileSync(path.join(os.homedir(), ".pi/agent/bg-tasks", id4, "out.log"), "utf8")));
+check("detach: log captured", /detach-ok/.test(readFileSync(path.join(STATE_DIR, id4, "out.log"), "utf8")));
 
 // --- 5: artifact ---
 const tmpJson = path.join(os.tmpdir(), `bg-e2e-${Date.now()}.json`);

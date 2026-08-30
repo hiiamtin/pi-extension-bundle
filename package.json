@@ -1,6 +1,6 @@
 {
   "name": "@tintin/pi-extensions",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "pi extensions for the TinTin setup: AI quota status (ai-cost MCP) + web search (Tavily/Exa/DuckDuckGo fallback) + web fetch (Jina/Exa/Tavily/Scrapling fallback) + background tasks (bg_run/status/log/artifact/kill + follow-mode interceptor)",
   "keywords": [
     "pi-package"
