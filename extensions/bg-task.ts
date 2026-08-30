@@ -16,7 +16,7 @@
 //   bg_kill(id)                           → SIGTERM the whole process group,
 //                                           escalate to SIGKILL after 5s.
 //
-// FOLLOW-MODE INTERCEPTOR (PI_BG_INTERCEPTOR, default warn):
+// FOLLOW-MODE INTERCEPTOR (PI_BG_INTERCEPTOR, default auto-bg):
 //   warn    — built-in `bash` tool watched; a follow/stream command is blocked
 //             ONCE with a short reason (use bg_run / add `timeout` / repeat the
 //             exact command to force-run). Detection is scoped per command so
@@ -85,7 +85,7 @@ const ORPHAN_MS = 15_000; // heartbeat older than this + still running => orphan
 const WIDGET_MS = 3_000;
 const SETTINGS_FILE = path.join(os.homedir(), ".pi/agent/bg-task-settings.json");
 const MAX_OUTPUT_CHARS = 8_000;
-const INTERCEPTOR_MODE = (process.env.PI_BG_INTERCEPTOR || "warn").toLowerCase(); // warn | auto-bg | off
+const INTERCEPTOR_MODE = (process.env.PI_BG_INTERCEPTOR || "auto-bg").toLowerCase(); // auto-bg | warn | off
 const ARTIFACT_PARSE_LIMIT = 8 * 1024 * 1024; // files bigger than this skip JSON.parse
 
 // --- types ------------------------------------------------------------------

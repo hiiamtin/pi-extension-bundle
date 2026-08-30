@@ -107,7 +107,7 @@ brute-force node solver pinned a session for 10+ minutes; `task logs-*` with
 - `bg_kill(id)` — SIGTERM the whole process group, SIGKILL after 5s — verified
   zero leftover children in e2e (`pgrep -g` = 0 after kill).
 
-**Follow-mode interceptor** (`PI_BG_INTERCEPTOR`, default `warn`): the
+**Follow-mode interceptor** (`PI_BG_INTERCEPTOR`, default `auto-bg`): the
 built-in `bash` tool is watched. Detection is **scoped per command** (heredoc
 bodies and quoted strings are data, never options) so common `-f` flags never
 false-positive:
@@ -121,13 +121,13 @@ false-positive:
 
 Modes:
 
-- `warn` (default) — a caught command is blocked ONCE with a short reason
-  telling the model to use `bg_run` or add `timeout`; repeating the exact
-  command is allowed through (warn, let the model decide).
-- `auto-bg` — don't ask: the command is started as a background task directly
-  and the model gets the task id back. A blocking call to a follow command is
-  always wrong (pi only sees output when a process exits — follow never
-  does), and this saves the block→retry round trip entirely.
+- `auto-bg` (default) — don't ask: the command is started as a background
+  task directly and the model gets the task id back. A blocking call to a
+  follow command is always wrong (pi only sees output when a process exits —
+  follow never does), and this saves the block→retry round trip entirely.
+- `warn` — a caught command is blocked ONCE with a short reason telling the
+  model to use `bg_run` or add `timeout`; repeating the exact command is
+  allowed through (warn, let the model decide).
 - `off` — no interception.
 
 On exit, the owning session gets a `bg-task` custom message with
@@ -142,7 +142,7 @@ Human commands: `/bg` (panel), `/bg kill <id>` (confirm), `/bg on|off`
   `PI_BG_PRUNE_HOURS` (24).
 - Config: `PI_BG_STATE_DIR`, `PI_BG_MAX_CONCURRENT` (8), `PI_BG_LOG_CAP_MB`
   (2), `PI_BG_PRUNE_HOURS` (24), `PI_BG_DEFAULT_TIMEOUT_MIN` (0 = none),
-  `PI_BG_INTERCEPTOR` (`warn` | `off`).
+  `PI_BG_INTERCEPTOR` (`auto-bg` | `warn` | `off`).
 - Limitation: a task whose output exceeds the pipe buffer dies if the pi
   process itself exits mid-run (marked `gone` on the next scan).
 - `/bg` commands in pi-web work too (widget renders above the editor in both
