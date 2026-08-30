@@ -16,11 +16,15 @@
 //   bg_kill(id)                           → SIGTERM the whole process group,
 //                                           escalate to SIGKILL after 5s.
 //
-// FOLLOW-MODE INTERCEPTOR (default warn): the built-in `bash` tool is watched;
-// a follow/stream command (`-f`, `--follow`, `watch`, `tail -f`) is blocked
-// ONCE with guidance (use bg_run / add `timeout`), then allowed if the model
-// repeats the exact command — warn, let the model decide. Disable with
-// PI_BG_INTERCEPTOR=off.
+// FOLLOW-MODE INTERCEPTOR (PI_BG_INTERCEPTOR, default warn):
+//   warn    — built-in `bash` tool watched; a follow/stream command is blocked
+//             ONCE with a short reason (use bg_run / add `timeout` / repeat the
+//             exact command to force-run). Detection is scoped per command so
+//             `rm -f`, `grep -f`, heredoc bodies etc. never false-positive.
+//   auto-bg — don't even ask: the follow command is started as a background
+//             task directly (a blocking call to a follow command is always
+//             wrong — pi only sees output when a process exits).
+//   off     — no interception.
 //
 // Design notes (TinTin VM, 4 cores / 24GB ARM):
 //   - Every task runs `nice -n 15 ionice -c3` so background jobs can never
@@ -81,7 +85,7 @@ const ORPHAN_MS = 15_000; // heartbeat older than this + still running => orphan
 const WIDGET_MS = 3_000;
 const SETTINGS_FILE = path.join(os.homedir(), ".pi/agent/bg-task-settings.json");
 const MAX_OUTPUT_CHARS = 8_000;
-const INTERCEPTOR_MODE = (process.env.PI_BG_INTERCEPTOR || "warn").toLowerCase(); // warn | off
+const INTERCEPTOR_MODE = (process.env.PI_BG_INTERCEPTOR || "warn").toLowerCase(); // warn | auto-bg | off
 const ARTIFACT_PARSE_LIMIT = 8 * 1024 * 1024; // files bigger than this skip JSON.parse
 
 // --- types ------------------------------------------------------------------
@@ -870,6 +874,18 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
         const cmd = typeof event.input?.command === "string" ? event.input.command : "";
         if (!cmd || !looksLikeFollow(cmd)) return undefined;
         if (/^\s*timeout\s/.test(cmd)) return undefined; // explicitly bounded — fine
+        // auto-bg mode: a blocking call to a follow command is ALWAYS wrong (pi
+        // only sees output when the process exits — follow never exits), so
+        // redirect it into a background task directly. Zero extra round trips.
+        if (INTERCEPTOR_MODE === "auto-bg" || INTERCEPTOR_MODE === "auto") {
+          const res = spawnTask({ command: cmd, name: `auto:${cmd.trim().split("\n")[0].slice(0, 30)}` });
+          return {
+            block: true,
+            reason: res.ok
+              ? `bg-task auto-bg: started as background task '${res.meta.name}' (id: ${res.meta.id}). Monitor with bg_status, read with bg_log, stop with bg_kill. (PI_BG_INTERCEPTOR=auto-bg)`
+              : `bg-task auto-bg failed (${res.error}) — run it via bg_run yourself, or prefix with 'timeout N'.`,
+          };
+        }
         const key = cmd.trim();
         const now = Date.now();
         for (const [k, t] of warned) if (now - t > 3_600_000) warned.delete(k);
@@ -882,12 +898,8 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
         ctx?.ui?.notify?.("bg-task: blocked a follow-mode bash call once (model decides)", "warning");
         return {
           block: true,
-          reason: [
-            "⚠️ blocked by bg-task: this command uses follow/stream mode (-f/--follow/watch) and will NEVER exit on its own — running it here would block the session indefinitely. Decide:",
-            "1. (recommended) run it via bg_run instead — the conversation stays free and you can bg_kill it when done,",
-            "2. add an explicit bound, e.g. prefix with 'timeout 30 ', or",
-            "3. if you truly need it blocking, repeat the exact same command once more and it will be allowed.",
-          ].join("\n"),
+          reason:
+            "⚠️ bg-task: follow-mode command (-f/--follow/watch) never exits — blocking would hang this session. Run it via bg_run (recommended), prefix with 'timeout N', or repeat this exact command to force-run.",
         };
       } catch {
         return undefined; // interceptor must never break execution

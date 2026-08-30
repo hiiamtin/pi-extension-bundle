@@ -107,9 +107,10 @@ brute-force node solver pinned a session for 10+ minutes; `task logs-*` with
 - `bg_kill(id)` — SIGTERM the whole process group, SIGKILL after 5s — verified
   zero leftover children in e2e (`pgrep -g` = 0 after kill).
 
-**Follow-mode interceptor** (default `warn`): the built-in `bash` tool is
-watched. Detection is **scoped per command** (heredoc bodies and quoted
-strings are data, never options) so common `-f` flags never false-positive:
+**Follow-mode interceptor** (`PI_BG_INTERCEPTOR`, default `warn`): the
+built-in `bash` tool is watched. Detection is **scoped per command** (heredoc
+bodies and quoted strings are data, never options) so common `-f` flags never
+false-positive:
 
 - Caught: `docker[/compose|podman|kubectl|crictl] logs -f`, `tail -f`,
   `journalctl/systemctl/dmesg -f`, `watch`/`entr`, and tintin's
@@ -118,10 +119,16 @@ strings are data, never options) so common `-f` flags never false-positive:
 - Never caught: `rm -f`, `grep -f`, `curl -fsSL`, `git log -f`, `ping -f`,
   quoted/heredoc mentions, and anything prefixed with `timeout` (bounded).
 
-A caught command is blocked ONCE with a reason telling the model to use
-`bg_run` or add `timeout` — if the model repeats the exact command it is
-allowed through (warn, let the model decide). Disable with
-`PI_BG_INTERCEPTOR=off`.
+Modes:
+
+- `warn` (default) — a caught command is blocked ONCE with a short reason
+  telling the model to use `bg_run` or add `timeout`; repeating the exact
+  command is allowed through (warn, let the model decide).
+- `auto-bg` — don't ask: the command is started as a background task directly
+  and the model gets the task id back. A blocking call to a follow command is
+  always wrong (pi only sees output when a process exits — follow never
+  does), and this saves the block→retry round trip entirely.
+- `off` — no interception.
 
 On exit, the owning session gets a `bg-task` custom message with
 `triggerTurn: true`, so the model announces the result proactively (elapsed,
