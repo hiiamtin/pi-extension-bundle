@@ -5,8 +5,11 @@
 // with docker `logs -f` never exits at all). This extension gives the model
 // non-blocking tools:
 //
-//   bg_run(command, name?, timeout_min?)  → spawn detached (own process group),
-//                                           returns <100ms, chat continues.
+//   bg_run(command, name?, timeout_min?, detach?)  → spawn detached (own
+//                                           process group), returns <100ms,
+//                                           chat continues. detach=true: output
+//                                           fd-redirected, survives pi exit
+//                                           (exit code recorded to <id>/exitcode).
 //   bg_status(id?)                        → one task or all tasks (shared state:
 //                                           visible across ALL pi sessions).
 //   bg_log(id, tail_lines?)               → tail the rolling output log.
@@ -41,9 +44,9 @@
 //     model announces the result proactively instead of the user polling.
 //   - Auto-prune: finished/orphan/gone dirs older than PI_BG_PRUNE_HOURS (24).
 //
-// Human commands:  /bg            — list all tasks (panel)
+// Human commands:  /bg            — interactive task picker (inspect/kill)
 //                  /bg kill <id>  — kill with confirm
-//                  /bg on|off     — expose bg_* tools to the model
+//                  /bg on|off     — expose bg_* tools AND gate the interceptor
 //
 // Config (env): PI_BG_STATE_DIR, PI_BG_MAX_CONCURRENT (8), PI_BG_LOG_CAP_MB (2),
 //               PI_BG_PRUNE_HOURS (24), PI_BG_DEFAULT_TIMEOUT_MIN (0 = none).
@@ -54,9 +57,11 @@ import { extractToolArgs, requireString, textResult } from "../lib/tool-compat.t
 import { Type } from "typebox";
 import { spawn, type ChildProcess } from "node:child_process";
 import {
+  closeSync,
   createWriteStream,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -106,13 +111,14 @@ interface Meta {
   owner: string; // session file basename (or pid-NNN fallback)
   heartbeat?: number; // updated every widget tick by the owning instance
   bytes?: number; // total output bytes written (across rotations)
+  detach?: boolean; // fd-redirected output: survives pi restart (no live rotation)
 }
 
 interface OwnTask {
   meta: Meta;
   child: ChildProcess;
-  stream: ReturnType<typeof createWriteStream>;
-  bytesCurrent: number; // bytes in the current out.log
+  stream: ReturnType<typeof createWriteStream> | null; // null in detach mode
+  bytesCurrent: number; // bytes in the current out.log (pipe mode only)
   timeoutTimer: NodeJS.Timeout | null;
   killTimer: NodeJS.Timeout | null;
 }
@@ -134,6 +140,37 @@ function fmtDur(ms: number): string {
 function ownerId(): string {
   // session file basename minus extension, e.g. "2026-08-30T09-14-03"
   return `pid-${process.pid}`;
+}
+
+// Aggregate CPU/RSS of an entire process group from /proc — stateless average
+// CPU over the task's lifetime (no sampling window needed). Returns null when
+// nothing in the group is alive anymore.
+function groupStats(pgid: number, elapsedSec: number): { cpuPct: number; rssMb: number } | null {
+  try {
+    const CLK = 100; // getconf CLK_TCK on Linux
+    const PAGE = 4096;
+    let ticks = 0;
+    let rssKb = 0;
+    let found = false;
+    for (const pid of readdirSync("/proc")) {
+      if (!/^\d+$/.test(pid)) continue;
+      let text: string;
+      try {
+        text = readFileSync(`/proc/${pid}/stat`, "utf8");
+      } catch {
+        continue; // process vanished mid-scan
+      }
+      const after = text.slice(text.lastIndexOf(")") + 2).split(" ");
+      if (Number(after[2]) !== pgid) continue; // after[2] = pgrp
+      found = true;
+      ticks += (Number(after[11]) + Number(after[12])) / CLK; // utime + stime
+      const rss = Number(after[21]); // rss pages
+      if (Number.isFinite(rss)) rssKb += (rss * PAGE) / 1024;
+    }
+    return found ? { cpuPct: Math.round(elapsedSec > 0 ? (ticks / elapsedSec) * 100 : 0), rssMb: Math.round((rssKb / 1024) * 10) / 10 } : null;
+  } catch {
+    return null;
+  }
 }
 
 function stateIcon(s: TaskState): string {
@@ -214,6 +251,10 @@ function saveSettings(): void {
 
 // --- scanning: refresh foreign tasks, prune old dirs ------------------------
 
+function exitPath(id: string): string {
+  return path.join(dirOf(id), "exitcode");
+}
+
 function refreshScan(): void {
   const now = Date.now();
   for (const m of listDiskMetas()) {
@@ -223,6 +264,23 @@ function refreshScan(): void {
       continue;
     }
     const heartbeatAge = now - (m.heartbeat ?? m.startedAt);
+    if (m.detach && heartbeatAge > ORPHAN_MS) {
+      // detached task whose owner session is gone: the wrapper writes the exit
+      // code to <id>/exitcode on completion — use it as the authoritative finish
+      try {
+        const st = statSync(exitPath(m.id));
+        const code = Number.parseInt(readFileSync(exitPath(m.id), "utf8").trim(), 10);
+        if (Number.isFinite(code)) {
+          writeMeta({ ...m, state: code === 0 ? "done" : "failed", exitCode: code, finishedAt: st.mtimeMs });
+          continue;
+        }
+      } catch {
+        /* not finished yet — fall through to liveness below */
+      }
+      if (!pgidAlive(m.pgid)) writeMeta({ ...m, state: "gone", finishedAt: now });
+      else writeMeta({ ...m, state: "orphan" });
+      continue;
+    }
     if (!pgidAlive(m.pgid)) {
       // owner pi died before pipes flushed, or the process vanished
       writeMeta({ ...m, state: "gone", finishedAt: now });
@@ -282,6 +340,13 @@ function ensureWidgetLoop(): void {
       for (const t of own.values()) {
         if (t.meta.state !== "running") continue;
         t.meta.heartbeat = Date.now();
+        if (t.meta.detach) {
+          try {
+            t.meta.bytes = statSync(path.join(dirOf(t.meta.id), "out.log")).size;
+          } catch {
+            /* ignore */
+          }
+        }
         writeMeta(t.meta);
       }
       refreshScan();
@@ -341,6 +406,7 @@ interface SpawnOpts {
   command: string;
   name?: string;
   timeoutMin?: number;
+  detach?: boolean;
 }
 
 function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; error: string } {
@@ -365,18 +431,40 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
     owner: ownerId(),
     heartbeat: Date.now(),
     bytes: 0,
+    detach: opts.detach === true ? true : undefined,
   };
 
   mkdirSync(dirOf(id), { recursive: true });
   writeMeta(meta);
 
   // new process group (detached) + lowest background priority
+  //   pipe mode (default): output piped through a rolling write stream — bounded
+  //     disk + live byte counter, but the task dies if pi exits (EPIPE).
+  //   detach mode: output fd-redirected straight to out.log — survives pi exit;
+  //     a wrapper appends the exit code to <id>/exitcode so any later session
+  //     can finalize the task's true state. No live rotation (prune covers disk).
   let child: ChildProcess;
   try {
-    child = spawn("nice", ["-n", "15", "ionice", "-c3", "bash", "-c", opts.command], {
-      detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const bashArgs = ["-n", "15", "ionice", "-c3", "bash", "-c"];
+    if (meta.detach) {
+      const fd = openSync(path.join(dirOf(id), "out.log"), "a");
+      // subshell group (not braces): valid for any command body incl. trailing
+      // `&`, and $? is always the group's exit code
+      child = spawn("nice", [...bashArgs, `(\n${opts.command}\n) ; echo $? > '${exitPath(id)}'`], {
+        detached: true,
+        stdio: ["ignore", fd, fd],
+      });
+      try {
+        closeSync(fd); // parent doesn't need it; the child holds its own copy
+      } catch {
+        /* ignore */
+      }
+    } else {
+      child = spawn("nice", [...bashArgs, opts.command], {
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    }
   } catch (e) {
     writeMeta({ ...meta, state: "failed", finishedAt: Date.now(), exitCode: -1 });
     return { ok: false, error: `spawn failed: ${(e as Error).message}` };
@@ -440,7 +528,7 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
     if (task.timeoutTimer) clearTimeout(task.timeoutTimer);
     if (task.killTimer) clearTimeout(task.killTimer);
     try {
-      task.stream.end();
+      task.stream?.end();
     } catch {
       /* ignore */
     }
@@ -667,12 +755,13 @@ function bgDetailText(id: string): string {
   if (!m) return `task '${id}' not found — use bg_status without args to list tasks`;
   const now = Date.now();
   const dur = m.finishedAt ? `ran ${fmtDur(m.finishedAt - m.startedAt)}` : `running for ${fmtDur(now - m.startedAt)}`;
+  const gs = m.state === "running" ? groupStats(m.pgid, (now - m.startedAt) / 1000) : null;
   const last = m.state === "running" ? tailLog(id, 3, 500) : tailLog(id, 5, 800);
   return clampChars(
     [
       `${stateIcon(m.state)} ${m.id} '${m.name}' — ${m.state}, ${dur}`,
       `cmd: ${m.cmd.slice(0, 200)}`,
-      `pid/pgid: ${m.pid}/${m.pgid} · output: ${((m.bytes ?? 0) / 1024).toFixed(1)}KB · owner: ${m.owner}`,
+      `pid/pgid: ${m.pid}/${m.pgid} · cpu: ${gs ? `${gs.cpuPct}%` : "-"} · rss: ${gs ? `${gs.rssMb}MB` : "-"} · output: ${((m.bytes ?? 0) / 1024).toFixed(1)}KB · owner: ${m.owner}${m.detach ? " · detached (survives pi restart)" : ""}`,
       `log: ${dirOf(id)}/out.log`,
       last ? `last output:\n${last}` : "(no output yet)",
     ].join("\n"),
@@ -699,6 +788,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       command: Type.String({ description: "Shell command to run in the background" }),
       name: Type.Optional(Type.String({ description: "Short label for the task (shown in the status widget)" })),
       timeout_min: Type.Optional(Type.Number({ description: `Kill the task after N minutes (default: ${DEFAULT_TIMEOUT_MIN || "none"}). Useful to bound exploratory scripts.` })),
+      detach: Type.Optional(Type.Boolean({ description: "Survive pi restarts: output goes straight to the log file (no live rotation) and the exit code is recorded on completion" })),
     }),
     execute: (...cbArgs: unknown[]) => {
       const params = extractToolArgs(cbArgs) as Record<string, unknown>;
@@ -709,6 +799,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
         command: String(params.command),
         name: params.name != null ? String(params.name) : undefined,
         timeoutMin: params.timeout_min != null ? Number(params.timeout_min) : undefined,
+        detach: params.detach === true,
       });
       if (!res.ok) return textResult(`error: ${res.error}`);
       const warn = looksLikeFollow(String(params.command))
@@ -823,8 +914,8 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
   // --- /bg command ----------------------------------------------------------
 
   pi.registerCommand("bg", {
-    description: "Background tasks: list, kill, toggle tools",
-    handler: async (args: string, ctx: { ui?: { notify?: (m: string, l: string) => void; confirm?: (t: string, m: string) => Promise<boolean> } }) => {
+    description: "Background tasks: picker, kill, toggle tools",
+    handler: async (args: string, ctx: { ui?: { notify?: (m: string, l: string) => void; confirm?: (t: string, m: string) => Promise<boolean>; select?: (title: string, options: string[]) => Promise<string | undefined> } }) => {
       if (ctx?.ui) {
         cachedUi = ctx.ui as typeof cachedUi;
         if (typeof ctx.ui.notify === "function") notify = ctx.ui.notify;
@@ -834,7 +925,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       if (sub === "on" || sub === "off") {
         settings.toolsEnabled = sub === "on";
         saveSettings();
-        ctx?.ui?.notify?.(`bg tools ${sub}`, "info");
+        ctx?.ui?.notify?.(`bg tools ${sub} (interceptor ${sub === "on" ? "active" : "disabled"} too)`, "info");
         return;
       }
 
@@ -857,7 +948,32 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
         return;
       }
 
-      // default: panel
+      // default: interactive picker (TUI + pi-web), plain list as fallback
+      refreshScan();
+      const metas = listDiskMetas();
+      if (!metas.length) {
+        ctx?.ui?.notify?.("no background tasks", "info");
+        return;
+      }
+      if (typeof ctx?.ui?.select === "function") {
+        const sorted = [...metas].sort((a, b) => Number(a.state === "running") - Number(b.state === "running"));
+        const pick = await ctx.ui.select("Background tasks (pick to inspect/kill)", [...sorted.map((m) => taskLine(m, own.has(m.id))), "✖ close"]);
+        if (!pick || pick === "✖ close") return;
+        const id = pick.split("·")[1]?.trim().split(" ")[0] ?? "";
+        const m = own.get(id)?.meta ?? readMeta(id);
+        if (!m) return;
+        if (m.state === "running" || m.state === "orphan") {
+          if (await ctx.ui.confirm?.("Kill this background task?", `${m.name} (${m.id}, pgid ${m.pgid})`)) {
+            if (own.has(id)) own.get(id)!.meta.state = "killed";
+            else writeMeta({ ...m, state: "killed" });
+            killGroup(m);
+            ctx.ui.notify?.(`SIGTERM sent to '${m.name}' (${m.id})`, "info");
+            return;
+          }
+        }
+        ctx.ui.notify?.(bgDetailText(id), "info");
+        return;
+      }
       ctx?.ui?.notify?.(bgListText(), "info");
     },
   });
@@ -870,6 +986,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     const warned = new Map<string, number>(); // cmd -> timestamp of first block
     pi.on("tool_call", async (event: { toolName?: string; input?: { command?: unknown } }, ctx?: { ui?: { notify?: (m: string, l: string) => void } }) => {
       try {
+        if (!settings.toolsEnabled) return undefined; // /bg off gates the interceptor too
         if (event?.toolName !== "bash") return undefined;
         const cmd = typeof event.input?.command === "string" ? event.input.command : "";
         if (!cmd || !looksLikeFollow(cmd)) return undefined;

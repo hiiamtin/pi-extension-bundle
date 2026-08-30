@@ -90,11 +90,14 @@ Keeps the conversation responsive while long jobs run (real-world trigger: a
 brute-force node solver pinned a session for 10+ minutes; `task logs-*` with
 `logs -f` never exits). The model gets non-blocking tools:
 
-- `bg_run(command, name?, timeout_min?)` — spawn detached in its own process
-  group at `nice 15 / ionice -c3` (can never starve the docker stack); returns
-  a task id immediately. Warns (in the tool result) when the command looks like
-  follow mode (`-f`/`--follow`/`watch`) so the model can decide to kill it
-  later — it never blocks the chat either way.
+- `bg_run(command, name?, timeout_min?, detach?)` — spawn detached in its own
+  process group at `nice 15 / ionice -c3` (can never starve the docker stack);
+  returns a task id immediately. Warns (in the tool result) when the command
+  looks like follow mode (`-f`/`--follow`/`watch`) so the model can decide to
+  kill it later — it never blocks the chat either way. `detach: true` streams
+  output straight to the log file via fd: the task survives pi restarts and
+  its real exit code is recorded to `<id>/exitcode` by a wrapper shell (no
+  live rotation in this mode).
 - `bg_status(id?)` — one task or ALL tasks **across every pi session on the
   machine** (shared state dir), incl. orphans from dead sessions.
 - `bg_log(id, tail_lines?)` — cheap tail of the rolling log (rotates at
@@ -134,8 +137,9 @@ On exit, the owning session gets a `bg-task` custom message with
 `triggerTurn: true`, so the model announces the result proactively (elapsed,
 exit code, last output, log path) instead of the user polling.
 
-Human commands: `/bg` (panel), `/bg kill <id>` (confirm), `/bg on|off`
-(expose tools to the model, default on).
+Human commands: `/bg` (interactive picker — pick a task to inspect or kill
+with confirm), `/bg kill <id>`, `/bg on|off` (expose tools to the model AND
+gate the interceptor, default on).
 
 - State: `~/.pi/agent/bg-tasks/<id>/{meta.json,out.log,out.1.log}` with
   heartbeats (stale heartbeat + live process ⇒ `orphan`), auto-prune after
@@ -143,8 +147,9 @@ Human commands: `/bg` (panel), `/bg kill <id>` (confirm), `/bg on|off`
 - Config: `PI_BG_STATE_DIR`, `PI_BG_MAX_CONCURRENT` (8), `PI_BG_LOG_CAP_MB`
   (2), `PI_BG_PRUNE_HOURS` (24), `PI_BG_DEFAULT_TIMEOUT_MIN` (0 = none),
   `PI_BG_INTERCEPTOR` (`auto-bg` | `warn` | `off`).
-- Limitation: a task whose output exceeds the pipe buffer dies if the pi
-  process itself exits mid-run (marked `gone` on the next scan).
+- Limitation: pipe-mode tasks whose output exceeds the pipe buffer die if the
+  pi process itself exits mid-run (marked `gone` on the next scan) — use
+  `detach: true` for jobs that must survive restarts.
 - `/bg` commands in pi-web work too (widget renders above the editor in both
   TUI and pi-web).
 
@@ -194,12 +199,12 @@ VM (dev, live-edit): registered as a local-path package by `task pi-extensions-s
 Other machines:
 
 ```bash
-pi install git:github.com/hiiamtin/pi-extensions@v1
+pi install git:github.com/hiiamtin/pi-extension-bundle@v1
 ```
 
 Update pinned ref:
 
 ```bash
-pi install git:github.com/hiiamtin/pi-extensions@v2   # move to new tag
+pi install git:github.com/hiiamtin/pi-extension-bundle@v2   # move to new tag
 pi update --extensions                                  # reconcile to configured ref
 ```
