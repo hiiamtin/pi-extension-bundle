@@ -299,10 +299,34 @@ function ensureWidgetLoop(): void {
 
 // --- core: spawn / finalize / kill ------------------------------------------
 
-const FOLLOW_RE = /(^|\s)(--follow|-f)(\s|$)|\bwatch\s+|\btail\s+-[a-zA-Z]*f/;
-
+// Detect follow/stream commands — scoped per command so common `-f` flags
+// (rm -f, grep -f, curl -f) and heredoc/quoted content never false-positive.
+// Real streamers: container logs -f (docker/podman/kubectl/...), tail -f,
+// journalctl/systemctl/dmesg -f, watch/entr, and tintin's `task logs-*`
+// (the Taskfile expands them to `docker compose logs --tail N -f`).
 function looksLikeFollow(cmd: string): boolean {
-  return FOLLOW_RE.test(cmd);
+  // heredoc bodies and quoted strings are data, not options of the main command
+  const c = cmd
+    .replace(/<<-?\s*(['"]?)(\w+)\1[\s\S]*?\n\s*\2\b/g, " HEREDOC ")
+    .replace(/"(?:[^"\\]|\\.)*"/g, ' "" ')
+    .replace(/'(?:[^'\\]|\\.)*'/g, " '' ");
+  if (!c.trim()) return false;
+  return c
+    .split(/\||;|&&|\|\||\n|\(|\)|`/)
+    .some((seg) => {
+      const tokens = seg.trim().split(/\s+/).filter(Boolean);
+      if (!tokens.length) return false;
+      const base = (tokens[0].split("/").pop() ?? tokens[0]).toLowerCase();
+      const rest = tokens.slice(1);
+      const hasF = rest.some((t) => t === "-f" || t === "--follow");
+      const tailF = base === "tail" && rest.some((t) => /^-[a-z]*f/i.test(t) || t === "--follow");
+      const watch = base === "watch" || base === "entr";
+      const contLogs = /^(docker|podman|nerdctl)(-compose)?$/.test(base) || base === "kubectl" || base === "crictl";
+      const contLogF = contLogs && rest.some((t) => /^logs?\b/.test(t)) && hasF;
+      const sysdF = (base === "journalctl" || base === "systemctl" || base === "dmesg") && hasF;
+      const taskLogs = base === "task" && /^logs/i.test(tokens[1] ?? ""); // tintin Taskfile
+      return contLogF || tailF || watch || sysdF || taskLogs;
+    });
 }
 
 function nextId(): string {

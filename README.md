@@ -108,11 +108,20 @@ brute-force node solver pinned a session for 10+ minutes; `task logs-*` with
   zero leftover children in e2e (`pgrep -g` = 0 after kill).
 
 **Follow-mode interceptor** (default `warn`): the built-in `bash` tool is
-watched. A follow/stream command (`-f`, `--follow`, `watch`, `tail -f`) is
-blocked ONCE with a reason telling the model to use `bg_run` or add
-`timeout` — if the model repeats the exact command it is allowed through
-(warn, let the model decide). Commands already prefixed with `timeout` pass.
-Disable with `PI_BG_INTERCEPTOR=off`.
+watched. Detection is **scoped per command** (heredoc bodies and quoted
+strings are data, never options) so common `-f` flags never false-positive:
+
+- Caught: `docker[/compose|podman|kubectl|crictl] logs -f`, `tail -f`,
+  `journalctl/systemctl/dmesg -f`, `watch`/`entr`, and tintin's
+  `task logs-*` (the Taskfile expands to `logs --tail N -f`) — anywhere in a
+  pipeline (`&&`, `;`, `|`).
+- Never caught: `rm -f`, `grep -f`, `curl -fsSL`, `git log -f`, `ping -f`,
+  quoted/heredoc mentions, and anything prefixed with `timeout` (bounded).
+
+A caught command is blocked ONCE with a reason telling the model to use
+`bg_run` or add `timeout` — if the model repeats the exact command it is
+allowed through (warn, let the model decide). Disable with
+`PI_BG_INTERCEPTOR=off`.
 
 On exit, the owning session gets a `bg-task` custom message with
 `triggerTurn: true`, so the model announces the result proactively (elapsed,
