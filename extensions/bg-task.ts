@@ -94,6 +94,7 @@ const PRUNE_MS = envInt("PI_BG_PRUNE_HOURS", 24, 1, 24 * 30) * 3_600_000;
 const DEFAULT_TIMEOUT_MIN = envInt("PI_BG_DEFAULT_TIMEOUT_MIN", 0, 0, 24 * 60); // 0 = no timeout
 const KILL_ESCALATE_MS = 5_000;
 const ORPHAN_MS = 15_000; // heartbeat older than this + still running => orphan
+const ADOPT_GRACE_MS = 60_000; // foreign finished task: adopt (notify here) only after the owner had this long to do it itself
 const WIDGET_MS = envInt("PI_BG_TICK_MS", 5_000, 1_000, 300_000); // scan/heartbeat cadence while tasks are running
 const SETTINGS_FILE = path.join(os.homedir(), ".pi/agent/bg-task-settings.json");
 const MAX_OUTPUT_CHARS = 8_000;
@@ -115,7 +116,8 @@ interface Meta {
   exitCode?: number | null;
   signal?: string | null;
   state: TaskState;
-  owner: string; // session file basename (or pid-NNN fallback)
+  owner: string; // short session label (or pid-NNN fallback)
+  ownerSession?: string; // full session file path — the real per-session identity
   heartbeat?: number; // updated every widget tick by the owning instance
   bytes?: number; // total output bytes written (across rotations)
   detach?: boolean; // fd-redirected output: survives pi restart (no live rotation)
@@ -147,8 +149,33 @@ function fmtDur(ms: number): string {
 }
 
 function ownerId(): string {
-  // session file basename minus extension, e.g. "2026-08-30T09-14-03"
+  // fallback identity when no session file is available (ephemeral sessions)
   return `pid-${process.pid}`;
+}
+
+function shortSession(sessionFile: string): string {
+  // "~/.pi/agent/sessions/<hash>/2026-08-30T19-35-12-abc.jsonl" -> "2026-08-30T19-35"
+  const base = (sessionFile.split("/").pop() ?? sessionFile).replace(/\.jsonl$/, "");
+  return base.slice(0, 16);
+}
+
+// Whose notice is this? Sessions are separated by their session FILE (pid is
+// useless in pi-web where every session shares one process).
+//   - our own session                    -> always ours
+//   - owner session file deleted          -> owner is gone, adopt
+//   - otherwise foreign                   -> adopt only after ADOPT_GRACE_MS
+//     (a live owner's exit handler notifies within milliseconds; silence past
+//     the grace means its watcher is dead)
+function shouldAdoptNotice(m: Meta, now: number): boolean {
+  const age = now - (m.finishedAt ?? now);
+  if (!m.ownerSession) return age > ADOPT_GRACE_MS; // legacy meta without session identity
+  if (currentSessionFile && m.ownerSession === currentSessionFile) return true;
+  if (!existsSync(m.ownerSession)) return true; // owner session file deleted — owner is gone
+  return age > ADOPT_GRACE_MS; // foreign: its live exit handler notifies in ms; silence means dead
+}
+
+function isCrossSession(m: Meta): boolean {
+  return !!m.ownerSession && (!currentSessionFile || m.ownerSession !== currentSessionFile);
 }
 
 // Aggregate CPU/RSS of an entire process group from /proc — stateless average
@@ -241,6 +268,7 @@ let cachedUi: { setWidget?: (k: string, lines: string[] | undefined) => void; se
 let widgetTimer: NodeJS.Timeout | null = null;
 let notify: ((msg: string, level: string) => void) | null = null;
 let piApi: ExtensionAPI | null = null;
+let currentSessionFile: string | undefined; // this instance's own session (set on session_start)
 
 const DEBUG_LOG = path.join(os.homedir(), ".pi/agent/log/bg-task-debug.log");
 // self-capped (~48KB) diagnostics for spawn/exit/notify — never fatal
@@ -298,7 +326,7 @@ function refreshScan(metas?: Meta[]): void {
         const code = Number.parseInt(readFileSync(exitPath(m.id), "utf8").trim(), 10);
         if (Number.isFinite(code)) {
           writeMeta({ ...m, state: code === 0 ? "done" : "failed", exitCode: code, finishedAt: st.mtimeMs });
-          attemptNotify(m, "scan"); // owner session is gone — surface it here instead
+          if (shouldAdoptNotice(m, now)) attemptNotify(m, "scan"); // owner session gone or task is ours
           continue;
         }
       } catch {
@@ -435,6 +463,7 @@ interface SpawnOpts {
   name?: string;
   timeoutMin?: number;
   detach?: boolean;
+  ownerSession?: string; // full session file path of the spawning session
 }
 
 function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; error: string } {
@@ -456,7 +485,8 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
     pgid: 0,
     startedAt: Date.now(),
     state: "running",
-    owner: ownerId(),
+    owner: opts.ownerSession ? shortSession(opts.ownerSession) : ownerId(),
+    ownerSession: opts.ownerSession,
     heartbeat: Date.now(),
     bytes: 0,
     detach: opts.detach === true ? true : undefined,
@@ -585,9 +615,10 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
 function attemptNotify(m: Meta, via: string): void {
   if (m.notifiedAt) return;
   m.notifyTries = (m.notifyTries ?? 0) + 1;
+  const cross = isCrossSession(m);
   const tail = tailLog(m.id, 5, 600);
   const content = [
-    `Background task '${m.name}' (${m.id}) finished: ${m.state}${m.exitCode != null ? ` exit=${m.exitCode}` : ""} after ${fmtDur((m.finishedAt ?? Date.now()) - m.startedAt)}.`,
+    `Background task '${m.name}' (${m.id}) finished: ${m.state}${m.exitCode != null ? ` exit=${m.exitCode}` : ""} after ${fmtDur((m.finishedAt ?? Date.now()) - m.startedAt)}.${cross ? " (from another session)" : ""}`,
     tail ? `Last output:\n${tail}` : "",
     `Full log: ${dirOf(m.id)}/out.log — inspect with bg_log, results on disk stay until pruned.`,
   ]
@@ -779,10 +810,10 @@ function openHeadTail(file: string): string {
 
 // --- tools ------------------------------------------------------------------
 
-function taskLine(m: Meta, mine: boolean): string {
+function taskLine(m: Meta): string {
   const now = Date.now();
   const dur = m.finishedAt ? fmtDur(m.finishedAt - m.startedAt) : fmtDur(now - m.startedAt);
-  const flag = mine ? " [this session]" : "";
+  const flag = own.has(m.id) || (m.ownerSession && m.ownerSession === currentSessionFile) ? " [this session]" : "";
   const exit = m.exitCode != null && m.exitCode !== 0 ? ` exit=${m.exitCode}` : "";
   return `${stateIcon(m.state)} ${m.id} · ${m.name} · ${m.state}${exit} · ${dur}${flag}`;
 }
@@ -808,7 +839,7 @@ function bgDetailText(id: string): string {
     [
       `${stateIcon(m.state)} ${m.id} '${m.name}' — ${m.state}, ${dur}`,
       `cmd: ${m.cmd.slice(0, 200)}`,
-      `pid/pgid: ${m.pid}/${m.pgid} · cpu: ${gs ? `${gs.cpuPct}%` : "-"} · rss: ${gs ? `${gs.rssMb}MB` : "-"} · output: ${((m.bytes ?? 0) / 1024).toFixed(1)}KB · owner: ${m.owner}${m.detach ? " · detached (survives pi restart)" : ""}`,
+      `pid/pgid: ${m.pid}/${m.pgid} · cpu: ${gs ? `${gs.cpuPct}%` : "-"} · rss: ${gs ? `${gs.rssMb}MB` : "-"} · output: ${((m.bytes ?? 0) / 1024).toFixed(1)}KB · owner: ${m.ownerSession ? shortSession(m.ownerSession) : m.owner}${m.detach ? " · detached (survives pi restart)" : ""}`,
       `log: ${dirOf(id)}/out.log`,
       last ? `last output:\n${last}` : "(no output yet)",
     ].join("\n"),
@@ -847,6 +878,9 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
         name: params.name != null ? String(params.name) : undefined,
         timeoutMin: params.timeout_min != null ? Number(params.timeout_min) : undefined,
         detach: params.detach === true,
+        ownerSession: typeof cbArgs[4] === "object" && cbArgs[4] !== null
+          ? (cbArgs[4] as { sessionManager?: { getSessionFile?: () => string | undefined } }).sessionManager?.getSessionFile?.()
+          : undefined,
       });
       if (!res.ok) return textResult(`error: ${res.error}`);
       const warn = looksLikeFollow(String(params.command))
@@ -1071,15 +1105,20 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     });
   }
 
-  // reload-proof finish notices: any live instance surfaces tasks that finished
-  // without ever being notified (their watcher died in a reload/restart)
-  pi.on("session_start", async () => {
+  // reload-proof finish notices. Strict ownership: a session only reports its
+  // OWN tasks; foreign tasks are surfaced only when their owner session is
+  // gone (file deleted) or past ADOPT_GRACE_MS without any notification
+  // (a live owner's exit handler notifies within milliseconds).
+  pi.on("session_start", async (_event: unknown, ctx: unknown) => {
     try {
+      const sf = (ctx as { sessionManager?: { getSessionFile?: () => string | undefined } } | undefined)?.sessionManager?.getSessionFile?.();
+      if (sf) currentSessionFile = sf;
       const metas = listDiskMetas();
       refreshScan(metas);
-      const pending = metas.filter((m) => m.state !== "running" && !m.notifiedAt && m.finishedAt && Date.now() - m.finishedAt < PRUNE_MS);
+      const now = Date.now();
+      const pending = metas.filter((m) => m.state !== "running" && !m.notifiedAt && m.finishedAt && now - m.finishedAt < PRUNE_MS && shouldAdoptNotice(m, now));
       if (!pending.length || !piApi || typeof piApi.sendMessage !== "function") return;
-      const lines = pending.slice(0, 5).map((m) => `${stateIcon(m.state)} ${m.name} (${m.id}) — ${m.state}${m.exitCode != null ? `, exit=${m.exitCode}` : ""}, ran ${fmtDur(m.finishedAt - m.startedAt)}`);
+      const lines = pending.slice(0, 5).map((m) => `${stateIcon(m.state)} ${m.name} (${m.id}) — ${m.state}${m.exitCode != null ? `, exit=${m.exitCode}` : ""}, ran ${fmtDur(m.finishedAt - m.startedAt)}${isCrossSession(m) ? " · from another session" : ""}`);
       (piApi.sendMessage as unknown as (msg: unknown, opts: unknown) => void)(
         {
           customType: "bg-task",
@@ -1089,7 +1128,6 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
         },
         { deliverAs: "followUp", triggerTurn: true },
       );
-      const now = Date.now();
       for (const m of pending) {
         m.notifiedAt = now;
         writeMeta(m);

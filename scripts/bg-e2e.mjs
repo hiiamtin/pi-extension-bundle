@@ -16,7 +16,7 @@
 // Exit code 0 = ALL OK.
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -99,6 +99,29 @@ if (typeof h !== "function") {
   if (bgId) await exec("bg_kill", { id: bgId.trim() });
   const normal = await h({ toolName: "bash", input: { command: "ls -la" } }, ctx);
   check("interceptor: normal command untouched", normal === undefined);
+}
+
+// --- 6: session ownership separation ---
+// session_start tracks the current session; our own finished tasks surface
+// without a cross-session tag, foreign ones only after adoption + with tag.
+const ssHook = hooks["session_start"];
+if (typeof ssHook === "function") {
+  // foreign task whose owner session file is DELETED -> adoptable immediately
+  const foreignDir = path.join(STATE_DIR, "e2eforeign");
+  mkdirSync(foreignDir, { recursive: true });
+  writeFileSync(
+    path.join(foreignDir, "meta.json"),
+    JSON.stringify({ id: "e2eforeign", name: "foreign-task", cmd: "echo", pid: 1, pgid: 1, startedAt: Date.now() - 120000, state: "done", exitCode: 0, finishedAt: Date.now() - 60000, owner: "dead-sess", ownerSession: "/tmp/definitely-deleted-session.jsonl", heartbeat: 0, bytes: 0 }),
+  );
+  await ssHook({}, { sessionManager: { getSessionFile: () => path.join(STATE_DIR, "e2e-current-session.jsonl") } });
+  const summary = sent.filter((s) => s.m?.content?.includes("finished since you were away"));
+  const last = summary.at(-1)?.m?.content ?? "";
+  check("ownership: foreign task adopted with cross-session tag", last.includes("foreign-task") && last.includes("from another session"));
+  check("ownership: own tasks not tagged cross-session", !last.includes("e2e-group"));
+  const fmeta = JSON.parse(readFileSync(path.join(foreignDir, "meta.json"), "utf8"));
+  check("ownership: foreign task marked notified", !!fmeta.notifiedAt);
+} else {
+  check("session_start hook registered", false);
 }
 
 console.log(failures === 0 ? "\nALL OK" : `\n${failures} FAILURE(S)`);
