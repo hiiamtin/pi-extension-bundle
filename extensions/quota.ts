@@ -220,6 +220,17 @@ function statusLineText(res: QuotaResponse, mode: Settings["statusMode"], curren
     const matched = target ? providers.filter((p) => providerMatches(p.provider, target)) : [];
     if (matched.length > 0) providers = matched; // fallback: show all when unmapped
   }
+  // collapse duplicate providers (e.g. multiple Gemini keys → "Gem" twice) —
+  // keep the entry with the highest usage bar so the line stays short
+  const byShort = new Map<string, (typeof providers)[number]>();
+  const topPct = (q: (typeof providers)[number]) => (q.bars.length ? Math.max(...q.bars.map((b) => b.percent)) : -1);
+  for (const p of providers) {
+    const key = shortName(p.provider);
+    const prev = byShort.get(key);
+    if (!prev || topPct(p) > topPct(prev)) byShort.set(key, p);
+  }
+  providers = [...byShort.values()];
+
   const parts = providers.map((p) => {
     if (p.status === "deferred" || p.bars.length === 0) return `${DIM}${shortName(p.provider)}–${R}`;
     const top = [...p.bars].sort((a, b) => b.percent - a.percent)[0];
