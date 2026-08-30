@@ -221,15 +221,18 @@ function statusLineText(res: QuotaResponse, mode: Settings["statusMode"], curren
     if (matched.length > 0) providers = matched; // fallback: show all when unmapped
   }
   const parts = providers.map((p) => {
-    if (p.status === "deferred" || p.bars.length === 0) return `${DIM}${shortName(p.provider)} –${R}`;
+    if (p.status === "deferred" || p.bars.length === 0) return `${DIM}${shortName(p.provider)}–${R}`;
     const top = [...p.bars].sort((a, b) => b.percent - a.percent)[0];
-    if (!top) return `${DIM}${shortName(p.provider)} ${p.status}${R}`;
+    if (!top) return `${DIM}${shortName(p.provider)}${R}`;
     const pct = Math.round(top.percent);
-    return `${colorForPct(pct)}${shortName(p.provider)} ${pct}%${R}`;
+    return `${colorForPct(pct)}${shortName(p.provider)}${pct}%${R}`;
   });
   if (parts.length === 0) return "";
-  const stale = res.metadata?.freshness === "stale" ? ` ${DIM}stale${R}` : "";
-  return `quota: ${parts.join(" · ")}${stale}`;
+  // Compact single-line format (mobile-safe): no "quota:" prefix, no " · "
+  // separators — long status lines wrap on narrow screens and make the pi-web
+  // footer grow tall. Typical output: "zAI42% OC78% 9arm– OA15%" (~24 chars).
+  const stale = res.metadata?.freshness === "stale" ? ` ${DIM}*${R}` : "";
+  return `${parts.join(" ")}${stale}`;
 }
 
 export default function quotaExtension(pi: ExtensionAPI): void {
