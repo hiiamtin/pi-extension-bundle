@@ -67,6 +67,7 @@ const MIN_ARGS = {
   bg_status: {},
   bg_log: { id: "nope-smoke" },
   bg_kill: { id: "nope-smoke" },
+  bg_artifact: { path: "package.json" },
 };
 
 let failures = 0;

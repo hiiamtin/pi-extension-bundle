@@ -10,8 +10,17 @@
 //   bg_status(id?)                        → one task or all tasks (shared state:
 //                                           visible across ALL pi sessions).
 //   bg_log(id, tail_lines?)               → tail the rolling output log.
+//   bg_artifact(id?, path?)               → token-safe summary of a result file
+//                                           (JSON/JSONL/CSV/text: schema +
+//                                           first entries, never the whole file).
 //   bg_kill(id)                           → SIGTERM the whole process group,
 //                                           escalate to SIGKILL after 5s.
+//
+// FOLLOW-MODE INTERCEPTOR (default warn): the built-in `bash` tool is watched;
+// a follow/stream command (`-f`, `--follow`, `watch`, `tail -f`) is blocked
+// ONCE with guidance (use bg_run / add `timeout`), then allowed if the model
+// repeats the exact command — warn, let the model decide. Disable with
+// PI_BG_INTERCEPTOR=off.
 //
 // Design notes (TinTin VM, 4 cores / 24GB ARM):
 //   - Every task runs `nice -n 15 ionice -c3` so background jobs can never
@@ -48,6 +57,7 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import * as os from "node:os";
@@ -71,6 +81,8 @@ const ORPHAN_MS = 15_000; // heartbeat older than this + still running => orphan
 const WIDGET_MS = 3_000;
 const SETTINGS_FILE = path.join(os.homedir(), ".pi/agent/bg-task-settings.json");
 const MAX_OUTPUT_CHARS = 8_000;
+const INTERCEPTOR_MODE = (process.env.PI_BG_INTERCEPTOR || "warn").toLowerCase(); // warn | off
+const ARTIFACT_PARSE_LIMIT = 8 * 1024 * 1024; // files bigger than this skip JSON.parse
 
 // --- types ------------------------------------------------------------------
 
@@ -487,6 +499,121 @@ function tailLog(id: string, lines: number, maxChars: number): string {
   return clampChars(arr.slice(Math.max(0, arr.length - lines)).join("\n"), maxChars);
 }
 
+// --- artifact summarizing (token-safe) ---------------------------------------
+
+function typeOf(v: unknown): string {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return "array";
+  if (typeof v === "number") return Number.isInteger(v) ? "int" : "float";
+  return typeof v;
+}
+
+function shapeOf(v: unknown): string {
+  if (v === null || typeof v !== "object") return typeOf(v);
+  if (Array.isArray(v)) return v.length ? `array[${v.length}] of ${typeOf(v[0])}` : "array[0]";
+  const keys = Object.keys(v);
+  return keys.length <= 6 ? `object{${keys.join(",")}}` : `object{${keys.slice(0, 6).join(",")},+${keys.length - 6} more}`;
+}
+
+function summarizeValue(v: unknown, maxChars: number): string {
+  if (v === null || typeof v !== "object") return clampChars(JSON.stringify(v) ?? "null", 120);
+  return clampChars(shapeOf(v), maxChars);
+}
+
+function artifactSummary(file: string, maxEntries: number): string {
+  let stat: { size: number; mtime: Date };
+  try {
+    const st = statSync(file);
+    stat = { size: st.size, mtime: st.mtime };
+  } catch {
+    return `error: file not found: ${file}`;
+  }
+  const head = `${file}\nsize: ${(stat.size / 1024).toFixed(1)}KB · modified: ${stat.mtime.toISOString()}`;
+
+  // too big to parse — raw head/tail only (fd reads, never the whole file)
+  if (stat.size > ARTIFACT_PARSE_LIMIT) {
+    return `${head} (too large to parse — raw preview)\n${clampChars(openHeadTail(file), MAX_OUTPUT_CHARS)}`;
+  }
+
+  const text = readFileSync(file, "utf8");
+  const lines = text.split("\n");
+  const ext = path.extname(file).toLowerCase();
+
+  // JSON
+  if (ext === ".json" || /^\s*[[{]/.test(text)) {
+    try {
+      const v = JSON.parse(text) as unknown;
+      if (Array.isArray(v)) {
+        const items = v.slice(0, maxEntries).map((it, i) => `  [${i}] ${clampChars(JSON.stringify(it) ?? "?", 400)}`);
+        return [
+          `${head}`,
+          `type: JSON array[${v.length}]`,
+          v.length ? `item shape: ${shapeOf(v[0])}` : "",
+          `first ${items.length} entr${items.length === 1 ? "y" : "ies"}:`,
+          ...items,
+        ].filter(Boolean).join("\n");
+      }
+      if (v && typeof v === "object") {
+        const entries = Object.entries(v as Record<string, unknown>).slice(0, 20).map(([k, val]) => `  ${k}: ${summarizeValue(val, 200)}`);
+        return [`${head}`, `type: JSON object{${Object.keys(v as object).length} keys}`, ...entries].join("\n");
+      }
+      return `${head}\ntype: JSON scalar — ${clampChars(JSON.stringify(v) ?? "?", 200)}`;
+    } catch {
+      // fall through to text/JSONL handling
+    }
+  }
+
+  // JSONL
+  const nonEmpty = lines.filter((l) => l.trim());
+  if (ext === ".jsonl" || (nonEmpty.length > 1 && nonEmpty.every((l) => /^\s*\{/.test(l)))) {
+    const parsed: unknown[] = [];
+    for (const l of nonEmpty) {
+      try {
+        parsed.push(JSON.parse(l) as unknown);
+      } catch {
+        break;
+      }
+    }
+    if (parsed.length) {
+      const items = parsed.slice(0, Math.min(maxEntries, 2)).map((it, i) => `  [${i}] ${clampChars(JSON.stringify(it) ?? "?", 300)}`);
+      return [`${head}`, `type: JSONL, ${nonEmpty.length} records`, `record shape: ${shapeOf(parsed[0])}`, ...items].join("\n");
+    }
+  }
+
+  // CSV
+  if (ext === ".csv" || (nonEmpty.length > 1 && (nonEmpty[0].match(/,/g)?.length ?? 0) >= 1 && (nonEmpty[1].match(/,/g)?.length ?? 0) === (nonEmpty[0].match(/,/g)?.length ?? 0))) {
+    const cols = nonEmpty[0].split(",");
+    const rows = nonEmpty.slice(1, 1 + maxEntries).map((r) => `  ${clampChars(r, 300)}`);
+    return [`${head}`, `type: CSV — ${cols.length} columns, ~${nonEmpty.length - 1} rows`, `columns: ${cols.join(", ")}`, ...rows].join("\n");
+  }
+
+  // plain text
+  return [
+    head,
+    `type: text — ${lines.length} lines`,
+    nonEmpty.length ? `head:\n${clampChars(lines.slice(0, 8).join("\n"), 1200)}` : "(empty)",
+    lines.length > 12 ? `tail:\n${clampChars(lines.slice(-4).join("\n"), 800)}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+// head+tail preview for oversized files — reads only ~2.3KB via fd, O(1) memory
+function openHeadTail(file: string): string {
+  const { openSync, readSync, closeSync, fstatSync } = require("node:fs") as typeof import("node:fs");
+  let fd: number | undefined;
+  try {
+    fd = openSync(file, "r");
+    const size = fstatSync(fd).size;
+    const headBuf = Buffer.alloc(Math.min(1500, size));
+    readSync(fd, headBuf, 0, headBuf.length, 0);
+    const tailLen = Math.min(800, size);
+    const tailBuf = Buffer.alloc(tailLen);
+    readSync(fd, tailBuf, 0, tailLen, size - tailLen);
+    return `head:\n${headBuf.toString("utf8")}\n…\ntail:\n${tailBuf.toString("utf8")}`;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 // --- tools ------------------------------------------------------------------
 
 function taskLine(m: Meta, mine: boolean): string {
@@ -502,7 +629,7 @@ function bgListText(): string {
   const metas = listDiskMetas();
   if (!metas.length) return "no background tasks (state: " + STATE_DIR + ")";
   const { total } = runningCount();
-  const head = `${metas.length} task(s), ${total} running (limit ${MAX_CONCURRENT}):\n`;
+  const head = `${metas.length} task(s), ${total} running (limit ${MAX_CONCURRENT}) · interceptor: ${INTERCEPTOR_MODE}:\n`;
   return clampChars(head + metas.slice(0, 20).map((m) => taskLine(m, own.has(m.id))).join("\n"), MAX_OUTPUT_CHARS);
 }
 
@@ -604,6 +731,41 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "bg_artifact",
+    label: "Background artifact",
+    description:
+      "Token-safe summary of a result file produced by a background task (or any file). JSON → array length + item shape + first entries; JSONL → record count + shape; CSV → columns + row count + sample rows; text → line count + head/tail. Never dumps the whole file. Use instead of reading large outputs into context.",
+    parameters: Type.Object({
+      path: Type.Optional(Type.String({ description: "Path to the file (required unless id points at the task's output log)" })),
+      id: Type.Optional(Type.String({ description: "Task id from bg_run — with no path, summarizes that task's captured output" })),
+      max_entries: Type.Optional(Type.Number({ description: "Sample entries to show (default 3, max 10)", minimum: 1, maximum: 10 })),
+    }),
+    execute: (...cbArgs: unknown[]) => {
+      const params = extractToolArgs(cbArgs) as Record<string, unknown>;
+      if (!settings.toolsEnabled) return disabled();
+      const id = typeof params.id === "string" ? params.id.trim() : "";
+      const pathArg = typeof params.path === "string" ? params.path.trim() : "";
+      if (!pathArg && !id) return textResult("error: provide 'path' (file to inspect) or 'id' (task whose output to inspect)");
+      let file = pathArg;
+      if (!file) {
+        const m = readMeta(id);
+        if (!m) return textResult(`task '${id}' not found — use bg_status without args to list tasks`);
+        file = existsSync(path.join(dirOf(id), "out.log")) ? path.join(dirOf(id), "out.log") : path.join(dirOf(id), "out.1.log");
+      }
+      if (!path.isAbsolute(file) && !existsSync(file)) {
+        // relative path might be relative to the task's original cwd context — try cwd first (default), that's it
+        return textResult(`error: file not found: ${file} (relative paths resolve against pi's cwd)`);
+      }
+      const maxEntries = Math.min(10, Math.max(1, Math.round(Number(params.max_entries) || 3)));
+      try {
+        return textResult(clampChars(artifactSummary(file, maxEntries), MAX_OUTPUT_CHARS));
+      } catch (e) {
+        return textResult(`error: cannot summarize ${file}: ${(e as Error).message}`);
+      }
+    },
+  });
+
+  pi.registerTool({
     name: "bg_kill",
     label: "Background kill",
     description:
@@ -671,6 +833,43 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       ctx?.ui?.notify?.(bgListText(), "info");
     },
   });
+
+  // --- follow-mode interceptor (built-in bash tool) --------------------------
+  // Warn ONCE per unique command: block with guidance so the model can switch
+  // to bg_run (or add `timeout`). If the model repeats the EXACT command, allow
+  // it — warn, let the model decide. Disable with PI_BG_INTERCEPTOR=off.
+  if (INTERCEPTOR_MODE !== "off") {
+    const warned = new Map<string, number>(); // cmd -> timestamp of first block
+    pi.on("tool_call", async (event: { toolName?: string; input?: { command?: unknown } }, ctx?: { ui?: { notify?: (m: string, l: string) => void } }) => {
+      try {
+        if (event?.toolName !== "bash") return undefined;
+        const cmd = typeof event.input?.command === "string" ? event.input.command : "";
+        if (!cmd || !looksLikeFollow(cmd)) return undefined;
+        if (/^\s*timeout\s/.test(cmd)) return undefined; // explicitly bounded — fine
+        const key = cmd.trim();
+        const now = Date.now();
+        for (const [k, t] of warned) if (now - t > 3_600_000) warned.delete(k);
+        if (warned.has(key)) {
+          warned.delete(key); // model insisted — let it through, tell the user
+          ctx?.ui?.notify?.("bg-task: follow-mode command allowed on retry", "warning");
+          return undefined;
+        }
+        warned.set(key, now);
+        ctx?.ui?.notify?.("bg-task: blocked a follow-mode bash call once (model decides)", "warning");
+        return {
+          block: true,
+          reason: [
+            "⚠️ blocked by bg-task: this command uses follow/stream mode (-f/--follow/watch) and will NEVER exit on its own — running it here would block the session indefinitely. Decide:",
+            "1. (recommended) run it via bg_run instead — the conversation stays free and you can bg_kill it when done,",
+            "2. add an explicit bound, e.g. prefix with 'timeout 30 ', or",
+            "3. if you truly need it blocking, repeat the exact same command once more and it will be allowed.",
+          ].join("\n"),
+        };
+      } catch {
+        return undefined; // interceptor must never break execution
+      }
+    });
+  }
 
   // housekeeping on load + hourly
   refreshScan();

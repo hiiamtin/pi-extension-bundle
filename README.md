@@ -99,8 +99,20 @@ brute-force node solver pinned a session for 10+ minutes; `task logs-*` with
   machine** (shared state dir), incl. orphans from dead sessions.
 - `bg_log(id, tail_lines?)` — cheap tail of the rolling log (rotates at
   `PI_BG_LOG_CAP_MB`, keeps one old file; fixed memory, bounded disk).
+- `bg_artifact(id?, path?, max_entries?)` — token-safe summary of a result
+  file: JSON → array length + item shape + first entries; JSONL → record
+  count + shape; CSV → columns + rows + sample; text → head/tail. Files over
+  8MB are previewed via fd reads (head+tail only, O(1) memory). With `id` and
+  no path it summarizes the task's captured output instead.
 - `bg_kill(id)` — SIGTERM the whole process group, SIGKILL after 5s — verified
   zero leftover children in e2e (`pgrep -g` = 0 after kill).
+
+**Follow-mode interceptor** (default `warn`): the built-in `bash` tool is
+watched. A follow/stream command (`-f`, `--follow`, `watch`, `tail -f`) is
+blocked ONCE with a reason telling the model to use `bg_run` or add
+`timeout` — if the model repeats the exact command it is allowed through
+(warn, let the model decide). Commands already prefixed with `timeout` pass.
+Disable with `PI_BG_INTERCEPTOR=off`.
 
 On exit, the owning session gets a `bg-task` custom message with
 `triggerTurn: true`, so the model announces the result proactively (elapsed,
@@ -113,7 +125,8 @@ Human commands: `/bg` (panel), `/bg kill <id>` (confirm), `/bg on|off`
   heartbeats (stale heartbeat + live process ⇒ `orphan`), auto-prune after
   `PI_BG_PRUNE_HOURS` (24).
 - Config: `PI_BG_STATE_DIR`, `PI_BG_MAX_CONCURRENT` (8), `PI_BG_LOG_CAP_MB`
-  (2), `PI_BG_PRUNE_HOURS` (24), `PI_BG_DEFAULT_TIMEOUT_MIN` (0 = none).
+  (2), `PI_BG_PRUNE_HOURS` (24), `PI_BG_DEFAULT_TIMEOUT_MIN` (0 = none),
+  `PI_BG_INTERCEPTOR` (`warn` | `off`).
 - Limitation: a task whose output exceeds the pipe buffer dies if the pi
   process itself exits mid-run (marked `gone` on the next scan).
 - `/bg` commands in pi-web work too (widget renders above the editor in both
