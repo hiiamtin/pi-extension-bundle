@@ -101,6 +101,17 @@ if (typeof h !== "function") {
   check("interceptor: normal command untouched", normal === undefined);
 }
 
+// --- 7: watch + wait + name addressing ---
+const r7 = await exec("bg_run", { command: "sleep 2; echo HELLO-READY-MARK; sleep 30", name: "e2e-watch", watch: ["hello-ready-mark"] });
+const id7 = r7.match(/id: ([^,)]+)/)[1];
+await sleep(3500); // echo fires ~2s in — watch hit should be delivered by now
+check("watch: pattern hit delivered mid-run", sent.some((s) => s.m?.customType === "bg-task-watch" && s.m?.details?.id === id7));
+check("name: bg_status by name", /running/.test(await exec("bg_status", { id: "e2e-watch" })));
+check("kill by name: accepted", /SIGTERM/.test(await exec("bg_kill", { id: "e2e-watch" })));
+await sleep(6500); // let the kill land
+const w = await exec("bg_wait", { id: "e2e-watch", timeout_sec: 5 });
+check("wait: finished task returns immediately", /killed/.test(w));
+
 // --- 6: session ownership separation ---
 // session_start tracks the current session; our own finished tasks surface
 // without a cross-session tag, foreign ones only after adoption + with tag.

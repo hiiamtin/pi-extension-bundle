@@ -454,6 +454,35 @@ function looksLikeFollow(cmd: string): boolean {
     });
 }
 
+// Watch hit: wake the agent mid-run (once per pattern, in-memory only —
+// watch state does not survive reload, matching the watcher's own lifetime).
+function notifyWatch(m: Meta, pattern: string, matchedLine: string): void {
+  debugLog(`watch id=${m.id} pattern='${pattern}' matched: ${matchedLine.slice(0, 80)}`);
+  const api = piApi;
+  if (!api || typeof api.sendMessage !== "function") return;
+  try {
+    (api.sendMessage as unknown as (msg: unknown, opts: unknown) => void)(
+      {
+        customType: "bg-task-watch",
+        display: true,
+        content: `Watch hit on background task '${m.name}' (${m.id}): pattern '${pattern}' matched${matchedLine ? ` — “${matchedLine}”` : ""}. The task is still running — bg_log for more, or bg_kill when done.`,
+        details: { id: m.id, pattern },
+      },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
+  } catch (e) {
+    debugLog(`watch notify failed id=${m.id}: ${(e as Error).message}`);
+  }
+}
+
+// Resolve a task by exact id, or by unique case-insensitive NAME (latest match).
+function resolveTask(idOrName: string): Meta | null {
+  const key = idOrName.trim();
+  const direct = readMeta(key);
+  if (direct) return direct;
+  return listDiskMetas().find((m) => m.name.toLowerCase() === key.toLowerCase()) ?? null;
+}
+
 function nextId(): string {
   return `${Date.now().toString(36).slice(-5)}${Math.random().toString(36).slice(2, 5)}`;
 }
@@ -464,6 +493,7 @@ interface SpawnOpts {
   timeoutMin?: number;
   detach?: boolean;
   ownerSession?: string; // full session file path of the spawning session
+  watch?: string[]; // output substrings that wake the agent mid-run (pipe mode only)
 }
 
 function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; error: string } {
@@ -543,6 +573,12 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
 
   // rolling log: out.log (active) + out.1.log (previous), bounded disk, fixed memory
   let rotating = false;
+  // watches: substring patterns matched against a small rolling output buffer;
+  // one wake per pattern (pipe mode only — detach has no in-process stream)
+  const watches = (meta.detach ? [] : opts.watch ?? []).map((pattern) => ({ pattern, hit: false }));
+  const WATCH_BUF_MAX = 8_192;
+  let watchBuf = "";
+  let watchBufLower = "";
   const openStream = () => {
     task.stream = createWriteStream(path.join(dirOf(id), "out.log"), { flags: "a" });
     task.stream.on("error", () => {
@@ -551,6 +587,22 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
   };
   openStream();
   const onData = (chunk: Buffer) => {
+    if (watches.length) {
+      const text = chunk.toString("utf8");
+      watchBuf = (watchBuf + text).slice(-WATCH_BUF_MAX);
+      watchBufLower = (watchBufLower + text.toLowerCase()).slice(-WATCH_BUF_MAX);
+      for (const w of watches) {
+        if (w.hit) continue;
+        const needle = w.pattern.toLowerCase();
+        const idx = watchBufLower.indexOf(needle);
+        if (idx < 0) continue;
+        w.hit = true;
+        const lineStart = watchBuf.lastIndexOf("\n", idx);
+        const lineEnd = watchBuf.indexOf("\n", idx);
+        const matchedLine = watchBuf.slice(lineStart + 1, lineEnd === -1 ? undefined : lineEnd).trim().slice(0, 200);
+        notifyWatch(meta, w.pattern, matchedLine);
+      }
+    }
     if (rotating) return;
     task.bytesCurrent += chunk.length;
     meta.bytes = (meta.bytes ?? 0) + chunk.length;
@@ -867,27 +919,31 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       name: Type.Optional(Type.String({ description: "Short label for the task (shown in the status widget)" })),
       timeout_min: Type.Optional(Type.Number({ description: `Kill the task after N minutes (default: ${DEFAULT_TIMEOUT_MIN || "none"}). Useful to bound exploratory scripts.` })),
       detach: Type.Optional(Type.Boolean({ description: "Survive pi restarts: output goes straight to the log file (no live rotation) and the exit code is recorded on completion" })),
+      watch: Type.Optional(Type.Array(Type.String({ description: "Substring to watch for in the output" }), { description: 'Patterns that wake you mid-run: when one appears in the output you get notified immediately (once per pattern) without waiting for exit. Example: ["ready", "ERROR"]. Ignored with detach.' })),
     }),
     execute: (...cbArgs: unknown[]) => {
       const params = extractToolArgs(cbArgs) as Record<string, unknown>;
       if (!settings.toolsEnabled) return disabled();
       const missing = requireString(params, "command");
       if (missing) return textResult(missing.errorText);
+      const watchPatterns = Array.isArray(params.watch) ? params.watch.map(String).filter(Boolean).slice(0, 10) : undefined;
       const res = spawnTask({
         command: String(params.command),
         name: params.name != null ? String(params.name) : undefined,
         timeoutMin: params.timeout_min != null ? Number(params.timeout_min) : undefined,
         detach: params.detach === true,
+        watch: watchPatterns,
         ownerSession: typeof cbArgs[4] === "object" && cbArgs[4] !== null
           ? (cbArgs[4] as { sessionManager?: { getSessionFile?: () => string | undefined } }).sessionManager?.getSessionFile?.()
           : undefined,
       });
       if (!res.ok) return textResult(`error: ${res.error}`);
+      const watchLine = watchPatterns?.length ? `\nwatching for: ${watchPatterns.map((w) => `"${w}"`).join(", ")} — you'll be notified when one appears` : "";
       const warn = looksLikeFollow(String(params.command))
         ? "\n⚠️ warning: this command looks like follow/stream mode (-f/--follow/watch) and may NEVER exit on its own. That is fine for background tasks (you will not be blocked), but kill it with bg_kill when you have what you need."
         : "";
       return textResult(
-        `started background task '${res.meta.name}' (id: ${res.meta.id}, pid: ${res.meta.pid})\nlog: ${dirOf(res.meta.id)}/out.log\nconversation continues — monitor with bg_status, read output with bg_log, stop with bg_kill.${warn}`,
+        `started background task '${res.meta.name}' (id: ${res.meta.id}, pid: ${res.meta.pid})\nlog: ${dirOf(res.meta.id)}/out.log${watchLine}\nconversation continues — monitor with bg_status, read output with bg_log, stop with bg_kill.${warn}`,
       );
     },
   });
@@ -896,14 +952,17 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     name: "bg_status",
     label: "Background status",
     description:
-      "Check background tasks. With id: state, elapsed, exit code, last output. Without id: list ALL tasks across every pi session on this machine (marked [this session] where applicable).",
+      "Check background tasks. With id or unique name: state, elapsed, exit code, last output. Without id: list ALL tasks across every pi session on this machine (marked [this session] where applicable).",
     parameters: Type.Object({
-      id: Type.Optional(Type.String({ description: "Task id from bg_run (omit to list all tasks)" })),
+      id: Type.Optional(Type.String({ description: "Task id or unique task name (omit to list all tasks)" })),
     }),
     execute: (...cbArgs: unknown[]) => {
       const params = extractToolArgs(cbArgs) as Record<string, unknown>;
       if (!settings.toolsEnabled) return disabled();
-      if (typeof params.id === "string" && params.id.trim()) return textResult(bgDetailText(params.id.trim()));
+      if (typeof params.id === "string" && params.id.trim()) {
+        const found = resolveTask(params.id.trim());
+        return textResult(found ? bgDetailText(found.id) : `task '${params.id}' not found — use bg_status without args to list tasks`);
+      }
       return textResult(bgListText());
     },
   });
@@ -913,7 +972,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     label: "Background log",
     description: "Read recent output (stdout+stderr) of a background task. Returns the tail only — cheap even when the task printed megabytes. Use bg_status first to see state.",
     parameters: Type.Object({
-      id: Type.String({ description: "Task id from bg_run" }),
+      id: Type.String({ description: "Task id or unique task name" }),
       tail_lines: Type.Optional(Type.Number({ description: "Number of trailing lines to return (default 50, max 400)", minimum: 1, maximum: 400 })),
     }),
     execute: (...cbArgs: unknown[]) => {
@@ -922,11 +981,49 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       const missing = requireString(params, "id");
       if (missing) return textResult(missing.errorText);
       const id = String(params.id).trim();
-      const m = readMeta(id);
+      const m = resolveTask(id);
       if (!m) return textResult(`task '${id}' not found — use bg_status without args to list tasks`);
       const lines = Math.min(400, Math.max(1, Number(params.tail_lines) || 50));
       const text = tailLog(id, lines, MAX_OUTPUT_CHARS);
       return textResult(text ? `bg '${m.name}' (${m.state}) — last ${lines} lines:\n${text}` : `bg '${m.name}' (${m.state}) has no output yet`);
+    },
+  });
+
+  pi.registerTool({
+    name: "bg_wait",
+    label: "Background wait",
+    description:
+      "Wait synchronously (blocking this turn) for a background task to finish, up to the timeout. Returns immediately if it is already finished. Prefer this over ending the turn when the task is short and you need its result to continue; for long tasks end the turn instead — you will be notified on exit. Accepts id or unique task name.",
+    parameters: Type.Object({
+      id: Type.String({ description: "Task id or unique task name" }),
+      timeout_sec: Type.Optional(Type.Number({ description: "Max seconds to wait (default 30, max 600)" })),
+    }),
+    execute: async (...cbArgs: unknown[]) => {
+      const params = extractToolArgs(cbArgs) as Record<string, unknown>;
+      if (!settings.toolsEnabled) return disabled();
+      const missing = requireString(params, "id");
+      if (missing) return textResult(missing.errorText);
+      const found = resolveTask(String(params.id).trim());
+      if (!found) return textResult(`task '${params.id}' not found — use bg_status without args to list tasks`);
+      if (found.state !== "running") return textResult(bgDetailText(found.id));
+      const timeoutSec = Math.min(600, Math.max(1, Math.round(Number(params.timeout_sec) || 30)));
+      const signal = cbArgs[2] as AbortSignal | undefined;
+      const deadline = Date.now() + timeoutSec * 1000;
+      while (Date.now() < deadline) {
+        if (signal?.aborted) return textResult(`wait aborted — task '${found.name}' (${found.id}) is still running; bg_status to check`);
+        await new Promise((r) => setTimeout(r, 250));
+        const cur = readMeta(found.id);
+        if (!cur) continue; // transient mid-write read
+        if (cur.state !== "running") {
+          // result delivered in-band here — consume the push notice for our own session
+          if (cur.ownerSession && currentSessionFile && cur.ownerSession === currentSessionFile && !cur.notifiedAt) {
+            cur.notifiedAt = Date.now();
+            writeMeta(cur);
+          }
+          return textResult(bgDetailText(cur.id));
+        }
+      }
+      return textResult(`still running after ${timeoutSec}s — task '${found.name}' (${found.id}). It keeps running; you'll be notified when it exits, or bg_wait again.`);
     },
   });
 
@@ -969,9 +1066,9 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     name: "bg_kill",
     label: "Background kill",
     description:
-      "Stop a background task by id. Kills the ENTIRE process group — no orphaned children. Works on tasks from any pi session, including orphans whose session is gone.",
+      "Stop a background task by id or unique name. Kills the ENTIRE process group — no orphaned children. Works on tasks from any pi session, including orphans whose session is gone.",
     parameters: Type.Object({
-      id: Type.String({ description: "Task id from bg_run" }),
+      id: Type.String({ description: "Task id or unique task name" }),
     }),
     execute: (...cbArgs: unknown[]) => {
       const params = extractToolArgs(cbArgs) as Record<string, unknown>;
@@ -979,8 +1076,10 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       const missing = requireString(params, "id");
       if (missing) return textResult(missing.errorText);
       const id = String(params.id).trim();
-      const t = own.get(id);
-      const m = t?.meta ?? readMeta(id);
+      const resolved = resolveTask(id);
+      if (!resolved) return textResult(`task '${id}' not found — use bg_status without args to list tasks`);
+      const t = own.get(resolved.id);
+      const m = t?.meta ?? resolved;
       if (!m) return textResult(`task '${id}' not found — use bg_status without args to list tasks`);
       if (m.state !== "running" && m.state !== "orphan") return textResult(`task '${id}' (${m.name}) already finished: ${m.state}`);
       const wasRunning = m.state === "running" || m.state === "orphan";
