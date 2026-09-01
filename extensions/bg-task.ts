@@ -132,6 +132,7 @@ interface OwnTask {
   bytesCurrent: number; // bytes in the current out.log (pipe mode only)
   timeoutTimer: NodeJS.Timeout | null;
   killTimer: NodeJS.Timeout | null;
+  ctx?: unknown; // the tool-execute ctx of the spawning bg_run call (has a wired sendMessage)
 }
 
 // --- small helpers ----------------------------------------------------------
@@ -269,6 +270,7 @@ let widgetTimer: NodeJS.Timeout | null = null;
 let notify: ((msg: string, level: string) => void) | null = null;
 let piApi: ExtensionAPI | null = null;
 let currentSessionFile: string | undefined; // this instance's own session (set on session_start)
+let eventCtx: { sendMessage?: unknown } | null = null; // fresh ctx from the last session_start — its sendMessage is wired per-session
 
 const DEBUG_LOG = path.join(os.homedir(), ".pi/agent/log/bg-task-debug.log");
 // self-capped (~48KB) diagnostics for spawn/exit/notify — never fatal
@@ -458,21 +460,17 @@ function looksLikeFollow(cmd: string): boolean {
 // watch state does not survive reload, matching the watcher's own lifetime).
 function notifyWatch(m: Meta, pattern: string, matchedLine: string): void {
   debugLog(`watch id=${m.id} pattern='${pattern}' matched: ${matchedLine.slice(0, 80)}`);
-  const api = piApi;
-  if (!api || typeof api.sendMessage !== "function") return;
-  try {
-    (api.sendMessage as unknown as (msg: unknown, opts: unknown) => void)(
-      {
-        customType: "bg-task-watch",
-        display: true,
-        content: `Watch hit on background task '${m.name}' (${m.id}): pattern '${pattern}' matched${matchedLine ? ` — “${matchedLine}”` : ""}. The task is still running — bg_log for more, or bg_kill when done.`,
-        details: { id: m.id, pattern },
-      },
-      { deliverAs: "followUp", triggerTurn: true },
-    );
-  } catch (e) {
-    debugLog(`watch notify failed id=${m.id}: ${(e as Error).message}`);
-  }
+  const { ok, outcome } = sendToSession(
+    {
+      customType: "bg-task-watch",
+      display: true,
+      content: `Watch hit on background task '${m.name}' (${m.id}): pattern '${pattern}' matched${matchedLine ? ` — “${matchedLine}”` : ""}. The task is still running — bg_log for more, or bg_kill when done.`,
+      details: { id: m.id, pattern },
+    },
+    { deliverAs: "followUp", triggerTurn: true },
+    m,
+  );
+  if (!ok) debugLog(`watch notify failed id=${m.id}: ${outcome}`);
 }
 
 // Resolve a task by exact id, or by unique case-insensitive NAME (latest match).
@@ -494,6 +492,7 @@ interface SpawnOpts {
   detach?: boolean;
   ownerSession?: string; // full session file path of the spawning session
   watch?: string[]; // output substrings that wake the agent mid-run (pipe mode only)
+  ctx?: unknown; // execute ctx of the bg_run call — per-call wired sendMessage
 }
 
 function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; error: string } {
@@ -568,6 +567,7 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
     bytesCurrent: 0,
     timeoutTimer: null,
     killTimer: null,
+    ctx: opts.ctx,
   };
   own.set(id, task);
 
@@ -664,6 +664,30 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
 // ALWAYS late-bound (read piApi.sendMessage at call time): pi hands extensions
 // a notInitialized placeholder at load and swaps in the real one afterwards —
 // a captured reference throws silently (the bug behind lost notifications).
+// Deliver a message to the session through the first WORKING sendMessage.
+// Resolution order (each late-bound, never captured at load):
+//   1. the spawning bg_run call's execute ctx (bound to the spawning session)
+//   2. the last session_start event ctx (current session — fresh per event)
+//   3. the pi api object (a loader placeholder in pi-web — throws; works in TUI)
+function sendToSession(message: unknown, opts: unknown, m: Meta | null): { ok: boolean; outcome: string } {
+  const candidates: Array<[string, unknown]> = [];
+  const t = m ? own.get(m.id) : undefined;
+  if (t?.ctx) candidates.push(["task ctx", (t.ctx as { sendMessage?: unknown }).sendMessage]);
+  if (eventCtx?.sendMessage) candidates.push(["event ctx", eventCtx.sendMessage]);
+  if (piApi && typeof piApi.sendMessage === "function") candidates.push(["pi api", piApi.sendMessage]);
+  let outcome = "sendMessage unavailable";
+  for (const [label, fn] of candidates) {
+    if (typeof fn !== "function") continue;
+    try {
+      (fn as (msg: unknown, o: unknown) => void)(message, opts);
+      return { ok: true, outcome: `sent via ${label}` };
+    } catch (e) {
+      outcome = `FAILED via ${label}: ${(e as Error).message}`;
+    }
+  }
+  return { ok: false, outcome };
+}
+
 function attemptNotify(m: Meta, via: string): void {
   if (m.notifiedAt) return;
   m.notifyTries = (m.notifyTries ?? 0) + 1;
@@ -676,21 +700,13 @@ function attemptNotify(m: Meta, via: string): void {
   ]
     .filter(Boolean)
     .join("\n");
-  const api = piApi;
-  let outcome = "sendMessage unavailable";
-  if (api && typeof api.sendMessage === "function") {
-    try {
-      (api.sendMessage as unknown as (msg: unknown, opts: unknown) => void)(
-        { customType: "bg-task", display: true, content, details: { id: m.id, state: m.state, exitCode: m.exitCode ?? null } },
-        { deliverAs: "followUp", triggerTurn: true },
-      );
-      outcome = "sent";
-    } catch (e) {
-      outcome = `FAILED: ${(e as Error).message}`;
-    }
-  }
+  const { ok, outcome } = sendToSession(
+    { customType: "bg-task", display: true, content, details: { id: m.id, state: m.state, exitCode: m.exitCode ?? null } },
+    { deliverAs: "followUp", triggerTurn: true },
+    m,
+  );
   debugLog(`notify[${via}] id=${m.id} '${m.name}' state=${m.state} tries=${m.notifyTries} -> ${outcome}`);
-  if (outcome === "sent" || m.notifyTries >= 3) m.notifiedAt = Date.now();
+  if (ok || m.notifyTries >= 3) m.notifiedAt = Date.now();
   writeMeta(m);
 }
 
@@ -1212,13 +1228,14 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     try {
       const sf = (ctx as { sessionManager?: { getSessionFile?: () => string | undefined } } | undefined)?.sessionManager?.getSessionFile?.();
       if (sf) currentSessionFile = sf;
+      if (ctx) eventCtx = ctx as { sendMessage?: unknown }; // fresh, per-event wired sendMessage
       const metas = listDiskMetas();
       refreshScan(metas);
       const now = Date.now();
       const pending = metas.filter((m) => m.state !== "running" && !m.notifiedAt && m.finishedAt && now - m.finishedAt < PRUNE_MS && shouldAdoptNotice(m, now));
-      if (!pending.length || !piApi || typeof piApi.sendMessage !== "function") return;
+      if (!pending.length) return;
       const lines = pending.slice(0, 5).map((m) => `${stateIcon(m.state)} ${m.name} (${m.id}) — ${m.state}${m.exitCode != null ? `, exit=${m.exitCode}` : ""}, ran ${fmtDur(m.finishedAt - m.startedAt)}${isCrossSession(m) ? " · from another session" : ""}`);
-      (piApi.sendMessage as unknown as (msg: unknown, opts: unknown) => void)(
+      const { ok, outcome } = sendToSession(
         {
           customType: "bg-task",
           display: true,
@@ -1226,7 +1243,12 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
           details: { ids: pending.map((m) => m.id) },
         },
         { deliverAs: "followUp", triggerTurn: true },
+        null,
       );
+      if (!ok) {
+        debugLog(`session_start notice failed: ${outcome}`);
+        return;
+      }
       for (const m of pending) {
         m.notifiedAt = now;
         writeMeta(m);
