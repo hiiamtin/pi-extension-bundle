@@ -131,6 +131,20 @@ if (typeof ssHook === "function") {
   check("ownership: own tasks not tagged cross-session", !last.includes("e2e-group"));
   const fmeta = JSON.parse(readFileSync(path.join(foreignDir, "meta.json"), "utf8"));
   check("ownership: foreign task marked notified", !!fmeta.notifiedAt);
+
+  // foreign task with a LIVE owner session -> strict: must NOT be surfaced here
+  const aliveDir = path.join(STATE_DIR, "e2ealive");
+  mkdirSync(aliveDir, { recursive: true });
+  const aliveSession = path.join(STATE_DIR, "alive-owner-session.jsonl");
+  writeFileSync(aliveSession, "");
+  writeFileSync(
+    path.join(aliveDir, "meta.json"),
+    JSON.stringify({ id: "e2ealive", name: "foreign-alive", cmd: "echo", pid: 3, pgid: 3, startedAt: Date.now() - 120000, state: "done", exitCode: 0, finishedAt: Date.now() - 60000, owner: "alive-sess", ownerSession: aliveSession, heartbeat: 0, bytes: 0 }),
+  );
+  await ssHook({}, { sessionManager: { getSessionFile: () => path.join(STATE_DIR, "e2e-current-session.jsonl") } });
+  check("ownership: foreign-ALIVE task never surfaced cross-session", !sent.some((s) => s.m?.content?.includes("foreign-alive")));
+  const ameta = JSON.parse(readFileSync(path.join(aliveDir, "meta.json"), "utf8"));
+  check("ownership: foreign-alive stays un-notified (waits for owner)", !ameta.notifiedAt);
 } else {
   check("session_start hook registered", false);
 }

@@ -45,9 +45,11 @@
 //     pi.sendMessage is read AT CALL TIME (late-bound): at load pi hands a
 //     notInitialized placeholder, so capturing it early silently broke every
 //     notification (the bug behind lost notices). If the watcher dies anyway
-//     (reload/restart), meta.notifiedAt stays unset and the next live session
-//     surfaces the finished task at its session_start — data never gets lost.
-//     All spawn/exit/notify attempts are logged to bg-task-debug.log.
+//     (reload/restart), meta.notifiedAt stays unset — and per STRICT OWNERSHIP
+//     the notice waits for the owner session's next activation (session_start
+//     / tick). Cross-session delivery happens ONLY when the owner session file
+//     has been deleted (orphaned task). All attempts are logged to
+//     bg-task-debug.log.
 //   - Auto-prune: finished/orphan/gone dirs older than PI_BG_PRUNE_HOURS (24).
 //
 // Human commands:  /bg            — interactive task picker (inspect/kill)
@@ -162,17 +164,15 @@ function shortSession(sessionFile: string): string {
 
 // Whose notice is this? Sessions are separated by their session FILE (pid is
 // useless in pi-web where every session shares one process).
-//   - our own session                    -> always ours
-//   - owner session file deleted          -> owner is gone, adopt
-//   - otherwise foreign                   -> adopt only after ADOPT_GRACE_MS
-//     (a live owner's exit handler notifies within milliseconds; silence past
-//     the grace means its watcher is dead)
-function shouldAdoptNotice(m: Meta, now: number): boolean {
-  const age = now - (m.finishedAt ?? now);
-  if (!m.ownerSession) return age > ADOPT_GRACE_MS; // legacy meta without session identity
-  if (currentSessionFile && m.ownerSession === currentSessionFile) return true;
-  if (!existsSync(m.ownerSession)) return true; // owner session file deleted — owner is gone
-  return age > ADOPT_GRACE_MS; // foreign: its live exit handler notifies in ms; silence means dead
+// STRICT OWNERSHIP: a notice is delivered only to the owning session's
+// instance (session_start/tick while that session is active). Foreign tasks
+// are adopted ONLY when the owner session file has been deleted — otherwise
+// the news waits for the owner's next activation. Legacy pid-only metas keep
+// the grace rule (they age out within 24h anyway).
+function canNotifyHere(m: Meta, now: number): boolean {
+  if (!m.ownerSession) return now - (m.finishedAt ?? now) > ADOPT_GRACE_MS; // legacy pid-only identity
+  if (currentSessionFile && m.ownerSession === currentSessionFile) return true; // ours
+  return !existsSync(m.ownerSession); // owner session deleted — orphaned, adopt
 }
 
 function isCrossSession(m: Meta): boolean {
@@ -328,7 +328,7 @@ function refreshScan(metas?: Meta[]): void {
         const code = Number.parseInt(readFileSync(exitPath(m.id), "utf8").trim(), 10);
         if (Number.isFinite(code)) {
           writeMeta({ ...m, state: code === 0 ? "done" : "failed", exitCode: code, finishedAt: st.mtimeMs });
-          if (shouldAdoptNotice(m, now)) attemptNotify(m, "scan"); // owner session gone or task is ours
+          if (canNotifyHere(m, now)) attemptNotify(m, "scan"); // owner session gone or task is ours
           continue;
         }
       } catch {
@@ -416,7 +416,7 @@ function ensureWidgetLoop(): void {
       for (const m of metas) {
         if (m.state === "running" || m.notifiedAt || !m.finishedAt) continue;
         if (nowT - m.finishedAt < 10_000) continue; // owner's fast path gets first shot
-        if (!own.has(m.id) && !shouldAdoptNotice(m, nowT)) continue;
+        if (!canNotifyHere(m, nowT)) continue; // strict ownership: foreign+alive waits for its owner
         attemptNotify(m, "tick");
       }
 
@@ -704,6 +704,12 @@ function sendToSession(message: unknown, opts: unknown, m: Meta | null): { ok: b
 
 function attemptNotify(m: Meta, via: string): void {
   if (m.notifiedAt) return;
+  // strict ownership: never push a cross-session notice while the owner
+  // session still exists — it will deliver on its own next activation
+  if (isCrossSession(m) && m.ownerSession && existsSync(m.ownerSession)) {
+    debugLog(`notify[${via}] id=${m.id} skipped — foreign task, owner session still alive`);
+    return;
+  }
   m.notifyTries = (m.notifyTries ?? 0) + 1;
   const cross = isCrossSession(m);
   const tail = tailLog(m.id, 5, 600);
@@ -1246,7 +1252,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       const metas = listDiskMetas();
       refreshScan(metas);
       const now = Date.now();
-      const pending = metas.filter((m) => m.state !== "running" && !m.notifiedAt && m.finishedAt && now - m.finishedAt < PRUNE_MS && shouldAdoptNotice(m, now));
+      const pending = metas.filter((m) => m.state !== "running" && !m.notifiedAt && m.finishedAt && now - m.finishedAt < PRUNE_MS && canNotifyHere(m, now));
       if (!pending.length) return;
       const lines = pending.slice(0, 5).map((m) => `${stateIcon(m.state)} ${m.name} (${m.id}) — ${m.state}${m.exitCode != null ? `, exit=${m.exitCode}` : ""}, ran ${fmtDur(m.finishedAt - m.startedAt)}${isCrossSession(m) ? " · from another session" : ""}`);
       const { ok, outcome } = sendToSession(

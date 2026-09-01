@@ -97,18 +97,25 @@ brute-force node solver pinned a session for 10+ minutes; `task logs-*` with
   kill it later — it never blocks the chat either way. `detach: true` streams
   output straight to the log file via fd: the task survives pi restarts and
   its real exit code is recorded to `<id>/exitcode` by a wrapper shell (no
-  live rotation in this mode).
-- `bg_status(id?)` — one task or ALL tasks **across every pi session on the
-  machine** (shared state dir), incl. orphans from dead sessions.
-- `bg_log(id, tail_lines?)` — cheap tail of the rolling log (rotates at
+  live rotation in this mode). `watch: ["ready", "ERROR"]` wakes the agent
+  mid-run (once per pattern) when the output matches — pipe mode only.
+- `bg_status(id_or_name?)` — one task or ALL tasks **across every pi session on
+  the machine** (shared state dir), incl. orphans from dead sessions.
+- `bg_log(id_or_name, tail_lines?)` — cheap tail of the rolling log (rotates at
   `PI_BG_LOG_CAP_MB`, keeps one old file; fixed memory, bounded disk).
+- `bg_wait(id_or_name, timeout_sec?)` — block up to N seconds for a short task
+  and get its result in the same turn (returns immediately if already done;
+  on timeout the task keeps running and the exit notification still fires).
 - `bg_artifact(id?, path?, max_entries?)` — token-safe summary of a result
   file: JSON → array length + item shape + first entries; JSONL → record
   count + shape; CSV → columns + rows + sample; text → head/tail. Files over
   8MB are previewed via fd reads (head+tail only, O(1) memory). With `id` and
   no path it summarizes the task's captured output instead.
-- `bg_kill(id)` — SIGTERM the whole process group, SIGKILL after 5s — verified
-  zero leftover children in e2e (`pgrep -g` = 0 after kill).
+- `bg_kill(id_or_name)` — SIGTERM the whole process group, SIGKILL after 5s —
+  verified zero leftover children in e2e (`pgrep -g` = 0 after kill).
+
+All id params also accept the unique case-insensitive task **name** (latest
+match) — e.g. `bg_kill("dev-server")`.
 
 **Follow-mode interceptor** (`PI_BG_INTERCEPTOR`, default `auto-bg`): the
 built-in `bash` tool is watched. Detection is **scoped per command** (heredoc
@@ -136,6 +143,15 @@ Modes:
 On exit, the owning session gets a `bg-task` custom message with
 `triggerTurn: true`, so the model announces the result proactively (elapsed,
 exit code, last output, log path) instead of the user polling.
+`pi.sendMessage` is late-bound (read at call time) — capturing it at load
+got a `notInitialized` placeholder and silently broke every notification.
+Delivery is **strictly scoped to the owning session** (identity = the
+session file, not pid — pid is shared across pi-web sessions): foreign
+finished tasks wait for their owner session's next activation; another
+session adopts them only when the owner session file has been deleted.
+If the watcher dies anyway (reload/restart), `notifiedAt` stays unset and
+the owner session surfaces the finished task at its own next `session_start`.
+All attempts are logged to `~/.pi/agent/log/bg-task-debug.log`.
 
 Human commands: `/bg` (interactive picker — pick a task to inspect or kill
 with confirm), `/bg kill <id>`, `/bg on|off` (expose tools to the model AND
