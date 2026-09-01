@@ -409,6 +409,17 @@ function ensureWidgetLoop(): void {
       const metas = listDiskMetas(); // single scan per tick, shared below
       refreshScan(metas);
 
+      // retry finish-notices that no session managed to deliver yet — delivery
+      // only succeeds while THIS instance's session is the active one (pi-web
+      // marks captured pi stale on session switch), so keep trying opportunistically
+      const nowT = Date.now();
+      for (const m of metas) {
+        if (m.state === "running" || m.notifiedAt || !m.finishedAt) continue;
+        if (nowT - m.finishedAt < 10_000) continue; // owner's fast path gets first shot
+        if (!own.has(m.id) && !shouldAdoptNotice(m, nowT)) continue;
+        attemptNotify(m, "tick");
+      }
+
       const lines = renderWidget(metas);
       const { total } = runningCount(metas);
       if (cachedUi?.setWidget) cachedUi.setWidget("bg-task", lines.length ? lines : undefined);
@@ -676,15 +687,18 @@ function sendToSession(message: unknown, opts: unknown, m: Meta | null): { ok: b
   if (eventCtx?.sendMessage) candidates.push(["event ctx", eventCtx.sendMessage]);
   if (piApi && typeof piApi.sendMessage === "function") candidates.push(["pi api", piApi.sendMessage]);
   let outcome = "sendMessage unavailable";
+  const tried: string[] = [];
   for (const [label, fn] of candidates) {
     if (typeof fn !== "function") continue;
+    tried.push(label);
     try {
       (fn as (msg: unknown, o: unknown) => void)(message, opts);
       return { ok: true, outcome: `sent via ${label}` };
     } catch (e) {
-      outcome = `FAILED via ${label}: ${(e as Error).message}`;
+      outcome = `FAILED via ${label}: ${(e as Error).message}`.slice(0, 300);
     }
   }
+  if (tried.length) outcome += ` [tried: ${tried.join(", ")}]`;
   return { ok: false, outcome };
 }
 
