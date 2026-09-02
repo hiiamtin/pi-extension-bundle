@@ -111,7 +111,7 @@ which also lets side-thread follow-ups cache-hit their own first turn.
 | D2 | Engine | `provider.streamSimple()` via `ctx.modelRegistry` (`completeSimple`). **No tool executor exists** → tool calls physically cannot run. If the response contains tool-call blocks, show a notice instead of the (missing) text |
 | D3 | Cache | Default `cacheRetention: "short"` (configurable). Prefix-stability rule: replayed content must be byte-identical to the main thread's request; all volatile content (question, reminder) goes last |
 | D4 | Model / thinking | Default = current model + current thinking level. Settings overrides: `model: "provider/id"`, `thinkingLevel`. Validate credentials via `getApiKeyAndHeaders`, fall back gracefully; clamp level with `getSupportedThinkingLevels(model)` |
-| D5 | Follow-ups | Yes. In-memory side threads (Map, survives within session), `/btw` with no args opens a resume menu. First turn writes cache (+25% on suffix), follow-ups read it |
+| D5 | Follow-ups & threads | Yes. In-memory side threads (Map on the extension instance — pi rebuilds instances on session switch/reload, so threads are per-session by design). `/btw <question>` always **starts a new thread**; follow-ups go through the composer inside the thread; bare `/btw` opens a **resume menu** (newest first, pick manually — never auto-resume). First turn writes cache (+25% on suffix), follow-ups read it |
 | D6 | System prompt source | Capture the assembled prompt from the `before_agent_start` event (store on the extension instance). Fallback: rebuild via `getSystemPromptOptions()`. If the session never ran a request, proceed with rebuilt prompt + empty/short history |
 | D7 | UI | `ctx.ui.custom` fullscreen overlay: streaming answer, scrollable transcript, Esc = abort (AbortSignal), composer for follow-ups |
 | D8 | Session purity | Zero writes to the session file. Nothing appended, nothing forked on disk. `/btw` traffic must not change session size |
@@ -251,20 +251,27 @@ bring-to-main, text-range selector, and per-screen menu framework).
 
 ---
 
-## 10. Open questions (decide before coding)
+## 10. Decisions
 
-1. **Command name** — `/btw` (familiar; collision only matters if
-   `@narumitw/pi-btw` is ever installed — it won't be) vs `/ask`. Propose: `/btw`.
-2. **Steering while the side model streams** (queue follow-up mid-answer) — v1 or defer? Propose: defer.
-3. **Bring-to-main** (D9) — confirm defer to post-v1.
-4. **Fallback variant** (sanitized snapshot for no-cache providers) — confirm out of scope.
-5. **`/btw` with no args** — resume menu (pi-btw behavior) or usage hint (Claude behavior)? Propose: resume menu.
-6. **Tests** — add a minimal test runner to the bundle or rely on §9 wire
-   verification + manual checks only. Propose: wire verification first, add
-   tests only if the assembly logic gets messy.
-7. **pi-web support** — the bundle also runs under pi-web (shared `~/.pi/agent`).
-   TUI-only with a clean "requires interactive TUI" error (pi-btw behavior), or
-   attempt UI adaptation now? Propose: TUI-only in v1.
+Resolved 2025 (user-confirmed):
+
+1. **Command name**: `/btw` (no `@narumitw/pi-btw` installed — no collision).
+2. **Steering mid-stream**: deferred.
+3. **Bring-to-main**: deferred to post-v1.
+4. **Sanitized-snapshot fallback**: cut — single request shape for all providers.
+5. **Bare `/btw`**: resume menu, newest first (never auto-resume); see D5 for
+   thread semantics (`/btw xxx` then `/btw yyy` = two threads; follow-ups via
+   composer, not repeated `/btw`).
+6. **Verification**: wire verification on first live run (dump real request/response,
+   assert prefix byte-identical to the main thread's last request and
+   `usage.cacheRead > 0`) before adding any test runner.
+7. **Web/pi-web**: **/ext-style mode split** — one core, UI layer by mode:
+   `tui` → full overlay (streaming, composer, resume menu); `rpc` (pi-web) →
+   answer via `ctx.ui.notify`, resume via `ctx.ui.select` (dialogs work in RPC),
+   and in rpc mode `/btw <q>` continues the latest thread if one exists so
+   follow-ups work without a persistent composer; `json`/`print` → guard + error.
+   Custom components (`ui.custom`) are TUI-only per pi docs; dialogs are
+   TUI+RPC capable — same pattern as `ext.ts`.
 
 ---
 
