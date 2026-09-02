@@ -1,5 +1,9 @@
 # /btw — Side-Question Extension for Pi
 
+> **Status: v1 implemented** (`extensions/btw.ts`, commit `4ad694f`).
+> Wire verification (§9) passed in live use. Deferred: bring-to-main,
+> mid-stream steering, snapshot fallback.
+
 Design document, pre-development. Everything below is verified against pi source
 (`@earendil-works/pi-coding-agent` 0.x, `pi-ai` 0.84.4) or reverse-engineered
 prior art. Sources listed at the end.
