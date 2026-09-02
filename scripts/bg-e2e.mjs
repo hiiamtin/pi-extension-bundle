@@ -164,6 +164,24 @@ if (typeof ssHook === "function") {
   check("input catch-up: owner session surfaces its finished task", sent.some((s) => s.m?.content?.includes("own-task-input")));
   const imeta = JSON.parse(readFileSync(path.join(ownIn, "meta.json"), "utf8"));
   check("input catch-up: marked notified after surfacing", !!imeta.notifiedAt);
+
+  // context-hook injection — guaranteed model-facing channel (fires before every LLM call)
+  const ctxHook = hooks["context"]?.[0];
+  check("context hook registered", typeof ctxHook === "function");
+  const ownCx = path.join(STATE_DIR, "e2ectx");
+  mkdirSync(ownCx, { recursive: true });
+  writeFileSync(
+    path.join(ownCx, "meta.json"),
+    JSON.stringify({ id: "e2ectx", name: "ctx-task", cmd: "echo", pid: 6, pgid: 6, startedAt: Date.now() - 120000, state: "done", exitCode: 0, finishedAt: Date.now() - 20000, owner: "me", ownerSession: path.join(STATE_DIR, "e2e-current-session.jsonl"), heartbeat: 0, bytes: 0 }),
+  );
+  const ctxRes = await ctxHook({ messages: [{ role: "user", content: "hi" }] }, { sessionManager: { getSessionFile: () => path.join(STATE_DIR, "e2e-current-session.jsonl") } });
+  check("context hook: injects completion notice into messages", Array.isArray(ctxRes?.messages) && ctxRes.messages.length === 2 && JSON.stringify(ctxRes.messages).includes("ctx-task"));
+  const cmeta = JSON.parse(readFileSync(path.join(ownCx, "meta.json"), "utf8"));
+  check("context hook: marked notified", !!cmeta.notifiedAt);
+  const ctxRes2 = await ctxHook({ messages: [{ role: "user", content: "hi" }] }, { sessionManager: { getSessionFile: () => path.join(STATE_DIR, "e2e-current-session.jsonl") } });
+  check("context hook: no duplicate injection (notifiedAt guard)", !Array.isArray(ctxRes2?.messages));
+  const ctxRes3 = await ctxHook({ messages: [{ role: "user", content: "hi" }] }, { sessionManager: { getSessionFile: () => aliveSession } });
+  check("context hook: foreign session gets no injection", !JSON.stringify(ctxRes3 ?? {}).includes("foreign-alive"));
 } else {
   check("session_start hook registered", false);
 }

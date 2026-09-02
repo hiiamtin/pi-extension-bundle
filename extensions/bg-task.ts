@@ -50,14 +50,16 @@
 //     / tick). Cross-session delivery happens ONLY when the owner session file
 //     has been deleted (orphaned task). All attempts are logged to
 //     bg-task-debug.log.
-//   - Auto-prune: finished/orphan/gone dirs older than PI_BG_PRUNE_HOURS (24).
+//   - Auto-prune: finished/orphan/gone dirs older than PI_BG_PRUNE_HOURS (168 = 7d).
+//     Also: finished-but-never-notified tasks stay queryable 7 days instead of
+//     vanishing after 24h (the "abandoned session" case — see context hook).
 //
 // Human commands:  /bg            — interactive task picker (inspect/kill)
 //                  /bg kill <id>  — kill with confirm
 //                  /bg on|off     — expose bg_* tools AND gate the interceptor
 //
 // Config (env): PI_BG_STATE_DIR, PI_BG_MAX_CONCURRENT (8), PI_BG_LOG_CAP_MB (2),
-//               PI_BG_PRUNE_HOURS (24), PI_BG_DEFAULT_TIMEOUT_MIN (0 = none),
+//               PI_BG_PRUNE_HOURS (168 = 7d), PI_BG_DEFAULT_TIMEOUT_MIN (0 = none),
 //               PI_BG_TICK_MS (5000 — scan/heartbeat cadence while tasks run).
 // After any pi upgrade run: node scripts/smoke-test.mjs
 
@@ -92,7 +94,7 @@ function envInt(name: string, def: number, min: number, max: number): number {
 const STATE_DIR = process.env.PI_BG_STATE_DIR || path.join(os.homedir(), ".pi/agent/bg-tasks");
 const MAX_CONCURRENT = envInt("PI_BG_MAX_CONCURRENT", 8, 1, 64);
 const ROTATE_BYTES = envInt("PI_BG_LOG_CAP_MB", 2, 1, 128) * 512 * 1024; // per file; total cap = 2× this
-const PRUNE_MS = envInt("PI_BG_PRUNE_HOURS", 24, 1, 24 * 30) * 3_600_000;
+const PRUNE_MS = envInt("PI_BG_PRUNE_HOURS", 168, 1, 24 * 90) * 3_600_000;
 const DEFAULT_TIMEOUT_MIN = envInt("PI_BG_DEFAULT_TIMEOUT_MIN", 0, 0, 24 * 60); // 0 = no timeout
 const KILL_ESCALATE_MS = 5_000;
 const ORPHAN_MS = 15_000; // heartbeat older than this + still running => orphan
@@ -1307,6 +1309,39 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
   for (const ev of sweepEvents) {
     pi.on(ev as never, (_event: unknown, ctx: unknown) => sweepFinishedNotices(ev, ctx));
   }
+
+  // GUARANTEED model-facing delivery: the `context` hook fires before EVERY
+  // LLM call of a session and may return a modified messages array for that
+  // request (transient, never persisted). This is the pi-supported channel
+  // that works even when sendMessage can't (pi-web stub runtime, stale refs,
+  // process restarts): the session's OWN pending completion notices get
+  // injected straight into its next prompt — the moment that session is used
+  // again, its finished tasks surface. Whether the exit/session_start
+  // sendMessage push already delivered is re-checked on disk right before
+  // injecting (single-writer discipline: disk is the lock).
+  pi.on("context", (event: { messages?: Array<Record<string, unknown>> }, ctx: unknown) => {
+    const sf = (ctx as { sessionManager?: { getSessionFile?: () => string | undefined } } | undefined)?.sessionManager?.getSessionFile?.();
+    if (sf) currentSessionFile = sf;
+    if (ctx) eventCtx = ctx as { sendMessage?: unknown };
+    const metas = listDiskMetas();
+    refreshScan(metas);
+    const now = Date.now();
+    const pumped = metas.filter((m) => m.state !== "running" && !m.notifiedAt && m.finishedAt && now - m.finishedAt < PRUNE_MS && canNotifyHere(m, now)).filter((m) => !readMeta(m.id)?.notifiedAt);
+    if (!pumped.length) return {};
+    const lines = pumped.slice(0, 5).map((m) => `${stateIcon(m.state)} ${m.name} (${m.id}) — ${m.state}${m.exitCode != null ? `, exit=${m.exitCode}` : ""}, ran ${fmtDur(m.finishedAt - m.startedAt)}`);
+    const text = ["<system-reminder>", `Background task${pumped.length === 1 ? "" : "s"} finished since you were away:`, ...lines, "Inspect with bg_status / bg_log.", "</system-reminder>"].join("\n");
+    for (const m of pumped) {
+      m.notifiedAt = now;
+      writeMeta(m);
+    }
+    debugLog(`context: injected ${pumped.length} finished task notice(s)`);
+    return {
+      messages: [
+        ...(event?.messages ?? []),
+        { role: "user", content: [{ type: "text", text }], timestamp: Date.now() },
+      ],
+    };
+  });
 
   // housekeeping on load + hourly
   refreshScan();
