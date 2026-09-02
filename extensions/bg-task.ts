@@ -739,6 +739,7 @@ function attemptNotify(m: Meta, via: string): void {
     m,
   );
   debugLog(`notify[${via}] id=${m.id} '${m.name}' state=${m.state} tries=${m.notifyTries} -> ${outcome}`);
+  if (ok) debugLog(`notify[${via}] id=${m.id} delivered → ${outcome}`);
   if (ok || m.notifyTries >= 3) m.notifiedAt = Date.now();
   writeMeta(m);
 }
