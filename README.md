@@ -151,7 +151,25 @@ finished tasks wait for their owner session's next activation; another
 session adopts them only when the owner session file has been deleted.
 If the watcher dies anyway (reload/restart), `notifiedAt` stays unset and
 the owner session surfaces the finished task at its own next `session_start`.
-All attempts are logged to `~/.pi/agent/log/bg-task-debug.log`.
+
+Delivery is **mode-aware** (detected from how many session files have ever
+been seen):
+
+- **Single session (TUI / one pi-web tab):** the plain sendMessage push always
+  works — one bound api, nothing ambiguous. The context-hook injector and the
+  input/tool_call/session_info_changed sweeps are skipped entirely (zero disk
+  I/O, zero prompt mutation, provider prompt caches stay untouched). Only the
+  exit fast path + session_start adoption are active.
+- **Multi-session (pi-web, 2+ tabs):** `sendMessage` learns which api belongs
+  to which session — the loader runs a session's factory milliseconds before
+  that session's `session_start`, so each start claims the captures since the
+  previous one (per-session api list, splice-proof by holding object refs).
+  Delivery targets ONLY the owner's own apis — the notice queues in the
+  owner's session (`deliverAs: nextTurn`, no wake) even while you watch
+  another tab. The `context` hook stays as the guarantee layer: it injects the
+  pending notice into the owner's very next LLM call when no push landed.
+Retention of finished-but-unnotified tasks is 7 days. All attempts are logged
+to `~/.pi/agent/log/bg-task-debug.log`.
 
 Human commands: `/bg` (interactive picker — pick a task to inspect or kill
 with confirm), `/bg kill <id>`, `/bg on|off` (expose tools to the model AND
@@ -159,9 +177,9 @@ gate the interceptor, default on).
 
 - State: `~/.pi/agent/bg-tasks/<id>/{meta.json,out.log,out.1.log}` with
   heartbeats (stale heartbeat + live process ⇒ `orphan`), auto-prune after
-  `PI_BG_PRUNE_HOURS` (24).
+  `PI_BG_PRUNE_HOURS` (168 = 7 days).
 - Config: `PI_BG_STATE_DIR`, `PI_BG_MAX_CONCURRENT` (8), `PI_BG_LOG_CAP_MB`
-  (2), `PI_BG_PRUNE_HOURS` (24), `PI_BG_DEFAULT_TIMEOUT_MIN` (0 = none),
+  (2), `PI_BG_PRUNE_HOURS` (168 = 7d), `PI_BG_DEFAULT_TIMEOUT_MIN` (0 = none),
   `PI_BG_INTERCEPTOR` (`auto-bg` | `warn` | `off`),
   `PI_BG_TICK_MS` (5000 — scan/heartbeat cadence while tasks run).
 - Limitation: pipe-mode tasks whose output exceeds the pipe buffer die if the

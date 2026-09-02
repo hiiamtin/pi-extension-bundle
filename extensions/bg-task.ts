@@ -1334,6 +1334,10 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
         if (changed) debugLog(`session-track[${via}] -> ${sf}`);
       }
       if (ctx) eventCtx = ctx as { sendMessage?: unknown }; // fresh, per-event wired sendMessage
+      // In single-session mode the session_start sweep (reload adoption) already
+      // covers every catch-up — the input/tool_call/session_info_changed sweeps
+      // exist ONLY for pi-web multi-tab (where tab clicks fire no session_start).
+      if (via !== "session_start" && pushAllowed()) return;
       const metas = listDiskMetas();
       refreshScan(metas);
       const now = Date.now();
@@ -1380,6 +1384,11 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
   // sendMessage push already delivered is re-checked on disk right before
   // injecting (single-writer discipline: disk is the lock).
   pi.on("context", (event: { messages?: Array<Record<string, unknown>> }, ctx: unknown) => {
+    // Single-session mode (TUI / one tab): the sendMessage push always works
+    // (one bound api, nothing ambiguous) — the context hook would never inject
+    // anything, so skip ALL of its work (no disk scan, no prompt mutation) and
+    // keep provider prompt caches untouched.
+    if (pushAllowed()) return {};
     const sf = (ctx as { sessionManager?: { getSessionFile?: () => string | undefined } } | undefined)?.sessionManager?.getSessionFile?.();
     if (sf) {
       seenSessionFiles.add(sf);
