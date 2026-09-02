@@ -225,7 +225,11 @@ missing param fails loudly instead of silently sending `undefined` upstream.
   It loads all extensions and calls each registered tool under BOTH calling
   conventions; exit code 0 (`ALL OK`) means safe to use. Detects the silent
   param-loss failure mode that once broke web_search (query=undefined →
-  upstream HTTP 422/400).
+  upstream HTTP 422/400). Also auto-links the installed pi packages into
+  `node_modules/@earendil-works` (gitignored, same pattern as the typebox
+  link) so extensions that runtime-import pi packages (btw.ts) load and get
+  verified too — command registration + argument completions are checked as
+  well. Extensions are skipped with a reason only when pi can't be located.
 
 ### btw.ts — /btw side-question command
 
