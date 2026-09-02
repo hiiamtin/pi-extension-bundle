@@ -69,7 +69,10 @@ class McpClient {
   private pending = new Map<number, { resolve: (v: string) => void; reject: (e: Error) => void }>();
 
   private ensure(): ChildProcessWithoutNullStreams {
-    if (this.proc && this.proc.exitCode === null) return this.proc;
+    // stdin can be destroyed (EPIPE'd) slightly before the `exit` event fires —
+    // treat such a child as dead so the next request respawns instead of writing
+    // into a broken pipe
+    if (this.proc && this.proc.exitCode === null && !this.proc.stdin.destroyed) return this.proc;
     const proc = spawn(AI_COST_BIN, ["mcp"], { env: AI_COST_ENV, stdio: ["pipe", "pipe", "pipe"] });
     proc.stdout.setEncoding("utf8");
     proc.stdout.on("data", (chunk: string) => {
@@ -92,6 +95,12 @@ class McpClient {
         }
       }
     });
+    // A dead child's stdio must never surface as uncaughtException — that
+    // kills the whole pi session (EPIPE crash 2026-09-02). Errors here are
+    // handled via write callbacks / pending rejection instead.
+    proc.stdin.on("error", () => {});
+    proc.stdout.on("error", () => {});
+    proc.stderr.on("error", () => {});
     proc.on("exit", () => {
       for (const { reject } of this.pending.values()) reject(new Error("ai-cost mcp exited"));
       this.pending.clear();
@@ -114,7 +123,14 @@ class McpClient {
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); },
       });
-      proc.stdin.write(payload);
+      proc.stdin.write(payload, (err) => {
+        if (err) {
+          clearTimeout(timer);
+          this.pending.delete(id);
+          this.proc = null; // pipe is broken — respawn on next request
+          reject(err);
+        }
+      });
     });
   }
 
