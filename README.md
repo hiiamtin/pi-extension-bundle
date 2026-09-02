@@ -210,6 +210,24 @@ missing param fails loudly instead of silently sending `undefined` upstream.
   param-loss failure mode that once broke web_search (query=undefined →
   upstream HTTP 422/400).
 
+## Conventions for new extensions
+
+- **Every command must be autocomplete-ready.** Any `pi.registerCommand()`
+  should implement `getArgumentCompletions(argumentPrefix)` so typing
+  `/cmd <space>` in the TUI offers selectable subcommands/arguments (same UX
+  as the built-in commands). Reference implementations: `quota.ts` (static
+  subcommand tree) and `bg-task.ts` (completes live task ids from the shared
+  state dir). Rules of thumb:
+  - return `{ value, label }` items, or `null` for "nothing to show"
+  - keep it READ-ONLY — completions run on every keystroke, never mutate disk
+    state there
+  - cap the list (~8 items) and filter by prefix/substring
+- **Tools go through `lib/tool-compat.ts`** — wrap `execute` with
+  `extractToolArgs()` and validate required params with `requireString()`
+  (see "pi-version compatibility" above).
+- **Long-running work belongs in a background task**, never a blocking tool
+  call — prefer spawning via the `bg-task` extension's machinery.
+
 ## Repo layout
 
 ```
@@ -224,6 +242,8 @@ lib/
   tool-compat.ts   shared helpers: signature normalization + loud param validation
 scripts/
   smoke-test.mjs   run after any pi upgrade (see web-search section above)
+  bg-e2e.mjs       functional end-to-end test for bg-task (fake ExtensionAPI)
+  bg-regression.mjs regression tests for bg-task bugs + /bg clean/autocomplete
 ```
 
 Note: tool-compat.ts lives under `lib/` (extensions import it as
