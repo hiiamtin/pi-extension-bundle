@@ -529,6 +529,112 @@ function clearAnswerPanel(ctx: ExtensionCommandContext): void {
 	ctx.ui.notify("btw · answer panel dismissed", "info");
 }
 
+function estimateTokens(text: string): number {
+	return Math.ceil(text.length / 4);
+}
+
+function formatThreadText(thread: BtwThread, scope: "latest" | "all"): string {
+	const turns = scope === "latest" ? thread.turns.slice(-1) : thread.turns;
+	const header = `[/btw side question: ${thread.title}]`;
+	const body = turns.map((t) => `Q: ${t.question}\n\nA: ${t.answer}`).join("\n\n");
+	return `${header}\n\n${body}`;
+}
+
+function bringToEditor(ctx: ExtensionCommandContext, thread: BtwThread, scope: "latest" | "all"): void {
+	const text = formatThreadText(thread, scope);
+	const existing = ctx.ui.getEditorText();
+	const merged = existing.trim() ? `${existing}\n\n${text}` : text;
+	ctx.ui.setEditorText(merged);
+	const what = scope === "all" ? `${thread.turns.length} Q&A` : "latest Q&A";
+	ctx.ui.notify(
+		`btw · brought ${what} (~${estimateTokens(text)} tokens) into the main editor — review and submit when ready`,
+		"info",
+	);
+}
+
+async function handleBringCommand(
+	ctx: ExtensionCommandContext,
+	arg: string,
+	registry: BtwThreadRegistry,
+): Promise<void> {
+	const threads = registry.list();
+	if (threads.length === 0) {
+		ctx.ui.notify("btw: no side threads in this session", "warning");
+		return;
+	}
+	if (arg && arg !== "latest" && arg !== "all") {
+		ctx.ui.notify("btw: usage /btw bring [latest|all]", "warning");
+		return;
+	}
+	let thread = threads[0];
+	let scope: "latest" | "all";
+	if (arg) {
+		scope = arg;
+	} else {
+		if (threads.length > 1) {
+			const choice = await ctx.ui.select(
+				"btw bring — which thread",
+				threads.map((t) => `${t.id} · ${t.title}`),
+			);
+			if (!choice) return;
+			thread = threads.find((t) => choice.startsWith(`${t.id} ·`)) ?? thread;
+		}
+		const picked = await ctx.ui.select(`btw bring — what from ${thread.id}?`, [
+			"Latest answer only",
+			"Entire thread",
+		]);
+		if (!picked) return;
+		scope = picked === "Entire thread" ? "all" : "latest";
+	}
+	bringToEditor(ctx, thread, scope);
+}
+
+function showThreadWidget(ctx: ExtensionCommandContext, thread: BtwThread): void {
+	const lines: string[] = [`btw · ${thread.id} · ${thread.title} (${thread.turns.length} Q&A)`, ""];
+	for (const turn of thread.turns) {
+		lines.push(`Q: ${turn.question}`, "");
+		for (const line of turn.answer.split("\n")) lines.push(line);
+		lines.push("");
+	}
+	lines.push("dismiss: /btw clear");
+	ctx.ui.setWidget(BTW_WIDGET_KEY, lines.slice(0, WIDGET_MAX_LINES));
+	if (lines.length > WIDGET_MAX_LINES) {
+		ctx.ui.notify(`btw: thread longer than ${WIDGET_MAX_LINES} lines — truncated in panel`, "warning");
+	}
+}
+
+async function handleShowCommand(
+	ctx: ExtensionCommandContext,
+	arg: string,
+	registry: BtwThreadRegistry,
+): Promise<void> {
+	const threads = registry.list();
+	if (threads.length === 0) {
+		ctx.ui.notify("btw: no side threads in this session", "warning");
+		return;
+	}
+	let thread = threads[0];
+	if (arg) {
+		const normalized = arg.startsWith("btw-") ? arg : `btw-${arg.replace(/^@/, "")}`;
+		thread =
+			threads.find((t) => t.id === normalized || t.id === arg) ??
+			threads.find((t) => t.title.includes(arg));
+		if (!thread) {
+			ctx.ui.notify(`btw: no thread matching "${arg}" — try bare /btw show to pick`, "warning");
+			return;
+		}
+	} else if (threads.length > 1) {
+		const choice = await ctx.ui.select(
+			"btw show — which thread",
+			threads.map((t) => `${t.id} · ${t.title}`),
+			);
+		if (!choice) return;
+		thread = threads.find((t) => choice.startsWith(`${t.id} ·`)) ?? thread;
+	}
+	showThreadWidget(ctx, thread);
+	ctx.ui.notify(`btw · showing ${thread.id} in the panel — dismiss: /btw clear`, "info");
+}
+
 function handleLevelCommand(ctx: ExtensionCommandContext, value: string): void {
 	const settings = loadSettings();
 	const effective = settings.thinkingLevel ?? clampThinkingLevel(ctx.thinkingLevel ?? "off");
@@ -650,7 +756,7 @@ export default function btwExtension(pi: ExtensionAPI) {
 
 	pi.registerCommand("btw", {
 		description:
-			"Ask a side question without touching the main conversation. /btw <question> = new thread; bare /btw = resume menu; /btw clear = dismiss answer panel; /btw level [x] = show/set thinking level",
+			"Ask a side question without touching the main conversation. /btw <question> = new thread; bare /btw = resume menu; /btw clear = dismiss panel; /btw level [x] = thinking level; /btw bring [latest|all] = copy Q&A to main editor; /btw show [id] = show thread in panel",
 		// Free-form question text — complete only the subcommands. Resume happens
 		// via the bare-/btw menu (in-memory state, not typeable ids).
 		getArgumentCompletions: (prefix: string) => {
@@ -660,6 +766,8 @@ export default function btwExtension(pi: ExtensionAPI) {
 				return [
 					{ value: "clear", label: "clear — Dismiss the /btw answer panel (pi-web)" },
 					{ value: "level", label: "level — Show/set /btw thinking level" },
+					{ value: "bring", label: "bring — Copy Q&A into the main editor" },
+					{ value: "show", label: "show — Show a side thread in the panel" },
 				];
 			}
 			const [, sub, rest] = match;
@@ -672,6 +780,27 @@ export default function btwExtension(pi: ExtensionAPI) {
 			}
 			if (sub === "clear" && !rest) {
 				return [{ value: "clear", label: "clear — Dismiss the /btw answer panel (pi-web)" }];
+			}
+			if (sub === "bring" && !rest) {
+				return [
+					{ value: "bring latest", label: "bring latest — Latest Q&A into the main editor" },
+					{ value: "bring all", label: "bring all — Entire thread into the main editor" },
+				];
+			}
+			if (sub === "show") {
+				const restLower = rest.toLowerCase();
+				const items = registry
+					.list()
+					.filter(
+						(t) =>
+							t.id.toLowerCase().startsWith(restLower) || t.title.toLowerCase().includes(restLower),
+					)
+					.slice(0, 8)
+					.map((t) => ({
+						value: `show ${t.id}`,
+						label: `show ${t.id} — ${t.title} (${t.turns.length} Q&A)`,
+					}));
+				return items.length > 0 ? items : null;
 			}
 			return null; // free-form question
 		},
@@ -688,6 +817,14 @@ export default function btwExtension(pi: ExtensionAPI) {
 			}
 			if (question === "level" || question.startsWith("level ")) {
 				handleLevelCommand(ctx, question.slice("level".length).trim());
+				return;
+			}
+			if (question === "bring" || question.startsWith("bring ")) {
+				await handleBringCommand(ctx, question.slice("bring".length).trim(), registry);
+				return;
+			}
+			if (question === "show" || question.startsWith("show ")) {
+				await handleShowCommand(ctx, question.slice("show".length).trim(), registry);
 				return;
 			}
 

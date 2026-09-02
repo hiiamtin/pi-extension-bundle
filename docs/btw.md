@@ -1,11 +1,12 @@
 # /btw — Side-Question Extension for Pi
 
-> **Status: v1 implemented** (`extensions/btw.ts`, commit `4ad694f`).
+> **Status: v1.1 implemented** (`extensions/btw.ts`, commit `4ad694f` + follow-ups).
 > Wire verification (§9) PASSED in live use — measured on a real thread:
 > `cache read 140,992 · in 1,286 · out 1,075 · $0.0025` → **99.1% of input
 > tokens served from the main thread's prompt cache**, confirming the
-> byte-identical prefix replay works as designed. Deferred: bring-to-main,
-> mid-stream steering, snapshot fallback.
+> byte-identical prefix replay works as designed. Deferred: mid-stream
+> steering, snapshot fallback. Shipped post-v1: `/btw level`, answer panel for
+> pi-web (`setWidget` + `/btw clear`), `/btw bring`, `/btw show`.
 
 Design document, pre-development. Everything below is verified against pi source
 (`@earendil-works/pi-coding-agent` 0.x, `pi-ai` 0.84.4) or reverse-engineered
@@ -122,7 +123,7 @@ which also lets side-thread follow-ups cache-hit their own first turn.
 | D6 | System prompt source | Capture the assembled prompt from the `before_agent_start` event (store on the extension instance). Fallback: rebuild via `getSystemPromptOptions()`. If the session never ran a request, proceed with rebuilt prompt + empty/short history |
 | D7 | UI | Mode split: `tui` → `ctx.ui.custom` fullscreen overlay (streaming answer, Esc abort, follow-up via `ui.input`); `rpc` (pi-web) → **persistent answer panel via `ui.setWidget`** (pi-web notify is a 5s auto-dismiss toast — unusable for long answers; widget dismissed via `/btw clear` or replaced by the next answer), resume via `ui.select`; `json`/`print` → guarded no-op |
 | D8 | Session purity | Zero writes to the session file. Nothing appended, nothing forked on disk. `/btw` traffic must not change session size |
-| D9 | "Bring to main" | Deferred (post-v1). When added: format Q&A into the main editor via `ctx.ui.setEditorText()` (explicit user action, like pi-btw) |
+| D9 | "Bring to main" | **Implemented (v1.1)**: `/btw bring [latest\|all]` — formats Q&A (scope menu when bare) and appends to the main editor via `ui.getEditorText()`/`ui.setEditorText()` (sets directly when empty). Explicit user submit; no auto-send. Works in tui + rpc (both support editor text) |
 
 ### Why not the no-tools/sanitized variant?
 

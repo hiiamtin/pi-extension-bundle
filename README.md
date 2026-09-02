@@ -224,6 +224,11 @@ Design doc with full rationale: `docs/btw.md`.
 - **/btw level [x]** — show/set the side-question thinking level
   (`off|minimal|low|medium|high|xhigh|max`). Persisted to `pi-btw.json`;
   delete the key to follow the main thread's level again.
+- **/btw bring [latest\|all]** — copy the thread's Q&A into the main editor
+  (append; set directly if the editor is empty). Review and submit yourself —
+  nothing is sent automatically.
+- **/btw show [id]** — render a side thread (newest, or by id/title) in the
+  answer panel; dismiss with `/btw clear`.
 - No tools are ever executed — the answer is a single completion. Esc aborts.
 - Modes: TUI = streaming overlay; rpc/pi-web = answer shown in a persistent
   panel above the editor (dismiss with **/btw clear**, or from the bare-/btw
