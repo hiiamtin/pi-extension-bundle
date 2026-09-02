@@ -1,7 +1,10 @@
 # /btw — Side-Question Extension for Pi
 
 > **Status: v1 implemented** (`extensions/btw.ts`, commit `4ad694f`).
-> Wire verification (§9) passed in live use. Deferred: bring-to-main,
+> Wire verification (§9) PASSED in live use — measured on a real thread:
+> `cache read 140,992 · in 1,286 · out 1,075 · $0.0025` → **99.1% of input
+> tokens served from the main thread's prompt cache**, confirming the
+> byte-identical prefix replay works as designed. Deferred: bring-to-main,
 > mid-stream steering, snapshot fallback.
 
 Design document, pre-development. Everything below is verified against pi source
