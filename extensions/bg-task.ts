@@ -304,17 +304,19 @@ const pushAllowed = () => seenSessionFiles.size <= 1;
 // few milliseconds BEFORE it emits that session's session_start — proven in
 // the live log: pi#12 captured at 09:19:01.359, its session_start at
 // .405. So each session_start claims every not-yet-claimed capture since the
-// previous one {from..to} — including stub/discovery captures (they throw at
-// send time; the real one in the same range delivers). This makes
-// sendMessage TARGETABLE: try the range belonging to the target session file
-// and the message lands in THAT session — no more cross-session leaks.
-const apiRangeBySession = new Map<string, { from: number; to: number }>();
+// previous one — including stub/discovery captures (they throw at send time;
+// the real one in the claim delivers). We store the api OBJECTS per session
+// (not indices): the capturedPis cap splices the list, which shifts indices.
+const sessionApis = new Map<string, Array<{ pi: ExtensionAPI; at: number }>>();
 let lastAssociatedIndex = -1;
 function associateCapturesWith(sf: string): void {
   const from = lastAssociatedIndex + 1;
   const to = capturedPis.length - 1;
   if (from <= to) {
-    apiRangeBySession.set(sf, { from, to });
+    const claimed = capturedPis.slice(from, to + 1);
+    const arr = sessionApis.get(sf);
+    if (arr) arr.push(...claimed);
+    else sessionApis.set(sf, [...claimed]);
     lastAssociatedIndex = to;
   }
 }
@@ -742,15 +744,14 @@ function sendToSession(message: unknown, opts: unknown, m: Meta | null, target?:
       return false;
     }
   };
-  // 1) session-targeted: only apis recorded as belonging to `target` — the
-  //    message lands in exactly that session (no leak, even multi-session).
+  // 1) session-targeted: only apis claimed by `target` — the message lands in
+  //    exactly that session (no leak, even multi-session).
   if (target) {
-    const range = apiRangeBySession.get(target);
-    if (range) {
-      for (let i = range.to; i >= range.from; i--) {
-        const c = capturedPis[i];
-        if (c && trySend(`pi#${i}(@${c.at})→target`, c.pi.sendMessage)) {
-          return { ok: true, outcome: `sent via pi#${i} (target session)` };
+    const apis = sessionApis.get(target);
+    if (apis?.length) {
+      for (let i = apis.length - 1; i >= 0; i--) {
+        if (trySend(`pi(@${apis[i].at})→target`, apis[i].pi.sendMessage)) {
+          return { ok: true, outcome: "sent via targeted session api" };
         }
       }
     }
