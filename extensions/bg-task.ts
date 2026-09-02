@@ -268,7 +268,18 @@ let settings = { toolsEnabled: true };
 let cachedUi: { setWidget?: (k: string, lines: string[] | undefined) => void; setStatus?: (k: string, t: string) => void } | null = null;
 let widgetTimer: NodeJS.Timeout | null = null;
 let notify: ((msg: string, level: string) => void) | null = null;
-let piApi: ExtensionAPI | null = null;
+// Every session that (re)loads this extension runs the factory, and the
+// loader hands each run a fresh api delegating to that session's runtime.
+// A session's runtime only gets working action methods after its runner
+// binds core (loadExtensions with a discovery-only runtime never binds —
+// `sendMessage` stays the throwing stub forever). pi-web re-runs discovery
+// loads often, so a single module-level `piApi` gets overwritten by whatever
+// ran LAST — a stub run silently breaks every later notification. Fix: keep
+// EVERY captured api on globalThis (survives module re-eval / reload in the
+// same process) and try them all at send time — bound ones deliver, stub/
+// stale ones throw and are skipped.
+const g = globalThis as { __bgCapturedPis?: Array<{ pi: ExtensionAPI; at: number }> };
+const capturedPis = (g.__bgCapturedPis ??= []);
 let currentSessionFile: string | undefined; // this instance's own session (set on session_start)
 let eventCtx: { sendMessage?: unknown } | null = null; // fresh ctx from the last session_start — its sendMessage is wired per-session
 
@@ -671,21 +682,23 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
   return { ok: true, meta };
 }
 
-// Deliver the "task finished" notice to this session via pi.sendMessage.
-// ALWAYS late-bound (read piApi.sendMessage at call time): pi hands extensions
-// a notInitialized placeholder at load and swaps in the real one afterwards —
-// a captured reference throws silently (the bug behind lost notifications).
-// Deliver a message to the session through the first WORKING sendMessage.
-// Resolution order (each late-bound, never captured at load):
+// Deliver the "task finished" notice to the session through the first
+// WORKING sendMessage. Every candidate is late-bound (never captured for
+// later use): extension apis are handed per session load and only session-
+// bound runtimes (post-bindCore) can actually send — a discovery-load api
+// throws the notInitialized stub and a replaced session's api throws stale.
+// Resolution order:
 //   1. the spawning bg_run call's execute ctx (bound to the spawning session)
 //   2. the last session_start event ctx (current session — fresh per event)
-//   3. the pi api object (a loader placeholder in pi-web — throws; works in TUI)
+//   3. ALL captured apis, newest first (we stop at the first that delivers)
 function sendToSession(message: unknown, opts: unknown, m: Meta | null): { ok: boolean; outcome: string } {
   const candidates: Array<[string, unknown]> = [];
   const t = m ? own.get(m.id) : undefined;
   if (t?.ctx) candidates.push(["task ctx", (t.ctx as { sendMessage?: unknown }).sendMessage]);
   if (eventCtx?.sendMessage) candidates.push(["event ctx", eventCtx.sendMessage]);
-  if (piApi && typeof piApi.sendMessage === "function") candidates.push(["pi api", piApi.sendMessage]);
+  for (let i = capturedPis.length - 1; i >= 0; i--) {
+    candidates.push([`pi#${i}(@${capturedPis[i].at})`, capturedPis[i].pi.sendMessage]);
+  }
   let outcome = "sendMessage unavailable";
   const tried: string[] = [];
   for (const [label, fn] of candidates) {
@@ -941,7 +954,10 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
   loadSettings();
   mkdirSync(STATE_DIR, { recursive: true });
   notify = null;
-  piApi = pi;
+  if (pi && !capturedPis.some((c) => c.pi === pi)) {
+    capturedPis.push({ pi, at: Date.now() });
+    if (capturedPis.length > 16) capturedPis.splice(0, capturedPis.length - 16); // bound memory
+  }
 
   const disabled = () => textResult("bg tools are disabled (/bg on to enable)");
 
