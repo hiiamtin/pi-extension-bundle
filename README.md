@@ -191,6 +191,23 @@ and `/bg clean <space>` list live task ids from the shared state dir.
 - `/bg` commands in pi-web work too (widget renders above the editor in both
   TUI and pi-web).
 
+### tok-rate.ts — live tok/s in the working row
+
+With `hideThinkingBlock: true` the working row is the only thing moving during
+long thinking stretches — and it doesn't move. This extension counts streaming
+deltas and rewrites the working message ~every 400ms:
+
+```
+✻ Thinking… ↑ 38.4 tok/s · 1.2k tok · 12s
+✎ Writing…  ↑ 61.8 tok/s · 2.0k tok · 28s
+```
+
+Phase switches automatically (thinking → writing); the rate is windowed (≥200ms
+folds, EMA-smoothed) so burst deltas don't make it explode; totals are chars/4
+heuristic (liveness meter, not billing). Restores pi's default working message
+on message_end / turn_end. Hosts without a working row (pi-web bridge, SDK) and
+`PI_TOK_RATE=off` keep it fully idle. Test: `node scripts/tok-rate-e2e.mjs`.
+
 #### pi-version compatibility (IMPORTANT)
 
 pi ≥0.84 changed the tool calling convention from `execute(params)` to
@@ -266,6 +283,7 @@ extensions/
   web-search.ts    web_search tool (Tavily/Exa/DuckDuckGo fallback)
   web-fetch.ts     web_fetch tool (Jina/Exa/Tavily/Scrapling fallback)
   bg-task.ts       bg_run / bg_status / bg_log / bg_kill background tasks + /bg
+  tok-rate.ts      live tok/s in the working row (streaming deltas → setWorkingMessage)
   btw.ts           /btw — side-question command (real-fork, cache-friendly;
                    design: docs/btw.md)
 lib/
@@ -274,6 +292,7 @@ scripts/
   smoke-test.mjs   run after any pi upgrade (see web-search section above)
   bg-e2e.mjs       functional end-to-end test for bg-task (fake ExtensionAPI)
   bg-regression.mjs regression tests for bg-task bugs + /bg clean/autocomplete
+  tok-rate-e2e.mjs functional test for tok-rate (simulated stream events)
 ```
 
 Note: tool-compat.ts lives under `lib/` (extensions import it as

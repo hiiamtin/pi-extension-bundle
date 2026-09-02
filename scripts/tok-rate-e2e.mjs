@@ -81,8 +81,9 @@ check("toolcall_delta ignored (no repaint)", setWorkingCalls.length === callsBef
 // --- message_end restores the default working message --------------------------
 await fire("message_end", { message: { role: "assistant" } });
 check("message_end restores default (undefined arg)", last() === undefined);
+const callsAtRestore = setWorkingCalls.length;
 await sleep(500);
-check("timer stopped after message_end (no repaints)", setWorkingCalls.length === callsBeforeTool + 2, `calls=${setWorkingCalls.length}`);
+check("timer stopped after message_end (no repaints)", setWorkingCalls.length === callsAtRestore, `restore=${callsAtRestore} now=${setWorkingCalls.length}`);
 
 // --- next message re-activates cleanly ------------------------------------------
 await fire("message_start", { message: { role: "assistant" } });

@@ -53,7 +53,9 @@ export default function tokRateExtension(pi: ExtensionAPI): void {
   let chars = 0;
   let ema = 0; // smoothed tok/s
   let startedAt = 0;
-  let lastDeltaAt = 0;
+  let lastRateAt = 0; // windowed rate: fold chars into the EMA at most every 200ms
+  let charsAtLastRate = 0;
+  let lastPaintAt = 0;
   let phase: "Thinking" | "Writing" = "Thinking";
   let icon = "✻";
   let timer: NodeJS.Timeout | null = null;
@@ -73,10 +75,24 @@ export default function tokRateExtension(pi: ExtensionAPI): void {
     }
   };
 
-  const render = (): void => {
+  const render = (force = false): void => {
     if (!active || !ui) return;
-    const elapsed = Math.max(1, Date.now() - startedAt);
-    const msg = `${icon} ${phase}… ↑ ${ema.toFixed(1)} tok/s · ${fmtTok(chars / CHARS_PER_TOKEN)} tok · ${fmtDur(elapsed)}`;
+    const now = Date.now();
+    // windowed rate — per-delta dt can be ~0ms (burst deltas in one tick),
+    // which makes instant rates explode and poisons the EMA; folding over a
+    // >=200ms window keeps the number sane and naturally smooth
+    const dt = now - lastRateAt;
+    if (dt >= 200) {
+      const instant = (chars - charsAtLastRate) / CHARS_PER_TOKEN / (dt / 1000);
+      ema = ema === 0 ? instant : ema * 0.5 + instant * 0.5;
+      lastRateAt = now;
+      charsAtLastRate = chars;
+    }
+    if (!force && now - lastPaintAt < 100) return; // paint throttle (deltas can burst)
+    lastPaintAt = now;
+    const elapsed = Math.max(1, now - startedAt);
+    const rate = ema > 0 ? ema.toFixed(1) : "--"; // "--" until the first window closes
+    const msg = `${icon} ${phase}… ↑ ${rate} tok/s · ${fmtTok(chars / CHARS_PER_TOKEN)} tok · ${fmtDur(elapsed)}`;
     try {
       ui.setWorkingMessage?.(msg);
     } catch {
@@ -93,7 +109,9 @@ export default function tokRateExtension(pi: ExtensionAPI): void {
     chars = 0;
     ema = 0;
     startedAt = Date.now();
-    lastDeltaAt = startedAt;
+    lastRateAt = startedAt;
+    charsAtLastRate = 0;
+    lastPaintAt = 0;
     phase = "Thinking";
     icon = "✻";
     active = true;
@@ -107,23 +125,21 @@ export default function tokRateExtension(pi: ExtensionAPI): void {
     if (!active) return;
     const ev = event.assistantMessageEvent;
     if (!ev) return;
+    let nextPhase: "Thinking" | "Writing";
     if (ev.type === "thinking_delta") {
-      phase = "Thinking";
-      icon = "✻";
+      nextPhase = "Thinking";
     } else if (ev.type === "text_delta") {
-      phase = "Writing";
-      icon = "✎";
+      nextPhase = "Writing";
     } else {
       return; // start/end markers and toolcall JSON deltas are not prose
     }
     const len = ev.delta?.length ?? 0;
     if (!len) return;
-    const now = Date.now();
-    const instant = (len / CHARS_PER_TOKEN) / (Math.max(1, now - lastDeltaAt) / 1000);
-    lastDeltaAt = now;
+    const phaseChanged = nextPhase !== phase;
+    phase = nextPhase;
+    icon = nextPhase === "Thinking" ? "✻" : "✎";
     chars += len;
-    ema = ema === 0 ? instant : ema * 0.7 + instant * 0.3;
-    render(); // immediate first paint; the timer keeps it fresh during pauses
+    render(phaseChanged); // phase switch paints immediately; prose deltas are throttled
   });
 
   pi.on("message_end", (event: StreamEvent) => {

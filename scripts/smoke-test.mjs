@@ -52,13 +52,32 @@ const files = process.argv.slice(2).length
       .split("\n")
       .filter(Boolean)
       .map((p) => path.basename(p));
+const skipped = [];
 for (const f of files) {
-  const mod = await import(path.join(pkgRoot, "extensions", f));
-  mod.default(fakePi);
+  try {
+    const mod = await import(path.join(pkgRoot, "extensions", f));
+    mod.default(fakePi);
+  } catch (e) {
+    const msg = String(e?.message ?? e);
+    // Extensions may runtime-import @earendil-works/* (e.g. btw.ts →
+    // buildSessionContext, matchesKey). pi's own loader resolves those for
+    // extensions; this bare-node harness cannot. Skip such files instead of
+    // crashing the whole run — they must still be verified inside real pi.
+    if (/Cannot find package '@earendil-works\//.test(msg)) {
+      skipped.push(`${f} (imports runtime-provided @earendil-works/* — verify in pi)`);
+      continue;
+    }
+    console.error(`LOAD FAILED: ${f}: ${msg}`);
+    process.exit(1);
+  }
 }
+for (const s of skipped) console.log(`skipped: ${s}`);
 const names = Object.keys(registered);
 console.log(`registered tools: ${names.join(", ") || "(none)"}`);
-if (names.length === 0) process.exit(1);
+if (names.length === 0 && skipped.length >= files.length) {
+  console.error("every extension was skipped — nothing to smoke test");
+  process.exit(1);
+}
 
 // --- minimal valid args per tool ------------------------------------------
 const MIN_ARGS = {
