@@ -206,7 +206,7 @@ Phase switches automatically (thinking → writing); the rate is windowed (≥20
 folds, EMA-smoothed) so burst deltas don't make it explode; totals are chars/4
 heuristic (liveness meter, not billing). Restores pi's default working message
 on message_end / turn_end. Hosts without a working row (pi-web bridge, SDK) and
-`PI_TOK_RATE=off` keep it fully idle. Test: `node scripts/tok-rate-e2e.mjs`.
+`PI_TOK_RATE=off` keep it fully idle. The rate is theme-colored by tier (accent ≥50, success ≥30, warning ≥15, else error) like pi-web's tps badge. Test: `node scripts/tok-rate-e2e.mjs`.
 
 #### pi-version compatibility (IMPORTANT)
 

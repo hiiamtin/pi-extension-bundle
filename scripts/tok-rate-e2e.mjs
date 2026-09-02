@@ -125,5 +125,33 @@ await (hooks2.message_start ?? []).map((fn) => fn({ message: { role: "assistant"
 await (hooks2.message_update ?? []).map((fn) => fn({ assistantMessageEvent: { type: "text_delta", delta: "abc" } }, undefined));
 check("no-UI host (hasUI:false) stays completely idle", uiTouched === 0);
 
+// --- themed host: colors via theme.fg (rate tiers like pi-web's badge) ---------
+const hooksT = {};
+const paintedT = [];
+const fakeTheme = { fg: (color, text) => `\x1b[${color}m${text}\x1b[0m` };
+const modT = await import(path.join(pkgRoot, "extensions", "tok-rate.ts"));
+modT.default({
+  registerTool: () => {},
+  registerCommand: () => {},
+  on: (name, fn) => {
+    (hooksT[name] ??= []).push(fn);
+  },
+  sendMessage: () => {},
+});
+const fireT = (name, event) =>
+  Promise.all(
+    (hooksT[name] ?? []).map((fn) =>
+      fn(event, { hasUI: true, ui: { setWorkingMessage: (m) => paintedT.push(m), theme: fakeTheme } }),
+    ),
+  );
+await fireT("message_start", { message: { role: "assistant" } });
+await fireT("message_update", {
+  assistantMessageEvent: { type: "thinking_delta", delta: "x".repeat(2000) },
+});
+await sleep(450); // fold a rate window (ema > 0 → accent tier)
+const themed = paintedT.at(-1) ?? "";
+check("themed host paints ANSI colors (accent/dim present)", themed.includes("\x1b[") && themed.includes("accent") && themed.includes("dim"), JSON.stringify(themed));
+check("rate gets a tier color (accent/success/warning/error)", ["accent", "success", "warning", "error"].some((c) => themed.includes(`\x1b[${c}m↑`)), JSON.stringify(themed));
+
 console.log(failures === 0 ? "\nALL TOK-RATE CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

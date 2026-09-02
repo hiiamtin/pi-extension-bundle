@@ -27,6 +27,7 @@ const CHARS_PER_TOKEN = 4;
 
 interface WorkingUi {
   setWorkingMessage?: (msg?: string) => void;
+  theme?: { fg(color: string, text: string): string };
 }
 
 interface StreamEvent {
@@ -94,7 +95,15 @@ export default function tokRateExtension(pi: ExtensionAPI): void {
     lastPaintAt = now;
     const elapsed = Math.max(1, now - startedAt);
     const rate = ema > 0 ? ema.toFixed(1) : "--"; // "--" until the first window closes
-    const msg = `${icon} ${phase}… ↑ ${rate} tok/s · ${fmtTok(chars / CHARS_PER_TOKEN)} tok · ${fmtDur(elapsed)}`;
+    // rate tier colors (theme roles — same idea as pi-web's tps badge):
+    // >=50 accent, >=30 success, >=15 warning, else error
+    const tier = ema >= 50 ? "accent" : ema >= 30 ? "success" : ema >= 15 ? "warning" : "error";
+    const th = ui.theme;
+    const paint = (text: string, color?: string): string => (th && color ? th.fg(color, text) : text);
+    const msg =
+      paint(`${icon} ${phase}… `, "accent") +
+      paint(`↑ ${rate} tok/s`, tier) +
+      paint(` · ${fmtTok(chars / CHARS_PER_TOKEN)} tok · ${fmtDur(elapsed)}`, "dim");
     try {
       ui.setWorkingMessage?.(msg);
     } catch {
