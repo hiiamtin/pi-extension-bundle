@@ -1,7 +1,7 @@
 {
   "name": "@tintin/pi-extensions",
-  "version": "0.5.0",
-  "description": "pi extensions for the TinTin setup: AI quota status + web search + web fetch + background tasks (run/status/log/wait/artifact/kill, log watches, auto-bg interceptor, per-session ownership)",
+  "version": "0.6.0",
+  "description": "pi extensions for the TinTin setup: AI quota status + web search + web fetch + background tasks (run/status/log/wait/artifact/kill, log watches, auto-bg interceptor, per-session ownership) + /btw side questions (cache-friendly real-fork, docs/btw.md)",
   "keywords": [
     "pi-package"
   ],

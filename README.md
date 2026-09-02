@@ -210,6 +210,25 @@ missing param fails loudly instead of silently sending `undefined` upstream.
   param-loss failure mode that once broke web_search (query=undefined →
   upstream HTTP 422/400).
 
+### btw.ts — /btw side-question command
+
+Ask a quick question mid-task without polluting the main conversation.
+Design doc with full rationale: `docs/btw.md`.
+
+- **/btw <question>** — new side thread: replays the main thread's real request
+  prefix (same system prompt, tools, message history) + the question appended
+  last. The identical prefix is what makes provider prompt-cache hits work
+  (~90% discount on context tokens; watch `cache read` in the usage line).
+- **/btw** (bare) — resume menu for in-memory side threads (per session;
+  follow-ups via the composer prompt after each answer).
+- No tools are ever executed — the answer is a single completion. Esc aborts.
+- Modes: TUI = streaming overlay; rpc/pi-web = answer via notify; json/print =
+  guarded no-op.
+- Optional settings in `~/.pi/agent/pi-btw.json`: `model` ("provider/id", e.g.
+  a cheaper model), `thinkingLevel`, `cacheRetention` ("none"|"short"|"long").
+- Debug: set `BTW_DEBUG_DUMP=/tmp/btw.json` to dump the exact assembled
+  request context (for verifying cache-prefix identity; see docs/btw.md §9).
+
 ## Conventions for new extensions
 
 - **Every command must be autocomplete-ready.** Any `pi.registerCommand()`
@@ -238,6 +257,8 @@ extensions/
   web-search.ts    web_search tool (Tavily/Exa/DuckDuckGo fallback)
   web-fetch.ts     web_fetch tool (Jina/Exa/Tavily/Scrapling fallback)
   bg-task.ts       bg_run / bg_status / bg_log / bg_kill background tasks + /bg
+  btw.ts           /btw — side-question command (real-fork, cache-friendly;
+                   design: docs/btw.md)
 lib/
   tool-compat.ts   shared helpers: signature normalization + loud param validation
 scripts/
