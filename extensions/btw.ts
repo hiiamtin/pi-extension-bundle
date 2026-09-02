@@ -48,6 +48,9 @@ import { type Component, Key, matchesKey, type TUI } from "@earendil-works/pi-tu
 
 const SETTINGS_PATH = join(homedir(), ".pi", "agent", "pi-btw.json");
 
+const BTW_WIDGET_KEY = "btw";
+const WIDGET_MAX_LINES = 300;
+
 const THINKING_LEVELS = [
 	"off",
 	"minimal",
@@ -486,6 +489,33 @@ class BtwStreamView implements Component {
 // Command flows
 // ---------------------------------------------------------------------------
 
+function showAnswerPanel(
+	ctx: ExtensionCommandContext,
+	thread: BtwThread,
+	turn: BtwTurn,
+): void {
+	// rpc/pi-web has no overlay; notify() is a 5s toast — unreadable for long
+	// answers. setWidget renders a persistent panel above the editor instead;
+	// dismissed via /btw clear (or replaced by the next answer).
+	const lines: string[] = [];
+	lines.push(`btw · ${thread.id} · ${thread.title}`);
+	lines.push("");
+	const bodyLines = turn.answer.split("\n");
+	for (const line of bodyLines.slice(0, WIDGET_MAX_LINES)) lines.push(line);
+	if (bodyLines.length > WIDGET_MAX_LINES) {
+		lines.push(`… (${bodyLines.length - WIDGET_MAX_LINES} more lines truncated)`);
+	}
+	lines.push("");
+	const usage = describeUsage(turn.response);
+	lines.push(`${usage ? `${usage} — ` : ""}dismiss: /btw clear`);
+	ctx.ui.setWidget(BTW_WIDGET_KEY, lines);
+}
+
+function clearAnswerPanel(ctx: ExtensionCommandContext): void {
+	ctx.ui.setWidget(BTW_WIDGET_KEY, undefined);
+	ctx.ui.notify("btw · answer panel dismissed", "info");
+}
+
 async function resolveProvider(
 	ctx: ExtensionCommandContext,
 	resolved: ResolvedModel,
@@ -568,9 +598,7 @@ async function runThreadRpc(
 		ctx.ui.notify(`btw: ${result.message}`, "error");
 		return;
 	}
-	const answer = result.turn.answer;
-	const truncated = answer.length > 2000 ? `${answer.slice(0, 2000)}…` : answer;
-	ctx.ui.notify(`btw: ${truncated}`, "info");
+	showAnswerPanel(ctx, thread, result.turn);
 }
 
 export default function btwExtension(pi: ExtensionAPI) {
@@ -578,17 +606,26 @@ export default function btwExtension(pi: ExtensionAPI) {
 
 	pi.registerCommand("btw", {
 		description:
-			"Ask a side question without touching the main conversation. /btw <question> = new thread; bare /btw = resume menu",
-		// Free-form question text — nothing sensible to complete. Resume happens
-		// via the bare-/btw menu (in-memory state, not typeable ids). Returning
-		// null is the deliberate choice here.
-		getArgumentCompletions: () => null,
+			"Ask a side question without touching the main conversation. /btw <question> = new thread; bare /btw = resume menu; /btw clear = dismiss answer panel",
+		// Free-form question text — nothing sensible to complete besides the
+		// clear subcommand. Resume happens via the bare-/btw menu (in-memory
+		// state, not typeable ids).
+		getArgumentCompletions: (prefix: string) => {
+			const normalized = prefix.trimStart();
+			if (normalized && !"clear".startsWith(normalized)) return null;
+			return [{ value: "clear", label: "clear — Dismiss the /btw answer panel (pi-web)" }];
+		},
 		handler: async (args, ctx) => {
 			const question = args.trim();
 			if (ctx.mode !== "tui" && !ctx.hasUI) {
 				return; // json/print modes: nothing sensible to render
 			}
 			if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
+
+			if (question === "clear" || question === "close") {
+				clearAnswerPanel(ctx);
+				return;
+			}
 
 			const settings = loadSettings();
 			const resolution = await resolveModel(pi, ctx, settings);
@@ -644,9 +681,13 @@ export default function btwExtension(pi: ExtensionAPI) {
 				} else {
 					const choice = await ctx.ui.select(
 						"btw — resume a thread or start a new one",
-						["New question", ...threads.map((t) => `${t.id} · ${t.title}`)],
+						["New question", "Clear answer panel", ...threads.map((t) => `${t.id} · ${t.title}`)],
 					);
 					if (choice === undefined) return;
+					if (choice === "Clear answer panel") {
+						clearAnswerPanel(ctx);
+						return;
+					}
 					if (choice === "New question") {
 						const asked = await ctx.ui.input("btw — side question", "What do you want to know?");
 						effectiveQuestion = asked?.trim() ?? "";

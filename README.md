@@ -222,8 +222,9 @@ Design doc with full rationale: `docs/btw.md`.
 - **/btw** (bare) — resume menu for in-memory side threads (per session;
   follow-ups via the composer prompt after each answer).
 - No tools are ever executed — the answer is a single completion. Esc aborts.
-- Modes: TUI = streaming overlay; rpc/pi-web = answer via notify; json/print =
-  guarded no-op.
+- Modes: TUI = streaming overlay; rpc/pi-web = answer shown in a persistent
+  panel above the editor (dismiss with **/btw clear**, or from the bare-/btw
+  menu); json/print = guarded no-op.
 - Optional settings in `~/.pi/agent/pi-btw.json`: `model` ("provider/id", e.g.
   a cheaper model), `thinkingLevel`, `cacheRetention` ("none"|"short"|"long").
 - Debug: set `BTW_DEBUG_DUMP=/tmp/btw.json` to dump the exact assembled
