@@ -285,6 +285,40 @@ const capturedPis = (g.__bgCapturedPis ??= []);
 let currentSessionFile: string | undefined; // this instance's own session (set on session_start)
 let eventCtx: { sendMessage?: unknown } | null = null; // fresh ctx from the last session_start — its sendMessage is wired per-session
 
+// SESSION-SCOPED PUSH GUARD. pi.sendMessage does not target a session — the
+// message lands in whatever session the api's runtime is bound to. In a
+// multi-session host (pi-web: all tabs share one process; a tab click fires
+// no event so currentSessionFile can be stale) the newest captured api often
+// belongs to the OTHER session — proven live: exit fast path delivered the
+// owner's notice into the session the user had just switched to. So
+// sendMessage is used ONLY while exactly one session file has ever been seen
+// (TUI / single-tab): any bound api then belongs to that session. Once a
+// second session shows up, push is disabled and the per-session `context`
+// hook (the one channel that is strict BY CONSTRUCTION — its ctx names the
+// session making the LLM call) owns all delivery.
+const seenSessionFiles = new Set<string>();
+const pushAllowed = () => seenSessionFiles.size <= 1;
+
+// SESSION → API MAPPING (the load order makes it sound): the loader runs the
+// factory for a session (capturing an api bound to THAT session's runtime) a
+// few milliseconds BEFORE it emits that session's session_start — proven in
+// the live log: pi#12 captured at 09:19:01.359, its session_start at
+// .405. So each session_start claims every not-yet-claimed capture since the
+// previous one {from..to} — including stub/discovery captures (they throw at
+// send time; the real one in the same range delivers). This makes
+// sendMessage TARGETABLE: try the range belonging to the target session file
+// and the message lands in THAT session — no more cross-session leaks.
+const apiRangeBySession = new Map<string, { from: number; to: number }>();
+let lastAssociatedIndex = -1;
+function associateCapturesWith(sf: string): void {
+  const from = lastAssociatedIndex + 1;
+  const to = capturedPis.length - 1;
+  if (from <= to) {
+    apiRangeBySession.set(sf, { from, to });
+    lastAssociatedIndex = to;
+  }
+}
+
 const DEBUG_LOG = path.join(os.homedir(), ".pi/agent/log/bg-task-debug.log");
 // self-capped (~48KB) diagnostics for spawn/exit/notify — never fatal
 function debugLog(line: string): void {
@@ -493,6 +527,7 @@ function notifyWatch(m: Meta, pattern: string, matchedLine: string): void {
     },
     { deliverAs: "followUp", triggerTurn: true },
     m,
+    m.ownerSession,
   );
   if (!ok) debugLog(`watch notify failed id=${m.id}: ${outcome}`);
 }
@@ -693,24 +728,42 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
 //   1. the spawning bg_run call's execute ctx (bound to the spawning session)
 //   2. the last session_start event ctx (current session — fresh per event)
 //   3. ALL captured apis, newest first (we stop at the first that delivers)
-function sendToSession(message: unknown, opts: unknown, m: Meta | null): { ok: boolean; outcome: string } {
-  const candidates: Array<[string, unknown]> = [];
-  const t = m ? own.get(m.id) : undefined;
-  if (t?.ctx) candidates.push(["task ctx", (t.ctx as { sendMessage?: unknown }).sendMessage]);
-  if (eventCtx?.sendMessage) candidates.push(["event ctx", eventCtx.sendMessage]);
-  for (let i = capturedPis.length - 1; i >= 0; i--) {
-    candidates.push([`pi#${i}(@${capturedPis[i].at})`, capturedPis[i].pi.sendMessage]);
-  }
-  let outcome = "sendMessage unavailable";
+function sendToSession(message: unknown, opts: unknown, m: Meta | null, target?: string): { ok: boolean; outcome: string } {
   const tried: string[] = [];
-  for (const [label, fn] of candidates) {
-    if (typeof fn !== "function") continue;
+  let outcome = "sendMessage unavailable";
+  const trySend = (label: string, fn: unknown): boolean => {
+    if (typeof fn !== "function") return false;
     tried.push(label);
     try {
       (fn as (msg: unknown, o: unknown) => void)(message, opts);
-      return { ok: true, outcome: `sent via ${label}` };
+      return true;
     } catch (e) {
       outcome = `FAILED via ${label}: ${(e as Error).message}`.slice(0, 300);
+      return false;
+    }
+  };
+  // 1) session-targeted: only apis recorded as belonging to `target` — the
+  //    message lands in exactly that session (no leak, even multi-session).
+  if (target) {
+    const range = apiRangeBySession.get(target);
+    if (range) {
+      for (let i = range.to; i >= range.from; i--) {
+        const c = capturedPis[i];
+        if (c && trySend(`pi#${i}(@${c.at})→target`, c.pi.sendMessage)) {
+          return { ok: true, outcome: `sent via pi#${i} (target session)` };
+        }
+      }
+    }
+  }
+  // 2) single-session fallback: exactly one session has ever been seen, so any
+  //    bound api belongs to it (TUI / single tab).
+  if (pushAllowed()) {
+    const t = m ? own.get(m.id) : undefined;
+    if (t?.ctx && trySend("task ctx", (t.ctx as { sendMessage?: unknown }).sendMessage)) return { ok: true, outcome: "sent via task ctx" };
+    if (eventCtx?.sendMessage && trySend("event ctx", eventCtx.sendMessage)) return { ok: true, outcome: "sent via event ctx" };
+    for (let i = capturedPis.length - 1; i >= 0; i--) {
+      const c = capturedPis[i];
+      if (c && trySend(`pi#${i}(@${c.at})`, c.pi.sendMessage)) return { ok: true, outcome: `sent via pi#${i}` };
     }
   }
   if (tried.length) outcome += ` [tried: ${tried.join(", ")}]`;
@@ -719,13 +772,15 @@ function sendToSession(message: unknown, opts: unknown, m: Meta | null): { ok: b
 
 function attemptNotify(m: Meta, via: string): void {
   if (m.notifiedAt) return;
-  // strict ownership: never push a cross-session notice while the owner
-  // session still exists — it will deliver on its own next activation
-  if (isCrossSession(m) && m.ownerSession && existsSync(m.ownerSession)) {
-    debugLog(`notify[${via}] id=${m.id} skipped — foreign task, owner session still alive`);
+  const target = m.ownerSession; // deliver into the OWNER's session queue exactly
+  if (!target && !pushAllowed()) {
+    // legacy task (no owner identity) in a multi-session host: we cannot
+    // target it — leave notifiedAt unset; the context-hook grace rule covers it
+    debugLog(`notify[${via}] id=${m.id} push skipped — legacy task (no owner) in multi-session host`);
     return;
   }
   m.notifyTries = (m.notifyTries ?? 0) + 1;
+  const foregroundOwner = !!target && currentSessionFile === target; // owner is the active session → wake proactively
   const cross = isCrossSession(m);
   const tail = tailLog(m.id, 5, 600);
   const content = [
@@ -737,8 +792,9 @@ function attemptNotify(m: Meta, via: string): void {
     .join("\n");
   const { ok, outcome } = sendToSession(
     { customType: "bg-task", display: true, content, details: { id: m.id, state: m.state, exitCode: m.exitCode ?? null } },
-    { deliverAs: "followUp", triggerTurn: true },
+    foregroundOwner ? { deliverAs: "followUp", triggerTurn: true } : { deliverAs: "nextTurn", triggerTurn: false },
     m,
+    target,
   );
   debugLog(`notify[${via}] id=${m.id} '${m.name}' state=${m.state} tries=${m.notifyTries} -> ${outcome}`);
   if (ok) debugLog(`notify[${via}] id=${m.id} delivered → ${outcome}`);
@@ -1270,6 +1326,8 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     try {
       const sf = (ctx as { sessionManager?: { getSessionFile?: () => string | undefined } } | undefined)?.sessionManager?.getSessionFile?.();
       if (sf) {
+        seenSessionFiles.add(sf);
+        associateCapturesWith(sf);
         const changed = sf !== currentSessionFile;
         currentSessionFile = sf;
         if (changed) debugLog(`session-track[${via}] -> ${sf}`);
@@ -1290,6 +1348,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
         },
         { deliverAs: "followUp", triggerTurn: true },
         null,
+        sf || currentSessionFile,
       );
       if (!ok) {
         debugLog(`${via} notice failed: ${outcome}`);
@@ -1321,7 +1380,11 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
   // injecting (single-writer discipline: disk is the lock).
   pi.on("context", (event: { messages?: Array<Record<string, unknown>> }, ctx: unknown) => {
     const sf = (ctx as { sessionManager?: { getSessionFile?: () => string | undefined } } | undefined)?.sessionManager?.getSessionFile?.();
-    if (sf) currentSessionFile = sf;
+    if (sf) {
+      seenSessionFiles.add(sf);
+      associateCapturesWith(sf);
+      currentSessionFile = sf;
+    }
     if (ctx) eventCtx = ctx as { sendMessage?: unknown };
     const metas = listDiskMetas();
     refreshScan(metas);

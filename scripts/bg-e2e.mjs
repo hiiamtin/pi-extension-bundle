@@ -159,7 +159,8 @@ if (typeof ssHook === "function") {
   // typing in another session: must NOT surface our task
   await inputHook({ text: "hi" }, { sessionManager: { getSessionFile: () => aliveSession } });
   check("input catch-up: foreign session does not claim our task", !sent.some((s) => s.m?.content?.includes("own-task-input")));
-  // typing in the OWNER session: surfaces + marks notified
+  // typing in the OWNER session: the sweep targets the owner's api (session→api
+  // mapping) and delivers there — surfaces + marks notified
   await inputHook({ text: "hi" }, { sessionManager: { getSessionFile: () => path.join(STATE_DIR, "e2e-current-session.jsonl") } });
   check("input catch-up: owner session surfaces its finished task", sent.some((s) => s.m?.content?.includes("own-task-input")));
   const imeta = JSON.parse(readFileSync(path.join(ownIn, "meta.json"), "utf8"));
@@ -180,8 +181,8 @@ if (typeof ssHook === "function") {
   check("context hook: marked notified", !!cmeta.notifiedAt);
   const ctxRes2 = await ctxHook({ messages: [{ role: "user", content: "hi" }] }, { sessionManager: { getSessionFile: () => path.join(STATE_DIR, "e2e-current-session.jsonl") } });
   check("context hook: no duplicate injection (notifiedAt guard)", !Array.isArray(ctxRes2?.messages));
-  const ctxRes3 = await ctxHook({ messages: [{ role: "user", content: "hi" }] }, { sessionManager: { getSessionFile: () => aliveSession } });
-  check("context hook: foreign session gets no injection", !JSON.stringify(ctxRes3 ?? {}).includes("foreign-alive"));
+  const ctxRes3 = await ctxHook({ messages: [{ role: "user", content: "hi" }] }, { sessionManager: { getSessionFile: () => path.join(STATE_DIR, "third-session.jsonl") } });
+  check("context hook: session that owns nothing gets no injection", !Array.isArray(ctxRes3?.messages));
 } else {
   check("session_start hook registered", false);
 }
