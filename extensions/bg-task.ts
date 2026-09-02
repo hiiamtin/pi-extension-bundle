@@ -101,6 +101,7 @@ const ORPHAN_MS = 15_000; // heartbeat older than this + still running => orphan
 const NOTIFY_MAX_TRIES = 12; // push attempts before leaving delivery to the context hook / session_start sweep (do NOT set notifiedAt — that would block the guaranteed channel)
 const ADOPT_GRACE_MS = 60_000; // foreign finished task: adopt (notify here) only after the owner had this long to do it itself
 const WIDGET_MS = envInt("PI_BG_TICK_MS", 5_000, 1_000, 300_000); // scan/heartbeat cadence while tasks are running
+const FINISHED_LINGER_MS = 90_000; // finished own tasks stay in `own` (widget result line + tick retries) before eviction
 const SETTINGS_FILE = path.join(os.homedir(), ".pi/agent/bg-task-settings.json");
 const MAX_OUTPUT_CHARS = 8_000;
 const INTERCEPTOR_MODE = (process.env.PI_BG_INTERCEPTOR || "auto-bg").toLowerCase(); // auto-bg | warn | off
@@ -446,7 +447,7 @@ function renderWidget(metas: Meta[]): string[] {
   for (const t of own.values()) {
     const m = t.meta;
     if (m.state === "running") lines.push(`⚙️ ${m.name} · ${m.id} · ${fmtDur(now - m.startedAt)} · ${((m.bytes ?? t.bytesCurrent) / 1024).toFixed(0)}KB`);
-    else if (m.finishedAt && now - m.finishedAt < 90_000)
+    else if (m.finishedAt && now - m.finishedAt < FINISHED_LINGER_MS)
       lines.push(`${stateIcon(m.state)} ${m.name} · ${m.id} · ${m.state}${m.exitCode != null ? ` (exit ${m.exitCode})` : ""} · ${fmtDur((m.finishedAt ?? now) - m.startedAt)}`);
   }
   for (const m of metas) {
@@ -472,6 +473,11 @@ function ensureWidgetLoop(): void {
           }
         }
         writeMeta(t.meta);
+      }
+      // evict finished own entries once their linger is up (bounded map)
+      const nowEvict = Date.now();
+      for (const [id, t] of own) {
+        if (t.meta.state !== "running" && t.meta.finishedAt && nowEvict - t.meta.finishedAt > FINISHED_LINGER_MS) own.delete(id);
       }
       const metas = listDiskMetas(); // single scan per tick, shared below
       refreshScan(metas);
@@ -726,8 +732,9 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
     meta.signal = signal;
     meta.finishedAt = Date.now();
     writeMeta(meta);
-    own.delete(id);
-
+    // entry STAYS in `own` for a short linger: the widget can show the result
+    // line for FINISHED_LINGER_MS and the tick-retry loop keeps running (its
+    // stop condition sees non-empty widget lines) — the tick evicts afterwards
     attemptNotify(meta, "exit");
     if (typeof notify === "function") notify(`${stateIcon(meta.state)} bg '${meta.name}' ${meta.state}`, meta.state === "done" ? "info" : "warning");
   });

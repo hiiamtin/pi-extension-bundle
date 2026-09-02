@@ -40,10 +40,11 @@ const mod = await import(path.join(pkgRoot, "extensions", "bg-task.ts"));
 
 const sent = []; // every successful sendMessage payload
 const registered = {};
+const commands = {};
 const hooks = {};
 const fakePi = {
   registerTool: (t) => (registered[t.name] = t),
-  registerCommand: () => {},
+  registerCommand: (name, cmd) => (commands[name] = cmd),
   on: (name, fn) => { (hooks[name] ??= []).push(fn); },
   sendMessage: (m, o) => sent.push({ m, o }), // swapped for a thrower mid-test (#2)
 };
@@ -106,12 +107,8 @@ const fireSessionStart2 = (sf) =>
   hooks2.session_start[0]({}, { sessionManager: { getSessionFile: () => sf } });
 fireSessionStart2(OURS2); // claims fakePi2's capture under OURS2 → pushAllowed() false from here on
 
-// keeper task: keeps the widget loop (and with it the tick-based retries) alive
-// while reg02 is already finished — mirrors the real "other tasks still running" case
-await registered.bg_run.execute(
-  "tc", { command: "sleep 25", name: "reg02-keeper" },
-  undefined, undefined, { sessionManager: { getSessionFile: () => OURS2 } },
-);
+// NOTE: no keeper task here — after the linger fix the exit entry stays in
+// `own`, keeping the widget loop (and the tick retries) alive on its own
 await registered.bg_run.execute(
   "tc", { command: "echo reg02-output; exit 3", name: "reg02-notify" },
   undefined, undefined, { sessionManager: { getSessionFile: () => OURS2 } },
@@ -177,6 +174,21 @@ function makeClaimModel(cap) {
   model.associate(sessions[0]);
   check("#3 re-eval: re-associating never re-claims old captures", model.sessionApis.get(sessions[0]).length === before);
 }
+
+// --- #6 exit keeps the own entry for the widget linger -----------------------
+// the /bg handler primes cachedUi; a fast task must then render its result
+// line (✅ …) in the widget during the linger window — and the retry loop
+// stays alive without any other running task (proven by #2 needing no keeper)
+const widgetCalls = [];
+await commands.bg.handler("", { ui: { notify: () => {}, setStatus: () => {}, setWidget: (k, lines) => widgetCalls.push({ k, lines }) } });
+await registered.bg_run.execute(
+  "tc", { command: "echo reg06-widget; true", name: "reg06-widget" },
+  undefined, undefined, { sessionManager: { getSessionFile: () => OURS } },
+);
+await sleep(2500); // a couple of ticks
+const widgetHit = widgetCalls.find((c) => (c.lines ?? []).some((l) => l.includes("reg06-widget")));
+check("#6a finished task renders its result line in the widget (linger)", !!widgetHit && widgetHit.lines.some((l) => l.trim().startsWith("✅")), JSON.stringify(widgetCalls.map((c) => c.lines)));
+check("#6b widget loop still alive after exit (lines non-empty)", widgetCalls.some((c) => (c.lines ?? []).length > 0));
 
 // --- summary ------------------------------------------------------------------
 console.log(failures === 0 ? "\nALL REGRESSION CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
