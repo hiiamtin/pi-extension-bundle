@@ -153,5 +153,31 @@ const themed = paintedT.at(-1) ?? "";
 check("themed host paints ANSI colors (accent/dim present)", themed.includes("\x1b[") && themed.includes("accent") && themed.includes("dim"), JSON.stringify(themed));
 check("rate gets a tier color (accent/success/warning/error)", ["accent", "success", "warning", "error"].some((c) => themed.includes(`\x1b[${c}m↑`)), JSON.stringify(themed));
 
+// --- custom tier thresholds via PI_TOK_RATE_TIERS -------------------------------
+process.env.PI_TOK_RATE_TIERS = "10000,5000,100";
+const hooksC = {};
+const paintedC = [];
+const modC = await import(path.join(pkgRoot, "extensions", "tok-rate.ts") + "?custom-tiers");
+modC.default({
+  registerTool: () => {},
+  registerCommand: () => {},
+  on: (name, fn) => {
+    (hooksC[name] ??= []).push(fn);
+  },
+  sendMessage: () => {},
+});
+const fireC = (name, event) =>
+  Promise.all(
+    (hooksC[name] ?? []).map((fn) => fn(event, { hasUI: true, ui: { setWorkingMessage: (m) => paintedC.push(m), theme: fakeTheme } })),
+  );
+await fireC("message_start", { message: { role: "assistant" } });
+await fireC("message_update", {
+  assistantMessageEvent: { type: "text_delta", delta: "x".repeat(2000) },
+});
+await sleep(450); // rate ≈ 500 tok / 0.45s ≈ 1100 tok/s → warning under custom tiers (accent under defaults)
+const tiered = paintedC.at(-1) ?? "";
+check("PI_TOK_RATE_TIERS overrides thresholds (rate → warning)", tiered.includes("\x1b[warningm↑"), JSON.stringify(tiered));
+delete process.env.PI_TOK_RATE_TIERS;
+
 console.log(failures === 0 ? "\nALL TOK-RATE CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

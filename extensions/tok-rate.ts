@@ -25,6 +25,16 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const UPDATE_MS = 400;
 const CHARS_PER_TOKEN = 4;
 
+// rate tier thresholds for the colors: PI_TOK_RATE_TIERS="fast,ok,slow"
+// (accent >= fast, success >= ok, warning >= slow, error below). Defaults 50/30/15.
+const tierThresholds = (process.env.PI_TOK_RATE_TIERS || "")
+  .split(",")
+  .map((v) => Number(v.trim()))
+  .filter((v) => Number.isFinite(v) && v > 0);
+const TIER_FAST = tierThresholds[0] ?? 50;
+const TIER_OK = tierThresholds[1] ?? 30;
+const TIER_SLOW = tierThresholds[2] ?? 15;
+
 interface WorkingUi {
   setWorkingMessage?: (msg?: string) => void;
   theme?: { fg(color: string, text: string): string };
@@ -95,9 +105,8 @@ export default function tokRateExtension(pi: ExtensionAPI): void {
     lastPaintAt = now;
     const elapsed = Math.max(1, now - startedAt);
     const rate = ema > 0 ? ema.toFixed(1) : "--"; // "--" until the first window closes
-    // rate tier colors (theme roles — same idea as pi-web's tps badge):
-    // >=50 accent, >=30 success, >=15 warning, else error
-    const tier = ema >= 50 ? "accent" : ema >= 30 ? "success" : ema >= 15 ? "warning" : "error";
+    // rate tier colors (theme roles — same idea as pi-web's tps badge)
+    const tier = ema >= TIER_FAST ? "accent" : ema >= TIER_OK ? "success" : ema >= TIER_SLOW ? "warning" : "error";
     const th = ui.theme;
     const paint = (text: string, color?: string): string => (th && color ? th.fg(color, text) : text);
     const msg =
