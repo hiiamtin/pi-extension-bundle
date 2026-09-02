@@ -89,6 +89,7 @@ export default function tokRateExtension(pi: ExtensionAPI): void {
       charsAtLastRate = chars;
     }
     if (!force && now - lastPaintAt < 100) return; // paint throttle (deltas can burst)
+    if (force && now - lastPaintAt < 50) return; // even phase switches can't paint-storm
     lastPaintAt = now;
     const elapsed = Math.max(1, now - startedAt);
     const rate = ema > 0 ? ema.toFixed(1) : "--"; // "--" until the first window closes

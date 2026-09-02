@@ -70,8 +70,9 @@ check("totals accumulate (≥100 tok est.)", /· ([0-9.]+k?|[0-9]+) tok/.test(ms
 await fire("message_update", {
   assistantMessageEvent: { type: "text_delta", delta: "z".repeat(400) },
 });
+await sleep(450); // phase label lands on the next paint (throttle/tick ≤400ms)
 msg = last();
-check("text_delta switches phase to Writing", !!msg && msg.includes("Writing"), String(msg));
+check("text_delta switches phase to Writing (within a tick)", !!msg && msg.includes("Writing"), String(msg));
 const callsBeforeTool = setWorkingCalls.length;
 await fire("message_update", {
   assistantMessageEvent: { type: "toolcall_delta", delta: "{}" },
