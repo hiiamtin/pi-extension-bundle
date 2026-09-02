@@ -5,6 +5,8 @@
 //   #3 positional claim cursor desynced by the capturedPis splice cap
 //   #4 detach scan notified the stale meta ("finished: running") and clobbered state
 //   #5 taskLine called with 2 args but declared with 1 (type error — tsc, not here)
+//   #6 widget linger: finished task renders result line, retry loop stays alive
+//   #7 /bg clean [id] deletes finished tasks NOW; running/orphan are kept
 //
 //   node scripts/bg-regression.mjs   (exit 0 = ALL OK)
 //
@@ -12,7 +14,7 @@
 // (same loader approach as bg-e2e.mjs); test #3 replicates the claim
 // algorithm verbatim because sessionApis internals are not exported.
 
-import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -189,6 +191,37 @@ await sleep(2500); // a couple of ticks
 const widgetHit = widgetCalls.find((c) => (c.lines ?? []).some((l) => l.includes("reg06-widget")));
 check("#6a finished task renders its result line in the widget (linger)", !!widgetHit && widgetHit.lines.some((l) => l.trim().startsWith("✅")), JSON.stringify(widgetCalls.map((c) => c.lines)));
 check("#6b widget loop still alive after exit (lines non-empty)", widgetCalls.some((c) => (c.lines ?? []).length > 0));
+
+// --- #7 /bg clean deletes finished tasks now, keeps running/orphan -----------
+const notes7 = [];
+const ui7 = {
+  notify: (m) => notes7.push(String(m)),
+  confirm: async () => true,
+  setWidget: () => {},
+  setStatus: () => {},
+};
+writeMetaRaw("reg07fin", {
+  name: "reg07-finished", state: "done", exitCode: 0, finishedAt: Date.now() - 60_000,
+  owner: "pid-x", ownerSession: OURS, heartbeat: Date.now() - 60_000, bytes: 0,
+});
+writeMetaRaw("reg07run", {
+  name: "reg07-running", state: "running", owner: "pid-x",
+  ownerSession: OURS, heartbeat: Date.now(), bytes: 0,
+  pid: process.pid, pgid: process.pid, // alive → refreshScan must NOT re-mark it gone
+});
+await commands.bg.handler("clean", { ui: ui7 });
+check("#7a clean (no args) deletes finished tasks immediately", !existsSync(path.join(STATE_DIR, "reg07fin")));
+check("#7b clean keeps running tasks", existsSync(path.join(STATE_DIR, "reg07run")));
+await commands.bg.handler("clean reg07-running", { ui: ui7 });
+check("#7c clean <id> refuses running tasks", existsSync(path.join(STATE_DIR, "reg07run")) && notes7.some((n) => n.includes("bg_kill it first")));
+writeMetaRaw("reg07one", {
+  name: "reg07-single", state: "failed", exitCode: 2, finishedAt: Date.now() - 30_000,
+  owner: "pid-x", ownerSession: OURS, heartbeat: Date.now() - 30_000, bytes: 0,
+});
+await commands.bg.handler("clean reg07one", { ui: ui7 });
+check("#7d clean <id> deletes a specific finished task", !existsSync(path.join(STATE_DIR, "reg07one")));
+await commands.bg.handler("clean nope-xyz", { ui: ui7 });
+check("#7e clean <unknown id> reports not found", notes7.some((n) => n.includes("not found")));
 
 // --- summary ------------------------------------------------------------------
 console.log(failures === 0 ? "\nALL REGRESSION CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);

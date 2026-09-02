@@ -172,8 +172,9 @@ Retention of finished-but-unnotified tasks is 7 days. All attempts are logged
 to `~/.pi/agent/log/bg-task-debug.log`.
 
 Human commands: `/bg` (interactive picker — pick a task to inspect or kill
-with confirm), `/bg kill <id>`, `/bg on|off` (expose tools to the model AND
-gate the interceptor, default on).
+with confirm), `/bg kill <id>`, `/bg clean [id|name]` (delete finished tasks
+— meta + logs — immediately; running/orphan tasks are kept), `/bg on|off`
+(expose tools to the model AND gate the interceptor, default on).
 
 - State: `~/.pi/agent/bg-tasks/<id>/{meta.json,out.log,out.1.log}` with
   heartbeats (stale heartbeat + live process ⇒ `orphan`), auto-prune after

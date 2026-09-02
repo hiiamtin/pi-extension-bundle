@@ -54,9 +54,10 @@
 //     Also: finished-but-never-notified tasks stay queryable 7 days instead of
 //     vanishing after 24h (the "abandoned session" case — see context hook).
 //
-// Human commands:  /bg            — interactive task picker (inspect/kill)
-//                  /bg kill <id>  — kill with confirm
-//                  /bg on|off     — expose bg_* tools AND gate the interceptor
+// Human commands:  /bg                 — interactive task picker (inspect/kill)
+//                  /bg kill <id>     — kill with confirm
+//                  /bg clean [id]    — delete finished tasks (meta+logs) NOW; running/orphan kept
+//                  /bg on|off        — expose bg_* tools AND gate the interceptor
 //
 // Config (env): PI_BG_STATE_DIR, PI_BG_MAX_CONCURRENT (8), PI_BG_LOG_CAP_MB (2),
 //               PI_BG_PRUNE_HOURS (168 = 7d), PI_BG_DEFAULT_TIMEOUT_MIN (0 = none),
@@ -1239,7 +1240,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
   // --- /bg command ----------------------------------------------------------
 
   pi.registerCommand("bg", {
-    description: "Background tasks: picker, kill, toggle tools",
+    description: "Background tasks: picker, kill, clean, toggle tools",
     handler: async (args: string, ctx: { ui?: { notify?: (m: string, l: string) => void; confirm?: (t: string, m: string) => Promise<boolean>; select?: (title: string, options: string[]) => Promise<string | undefined> } }) => {
       if (ctx?.ui) {
         cachedUi = ctx.ui as typeof cachedUi;
@@ -1270,6 +1271,39 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
         else writeMeta({ ...m, state: "killed" });
         killGroup(m); // unconditional here: state was running/orphan (checked above)
         ctx?.ui?.notify?.(`SIGTERM sent to '${m.name}' (${id})`, "info");
+        return;
+      }
+
+      if (sub.startsWith("clean")) {
+        const arg = sub.replace(/^clean\s*/, "").trim();
+        refreshScan();
+        if (arg) {
+          const m = resolveTask(arg);
+          if (!m) {
+            ctx?.ui?.notify?.(`task '${arg}' not found`, "warning");
+            return;
+          }
+          if (m.state === "running" || m.state === "orphan") {
+            ctx?.ui?.notify?.(`'${m.name}' (${m.id}) is ${m.state} — bg_kill it first`, "warning");
+            return;
+          }
+          if (ctx?.ui?.confirm && !(await ctx.ui.confirm("Delete background task?", `${m.name} (${m.id}) — meta + logs removed immediately`))) return;
+          own.delete(m.id); // evict any lingering widget entry too
+          rmSync(dirOf(m.id), { recursive: true, force: true });
+          ctx?.ui?.notify?.(`deleted '${m.name}' (${m.id})`, "info");
+          return;
+        }
+        const finished = listDiskMetas().filter((m) => m.state !== "running" && m.state !== "orphan");
+        if (!finished.length) {
+          ctx?.ui?.notify?.("nothing to clean — no finished tasks", "info");
+          return;
+        }
+        if (ctx?.ui?.confirm && !(await ctx.ui.confirm("Delete ALL finished background tasks?", `${finished.length} task(s) — logs/results removed immediately (running/orphan are kept)`))) return;
+        for (const m of finished) {
+          own.delete(m.id);
+          rmSync(dirOf(m.id), { recursive: true, force: true });
+        }
+        ctx?.ui?.notify?.(`cleaned ${finished.length} finished task(s)`, "info");
         return;
       }
 
