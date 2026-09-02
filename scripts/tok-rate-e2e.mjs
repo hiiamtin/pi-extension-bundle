@@ -74,10 +74,21 @@ await sleep(450); // phase label lands on the next paint (throttle/tick ≤400ms
 msg = last();
 check("text_delta switches phase to Writing (within a tick)", !!msg && msg.includes("Writing"), String(msg));
 const callsBeforeTool = setWorkingCalls.length;
+const parseTok = (m) => {
+  const match = /· ([\d.]+)(k|M)? tok/.exec(m ?? "");
+  if (!match) return NaN;
+  let v = Number(match[1]);
+  if (match[2] === "k") v *= 1000;
+  if (match[2] === "M") v *= 1e6;
+  return v;
+};
+const beforeTok = parseTok(last());
 await fire("message_update", {
-  assistantMessageEvent: { type: "toolcall_delta", delta: "{}" },
+  assistantMessageEvent: { type: "toolcall_delta", delta: "j".repeat(400) },
 });
-check("toolcall_delta ignored (no repaint)", setWorkingCalls.length === callsBeforeTool);
+await sleep(450); // next paint folds the toolcall chars into totals
+const afterTok = parseTok(last());
+check("toolcall_delta counted into totals (label unchanged)", afterTok > beforeTok && (last() ?? "").includes("Writing"), `${beforeTok} → ${afterTok} tok`);
 
 // --- message_end restores the default working message --------------------------
 await fire("message_end", { message: { role: "assistant" } });

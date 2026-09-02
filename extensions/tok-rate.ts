@@ -10,9 +10,10 @@
 //   ✎ Writing…  ↑ 61.8 tok/s · 2.0k tok · 28s
 //
 // tok count is chars/4 (heuristic — this is a liveness meter, not billing);
-// the rate is EMA-smoothed (0.7 prev + 0.3 instant) so chunk-size jitter does
-// not make the number jump around. On message_end the default working message
-// is restored; toolcall deltas are ignored (JSON args, not prose).
+// the rate is windowed + EMA-smoothed so chunk-size jitter does not make the
+// number jump around. toolcall deltas (streamed JSON args) count toward the
+// rate/total but never change the phase label. On message_end the default
+// working message is restored.
 //
 // No UI (pi-web bridge, SDK headless) or PI_TOK_RATE=off → the extension stays
 // completely idle. No persistent state, no tools, no commands.
@@ -126,13 +127,20 @@ export default function tokRateExtension(pi: ExtensionAPI): void {
     if (!active) return;
     const ev = event.assistantMessageEvent;
     if (!ev) return;
-    let nextPhase: "Thinking" | "Writing";
+    let nextPhase: "Thinking" | "Writing" | null;
     if (ev.type === "thinking_delta") {
       nextPhase = "Thinking";
     } else if (ev.type === "text_delta") {
       nextPhase = "Writing";
+    } else if (ev.type === "toolcall_delta") {
+      // streamed JSON args count toward rate/total (matches pi-web) but never
+      // relabel the phase — they are not prose
+      const argLen = ev.delta?.length ?? 0;
+      if (argLen) chars += argLen;
+      render();
+      return;
     } else {
-      return; // start/end markers and toolcall JSON deltas are not prose
+      return; // start/end markers carry nothing countable
     }
     const len = ev.delta?.length ?? 0;
     if (!len) return;
