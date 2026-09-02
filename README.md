@@ -221,6 +221,9 @@ Design doc with full rationale: `docs/btw.md`.
   (~90% discount on context tokens; watch `cache read` in the usage line).
 - **/btw** (bare) — resume menu for in-memory side threads (per session;
   follow-ups via the composer prompt after each answer).
+- **/btw level [x]** — show/set the side-question thinking level
+  (`off|minimal|low|medium|high|xhigh|max`). Persisted to `pi-btw.json`;
+  delete the key to follow the main thread's level again.
 - No tools are ever executed — the answer is a single completion. Esc aborts.
 - Modes: TUI = streaming overlay; rpc/pi-web = answer shown in a persistent
   panel above the editor (dismiss with **/btw clear**, or from the bare-/btw

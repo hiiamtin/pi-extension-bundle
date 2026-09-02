@@ -187,7 +187,8 @@ Cache behavior:
 
 All fields optional. Missing `model` → current model; missing `thinkingLevel` →
 current level (clamped to the resolved model's supported levels); invalid values
-→ warn + fallback, never hard-fail.
+→ warn + fallback, never hard-fail. Change `thinkingLevel` at runtime with
+`/btw level <x>` (writes this file; delete the key to follow the main thread).
 
 ---
 

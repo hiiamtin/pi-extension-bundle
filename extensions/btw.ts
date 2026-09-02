@@ -117,6 +117,19 @@ function loadSettings(): BtwSettings {
 	}
 }
 
+function saveThinkingLevel(level: BtwThinkingLevel): void {
+	let raw: Record<string, unknown> = {};
+	try {
+		if (existsSync(SETTINGS_PATH)) {
+			raw = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as Record<string, unknown>;
+		}
+	} catch {
+		// overwrite unreadable file with the new level
+	}
+	raw.thinkingLevel = level;
+	writeFileSync(SETTINGS_PATH, `${JSON.stringify(raw, null, 2)}\n`);
+}
+
 function clampThinkingLevel(level: string | undefined): BtwThinkingLevel {
 	return level && (THINKING_LEVELS as readonly string[]).includes(level)
 		? (level as BtwThinkingLevel)
@@ -516,6 +529,37 @@ function clearAnswerPanel(ctx: ExtensionCommandContext): void {
 	ctx.ui.notify("btw · answer panel dismissed", "info");
 }
 
+function handleLevelCommand(ctx: ExtensionCommandContext, value: string): void {
+	const settings = loadSettings();
+	const effective = settings.thinkingLevel ?? clampThinkingLevel(ctx.thinkingLevel ?? "off");
+	const source = settings.thinkingLevel ? "pi-btw.json" : `following main thread (${effective})`;
+
+	if (!value) {
+		ctx.ui.notify(
+			`btw thinking level: ${effective} — source: ${source}. Set with /btw level <${THINKING_LEVELS.join("|")}> (applies from the next /btw question)`,
+			"info",
+		);
+		return;
+	}
+	if (!(THINKING_LEVELS as readonly string[]).includes(value)) {
+		ctx.ui.notify(`btw: unknown level "${value}" — valid: ${THINKING_LEVELS.join(" ")}`, "error");
+		return;
+	}
+	try {
+		saveThinkingLevel(value as BtwThinkingLevel);
+	} catch (error) {
+		ctx.ui.notify(
+			`btw: could not write ${SETTINGS_PATH} (${error instanceof Error ? error.message : String(error)})`,
+			"error",
+		);
+		return;
+	}
+	ctx.ui.notify(
+		`btw thinking level set to ${value} — saved to pi-btw.json, applies from the next /btw question (delete the key to follow the main thread again)`,
+		"info",
+	);
+}
+
 async function resolveProvider(
 	ctx: ExtensionCommandContext,
 	resolved: ResolvedModel,
@@ -606,14 +650,30 @@ export default function btwExtension(pi: ExtensionAPI) {
 
 	pi.registerCommand("btw", {
 		description:
-			"Ask a side question without touching the main conversation. /btw <question> = new thread; bare /btw = resume menu; /btw clear = dismiss answer panel",
-		// Free-form question text — nothing sensible to complete besides the
-		// clear subcommand. Resume happens via the bare-/btw menu (in-memory
-		// state, not typeable ids).
+			"Ask a side question without touching the main conversation. /btw <question> = new thread; bare /btw = resume menu; /btw clear = dismiss answer panel; /btw level [x] = show/set thinking level",
+		// Free-form question text — complete only the subcommands. Resume happens
+		// via the bare-/btw menu (in-memory state, not typeable ids).
 		getArgumentCompletions: (prefix: string) => {
 			const normalized = prefix.trimStart();
-			if (normalized && !"clear".startsWith(normalized)) return null;
-			return [{ value: "clear", label: "clear — Dismiss the /btw answer panel (pi-web)" }];
+			const match = normalized.match(/^(\S+)\s*(.*)$/);
+			if (!match) {
+				return [
+					{ value: "clear", label: "clear — Dismiss the /btw answer panel (pi-web)" },
+					{ value: "level", label: "level — Show/set /btw thinking level" },
+				];
+			}
+			const [, sub, rest] = match;
+			if (sub === "level") {
+				const restLower = rest.toLowerCase();
+				return THINKING_LEVELS.filter((l) => l.startsWith(restLower)).map((l) => ({
+					value: `level ${l}`,
+					label: `level ${l}`,
+				}));
+			}
+			if (sub === "clear" && !rest) {
+				return [{ value: "clear", label: "clear — Dismiss the /btw answer panel (pi-web)" }];
+			}
+			return null; // free-form question
 		},
 		handler: async (args, ctx) => {
 			const question = args.trim();
@@ -624,6 +684,10 @@ export default function btwExtension(pi: ExtensionAPI) {
 
 			if (question === "clear" || question === "close") {
 				clearAnswerPanel(ctx);
+				return;
+			}
+			if (question === "level" || question.startsWith("level ")) {
+				handleLevelCommand(ctx, question.slice("level".length).trim());
 				return;
 			}
 
