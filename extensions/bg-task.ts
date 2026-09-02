@@ -1257,14 +1257,21 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     });
   }
 
-  // reload-proof finish notices. Strict ownership: a session only reports its
-  // OWN tasks; foreign tasks are surfaced only when their owner session is
-  // gone (file deleted) or past ADOPT_GRACE_MS without any notification
-  // (a live owner's exit handler notifies within milliseconds).
-  pi.on("session_start", async (_event: unknown, ctx: unknown) => {
+  // Catch-up finish notices. Strict ownership: a session only reports its OWN
+  // tasks; foreign tasks are surfaced only when their owner session is gone
+  // (file deleted). pi-web runs sessions CONCURRENTLY and switching a browser
+  // tab back to a session does NOT fire `session_start` again (sessions stay
+  // alive) — so the sweep is also hooked to every event that fires when the
+  // user is actually using a session (`input`, `tool_call`, `session_info_changed`):
+  // the moment the owner session is active again, its finished tasks surface.
+  const sweepFinishedNotices = (via: string, ctx: unknown): void => {
     try {
       const sf = (ctx as { sessionManager?: { getSessionFile?: () => string | undefined } } | undefined)?.sessionManager?.getSessionFile?.();
-      if (sf) currentSessionFile = sf;
+      if (sf) {
+        const changed = sf !== currentSessionFile;
+        currentSessionFile = sf;
+        if (changed) debugLog(`session-track[${via}] -> ${sf}`);
+      }
       if (ctx) eventCtx = ctx as { sendMessage?: unknown }; // fresh, per-event wired sendMessage
       const metas = listDiskMetas();
       refreshScan(metas);
@@ -1283,18 +1290,23 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
         null,
       );
       if (!ok) {
-        debugLog(`session_start notice failed: ${outcome}`);
+        debugLog(`${via} notice failed: ${outcome}`);
         return;
       }
       for (const m of pending) {
         m.notifiedAt = now;
         writeMeta(m);
       }
-      debugLog(`session_start: surfaced ${pending.length} finished task(s)`);
+      debugLog(`${via}: surfaced ${pending.length} finished task(s)`);
     } catch (e) {
-      debugLog(`session_start notice failed: ${(e as Error).message}`);
+      debugLog(`${via} notice failed: ${(e as Error).message}`);
     }
-  });
+  };
+
+  const sweepEvents = ["session_start", "session_info_changed", "input", "tool_call"] as const;
+  for (const ev of sweepEvents) {
+    pi.on(ev as never, (_event: unknown, ctx: unknown) => sweepFinishedNotices(ev, ctx));
+  }
 
   // housekeeping on load + hourly
   refreshScan();

@@ -34,7 +34,7 @@ const sent = []; // captures pi.sendMessage payloads (notification assertions)
 mod.default({
   registerTool: (t) => (registered[t.name] = t),
   registerCommand: () => {},
-  on: (name, fn) => (hooks[name] = fn),
+  on: (name, fn) => { (hooks[name] ??= []).push(fn); },
   sendMessage: (m, o) => sent.push({ m, o }),
 });
 
@@ -88,7 +88,7 @@ writeFileSync(tmpJson, "c1,c2\n1,x\n2,y");
 check("artifact: CSV summary", /CSV/.test(await exec("bg_artifact", { path: tmpJson })));
 
 // --- 6: interceptor (default auto-bg) ---
-const h = hooks["tool_call"];
+const h = hooks["tool_call"]?.[0];
 const ctx = { ui: { notify: () => {} } };
 if (typeof h !== "function") {
   check("interceptor registered", false);
@@ -115,7 +115,7 @@ check("wait: finished task returns immediately", /killed/.test(w));
 // --- 6: session ownership separation ---
 // session_start tracks the current session; our own finished tasks surface
 // without a cross-session tag, foreign ones only after adoption + with tag.
-const ssHook = hooks["session_start"];
+const ssHook = hooks["session_start"]?.[0];
 if (typeof ssHook === "function") {
   // foreign task whose owner session file is DELETED -> adoptable immediately
   const foreignDir = path.join(STATE_DIR, "e2eforeign");
@@ -145,6 +145,25 @@ if (typeof ssHook === "function") {
   check("ownership: foreign-ALIVE task never surfaced cross-session", !sent.some((s) => s.m?.content?.includes("foreign-alive")));
   const ameta = JSON.parse(readFileSync(path.join(aliveDir, "meta.json"), "utf8"));
   check("ownership: foreign-alive stays un-notified (waits for owner)", !ameta.notifiedAt);
+
+  // input-event catch-up (pi-web: switching tabs doesn't re-fire session_start)
+  const inputHook = hooks["input"]?.[0];
+  check("input hook registered", typeof inputHook === "function");
+  const ownIn = path.join(STATE_DIR, "e2eowninput2");
+  mkdirSync(ownIn, { recursive: true });
+  writeFileSync(path.join(STATE_DIR, "e2e-current-session.jsonl"), ""); // owner session file must EXIST on disk
+  writeFileSync(
+    path.join(ownIn, "meta.json"),
+    JSON.stringify({ id: "e2eowninput2", name: "own-task-input", cmd: "echo", pid: 5, pgid: 5, startedAt: Date.now() - 120000, state: "done", exitCode: 0, finishedAt: Date.now() - 30000, owner: "me", ownerSession: path.join(STATE_DIR, "e2e-current-session.jsonl"), heartbeat: 0, bytes: 0 }),
+  );
+  // typing in another session: must NOT surface our task
+  await inputHook({ text: "hi" }, { sessionManager: { getSessionFile: () => aliveSession } });
+  check("input catch-up: foreign session does not claim our task", !sent.some((s) => s.m?.content?.includes("own-task-input")));
+  // typing in the OWNER session: surfaces + marks notified
+  await inputHook({ text: "hi" }, { sessionManager: { getSessionFile: () => path.join(STATE_DIR, "e2e-current-session.jsonl") } });
+  check("input catch-up: owner session surfaces its finished task", sent.some((s) => s.m?.content?.includes("own-task-input")));
+  const imeta = JSON.parse(readFileSync(path.join(ownIn, "meta.json"), "utf8"));
+  check("input catch-up: marked notified after surfacing", !!imeta.notifiedAt);
 } else {
   check("session_start hook registered", false);
 }
