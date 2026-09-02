@@ -1241,6 +1241,40 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
 
   pi.registerCommand("bg", {
     description: "Background tasks: picker, kill, clean, toggle tools",
+    // argument autocomplete (same mechanism as /quota): subcommands first, then
+    // live task ids for kill (running/orphan) and clean (finished)
+    getArgumentCompletions: (prefix: string) => {
+      const normalized = prefix.trimStart();
+      const argumentMatch = normalized.match(/^(\S+)\s+(.*)$/);
+      if (!argumentMatch) {
+        const subcommands = [
+          { value: "kill", label: "kill — Stop a running task (then pick the id)" },
+          { value: "clean", label: "clean — Delete finished tasks (meta + logs) now" },
+          { value: "on", label: "on — Expose bg_* tools AND interceptor" },
+          { value: "off", label: "off — Hide bg_* tools AND interceptor" },
+        ].filter(({ value }) => value.startsWith(normalized));
+        return subcommands.length > 0 ? subcommands : null;
+      }
+      const [, subcommand, argumentPrefix] = argumentMatch;
+      if (argumentPrefix === undefined) return null;
+      const argPrefix = argumentPrefix.trimStart().toLowerCase();
+      const matches = (m: Meta): boolean => m.id.startsWith(argPrefix) || m.name.toLowerCase().includes(argPrefix);
+      if (subcommand === "kill") {
+        return listDiskMetas()
+          .filter((m) => m.state === "running" || m.state === "orphan")
+          .filter(matches)
+          .slice(0, 8)
+          .map((m) => ({ value: `kill ${m.id}`, label: `${stateIcon(m.state)} ${m.name} · ${m.id} · ${m.state} · running ${fmtDur(Date.now() - m.startedAt)}` }));
+      }
+      if (subcommand === "clean") {
+        return listDiskMetas()
+          .filter((m) => m.state !== "running" && m.state !== "orphan")
+          .filter(matches)
+          .slice(0, 8)
+          .map((m) => ({ value: `clean ${m.id}`, label: `${stateIcon(m.state)} ${m.name} · ${m.id} · ${m.state} · ran ${fmtDur((m.finishedAt ?? Date.now()) - m.startedAt)}` }));
+      }
+      return null;
+    },
     handler: async (args: string, ctx: { ui?: { notify?: (m: string, l: string) => void; confirm?: (t: string, m: string) => Promise<boolean>; select?: (title: string, options: string[]) => Promise<string | undefined> } }) => {
       if (ctx?.ui) {
         cachedUi = ctx.ui as typeof cachedUi;

@@ -7,6 +7,7 @@
 //   #5 taskLine called with 2 args but declared with 1 (type error — tsc, not here)
 //   #6 widget linger: finished task renders result line, retry loop stays alive
 //   #7 /bg clean [id] deletes finished tasks NOW; running/orphan are kept
+//   #8 /bg argument autocomplete: subcommands + live task ids for kill/clean
 //
 //   node scripts/bg-regression.mjs   (exit 0 = ALL OK)
 //
@@ -222,6 +223,28 @@ await commands.bg.handler("clean reg07one", { ui: ui7 });
 check("#7d clean <id> deletes a specific finished task", !existsSync(path.join(STATE_DIR, "reg07one")));
 await commands.bg.handler("clean nope-xyz", { ui: ui7 });
 check("#7e clean <unknown id> reports not found", notes7.some((n) => n.includes("not found")));
+
+// --- #8 /bg argument autocomplete (getArgumentCompletions) -------------------
+const completions = (prefix) => commands.bg.getArgumentCompletions(prefix) ?? [];
+const subcmds = completions("").map((i) => i.value);
+check("#8a '/bg <space>' offers kill/clean/on/off", ["kill", "clean", "on", "off"].every((v) => subcmds.includes(v)) && subcmds.length === 4, JSON.stringify(subcmds));
+check("#8b prefix filters subcommands ('k' → kill only)", JSON.stringify(completions("k").map((i) => i.value)) === JSON.stringify(["kill"]));
+writeMetaRaw("reg08fin", {
+  name: "reg08-finished", state: "done", exitCode: 0, finishedAt: Date.now() - 60_000,
+  owner: "pid-x", ownerSession: OURS, heartbeat: Date.now() - 60_000, bytes: 0,
+});
+writeMetaRaw("reg08run", {
+  name: "reg08-running", state: "running", owner: "pid-x",
+  ownerSession: OURS, heartbeat: Date.now(), bytes: 0,
+  pid: process.pid, pgid: process.pid,
+});
+const killItems = completions("kill ");
+check("#8c 'kill <space>' lists running tasks by id", killItems.some((i) => i.value === `kill reg08run`) && !killItems.some((i) => i.value.includes("reg08fin")), JSON.stringify(killItems.map((i) => i.value)));
+const cleanItems = completions("clean ");
+check("#8d 'clean <space>' lists finished tasks by id", cleanItems.some((i) => i.value === `clean reg08fin`) && !cleanItems.some((i) => i.value.includes("reg08run")), JSON.stringify(cleanItems.map((i) => i.value)));
+check("#8e id-prefix filtering works ('clean reg08')", completions("clean reg08").some((i) => i.value === "clean reg08fin"));
+const none = commands.bg.getArgumentCompletions("clean zzz-nothing");
+check("#8f no matches → empty/null (no popup)", none === null || (Array.isArray(none) && none.length === 0));
 
 // --- summary ------------------------------------------------------------------
 console.log(failures === 0 ? "\nALL REGRESSION CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
