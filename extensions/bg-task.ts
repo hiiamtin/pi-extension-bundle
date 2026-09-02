@@ -98,6 +98,7 @@ const PRUNE_MS = envInt("PI_BG_PRUNE_HOURS", 168, 1, 24 * 90) * 3_600_000;
 const DEFAULT_TIMEOUT_MIN = envInt("PI_BG_DEFAULT_TIMEOUT_MIN", 0, 0, 24 * 60); // 0 = no timeout
 const KILL_ESCALATE_MS = 5_000;
 const ORPHAN_MS = 15_000; // heartbeat older than this + still running => orphan
+const NOTIFY_MAX_TRIES = 12; // push attempts before leaving delivery to the context hook / session_start sweep (do NOT set notifiedAt — that would block the guaranteed channel)
 const ADOPT_GRACE_MS = 60_000; // foreign finished task: adopt (notify here) only after the owner had this long to do it itself
 const WIDGET_MS = envInt("PI_BG_TICK_MS", 5_000, 1_000, 300_000); // scan/heartbeat cadence while tasks are running
 const SETTINGS_FILE = path.join(os.homedir(), ".pi/agent/bg-task-settings.json");
@@ -280,8 +281,14 @@ let notify: ((msg: string, level: string) => void) | null = null;
 // EVERY captured api on globalThis (survives module re-eval / reload in the
 // same process) and try them all at send time — bound ones deliver, stub/
 // stale ones throw and are skipped.
-const g = globalThis as { __bgCapturedPis?: Array<{ pi: ExtensionAPI; at: number }> };
+const g = globalThis as {
+  __bgCapturedPis?: Array<{ pi: ExtensionAPI; at: number; seq: number }>;
+  __bgCaptureSeq?: number; // monotonic capture counter (globalThis: survives re-eval, immune to splicing)
+  __bgClaimedSeq?: number; // highest capture seq already claimed by some session_start
+};
 const capturedPis = (g.__bgCapturedPis ??= []);
+g.__bgCaptureSeq ??= 0;
+g.__bgClaimedSeq ??= 0;
 let currentSessionFile: string | undefined; // this instance's own session (set on session_start)
 let eventCtx: { sendMessage?: unknown } | null = null; // fresh ctx from the last session_start — its sendMessage is wired per-session
 
@@ -305,20 +312,27 @@ const pushAllowed = () => seenSessionFiles.size <= 1;
 // the live log: pi#12 captured at 09:19:01.359, its session_start at
 // .405. So each session_start claims every not-yet-claimed capture since the
 // previous one — including stub/discovery captures (they throw at send time;
-// the real one in the claim delivers). We store the api OBJECTS per session
-// (not indices): the capturedPis cap splices the list, which shifts indices.
-const sessionApis = new Map<string, Array<{ pi: ExtensionAPI; at: number }>>();
-let lastAssociatedIndex = -1;
+// the real one in the claim delivers). Claims are matched by the monotonic
+// `seq` stamped on each capture, NOT by array position: the capturedPis cap
+// splices the list (shifting indices), which permanently desynced a
+// positional cursor — after the 17th load in one process, from>to held forever
+// and no session ever claimed its api again (targeted delivery silently died).
+const sessionApis = new Map<string, Array<{ pi: ExtensionAPI; at: number; seq: number }>>();
 function associateCapturesWith(sf: string): void {
-  const from = lastAssociatedIndex + 1;
-  const to = capturedPis.length - 1;
-  if (from <= to) {
-    const claimed = capturedPis.slice(from, to + 1);
-    const arr = sessionApis.get(sf);
-    if (arr) arr.push(...claimed);
-    else sessionApis.set(sf, [...claimed]);
-    lastAssociatedIndex = to;
+  const claimed = capturedPis.filter((c) => c.seq > (g.__bgClaimedSeq ?? 0));
+  if (!claimed.length) return;
+  const arr = sessionApis.get(sf);
+  if (arr) arr.push(...claimed);
+  else {
+    while (sessionApis.size >= 64) {
+      // bound the map: drop the least-recently-inserted session key
+      const oldest = sessionApis.keys().next().value;
+      if (oldest === undefined) break;
+      sessionApis.delete(oldest);
+    }
+    sessionApis.set(sf, [...claimed]);
   }
+  g.__bgClaimedSeq = Math.max(g.__bgClaimedSeq ?? 0, ...claimed.map((c) => c.seq));
 }
 
 const DEBUG_LOG = path.join(os.homedir(), ".pi/agent/log/bg-task-debug.log");
@@ -376,8 +390,12 @@ function refreshScan(metas?: Meta[]): void {
         const st = statSync(exitPath(m.id));
         const code = Number.parseInt(readFileSync(exitPath(m.id), "utf8").trim(), 10);
         if (Number.isFinite(code)) {
-          writeMeta({ ...m, state: code === 0 ? "done" : "failed", exitCode: code, finishedAt: st.mtimeMs });
-          if (canNotifyHere(m, now)) attemptNotify(m, "scan"); // owner session gone or task is ours
+          // finalize the SAME object we notify with — notifying the stale `m`
+          // produced "finished: running" notices and wrote state=running back
+          // over the just-written done/failed (clobbered until the next scan)
+          const done: Meta = { ...m, state: code === 0 ? "done" : "failed", exitCode: code, finishedAt: st.mtimeMs };
+          writeMeta(done);
+          if (canNotifyHere(done, now)) attemptNotify(done, "scan"); // owner session gone or task is ours
           continue;
         }
       } catch {
@@ -773,6 +791,7 @@ function sendToSession(message: unknown, opts: unknown, m: Meta | null, target?:
 
 function attemptNotify(m: Meta, via: string): void {
   if (m.notifiedAt) return;
+  if ((m.notifyTries ?? 0) >= NOTIFY_MAX_TRIES) return; // push abandoned — the context hook / session_start sweep still own this notice
   const target = m.ownerSession; // deliver into the OWNER's session queue exactly
   if (!target && !pushAllowed()) {
     // legacy task (no owner identity) in a multi-session host: we cannot
@@ -798,8 +817,14 @@ function attemptNotify(m: Meta, via: string): void {
     target,
   );
   debugLog(`notify[${via}] id=${m.id} '${m.name}' state=${m.state} tries=${m.notifyTries} -> ${outcome}`);
-  if (ok) debugLog(`notify[${via}] id=${m.id} delivered → ${outcome}`);
-  if (ok || m.notifyTries >= 3) m.notifiedAt = Date.now();
+  if (ok) {
+    m.notifiedAt = Date.now();
+    debugLog(`notify[${via}] id=${m.id} delivered → ${outcome}`);
+  } else if ((m.notifyTries ?? 0) >= NOTIFY_MAX_TRIES) {
+    // give up on PUSH retries only — notifiedAt stays UNSET so the guaranteed
+    // channels (owner session's context hook, session_start sweep) can still deliver
+    debugLog(`notify[${via}] id=${m.id} push abandoned after ${m.notifyTries} tries (${outcome}) — left for context/sweep delivery`);
+  }
   writeMeta(m);
 }
 
@@ -985,7 +1010,7 @@ function bgListText(): string {
   if (!metas.length) return "no background tasks (state: " + STATE_DIR + ")";
   const { total } = runningCount();
   const head = `${metas.length} task(s), ${total} running (limit ${MAX_CONCURRENT}) · interceptor: ${INTERCEPTOR_MODE}:\n`;
-  return clampChars(head + metas.slice(0, 20).map((m) => taskLine(m, own.has(m.id))).join("\n"), MAX_OUTPUT_CHARS);
+  return clampChars(head + metas.slice(0, 20).map((m) => taskLine(m)).join("\n"), MAX_OUTPUT_CHARS);
 }
 
 function bgDetailText(id: string): string {
@@ -1015,8 +1040,9 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
   mkdirSync(STATE_DIR, { recursive: true });
   notify = null;
   if (pi && !capturedPis.some((c) => c.pi === pi)) {
-    capturedPis.push({ pi, at: Date.now() });
-    if (capturedPis.length > 16) capturedPis.splice(0, capturedPis.length - 16); // bound memory
+    g.__bgCaptureSeq = (g.__bgCaptureSeq ?? 0) + 1;
+    capturedPis.push({ pi, at: Date.now(), seq: g.__bgCaptureSeq });
+    if (capturedPis.length > 16) capturedPis.splice(0, capturedPis.length - 16); // bound memory (seq-based claims are splice-proof)
   }
 
   const disabled = () => textResult("bg tools are disabled (/bg on to enable)");
@@ -1249,7 +1275,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       }
       if (typeof ctx?.ui?.select === "function") {
         const sorted = [...metas].sort((a, b) => Number(a.state === "running") - Number(b.state === "running"));
-        const pick = await ctx.ui.select("Background tasks (pick to inspect/kill)", [...sorted.map((m) => taskLine(m, own.has(m.id))), "✖ close"]);
+        const pick = await ctx.ui.select("Background tasks (pick to inspect/kill)", [...sorted.map((m) => taskLine(m)), "✖ close"]);
         if (!pick || pick === "✖ close") return;
         const id = pick.split("·")[1]?.trim().split(" ")[0] ?? "";
         const m = own.get(id)?.meta ?? readMeta(id);
@@ -1343,13 +1369,16 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       const now = Date.now();
       const pending = metas.filter((m) => m.state !== "running" && !m.notifiedAt && m.finishedAt && now - m.finishedAt < PRUNE_MS && canNotifyHere(m, now));
       if (!pending.length) return;
-      const lines = pending.slice(0, 5).map((m) => `${stateIcon(m.state)} ${m.name} (${m.id}) — ${m.state}${m.exitCode != null ? `, exit=${m.exitCode}` : ""}, ran ${fmtDur(m.finishedAt - m.startedAt)}${isCrossSession(m) ? " · from another session" : ""}`);
+      // mark ONLY the shown tasks as notified — the rest stay pending and
+      // surface on the next sweep / context injection instead of being swallowed
+      const shown = pending.slice(0, 5);
+      const lines = shown.map((m) => `${stateIcon(m.state)} ${m.name} (${m.id}) — ${m.state}${m.exitCode != null ? `, exit=${m.exitCode}` : ""}, ran ${fmtDur(m.finishedAt - m.startedAt)}${isCrossSession(m) ? " · from another session" : ""}`);
       const { ok, outcome } = sendToSession(
         {
           customType: "bg-task",
           display: true,
           content: `Background task${pending.length === 1 ? "" : "s"} finished since you were away:\n${lines.join("\n")}\nInspect with bg_status / bg_log.`,
-          details: { ids: pending.map((m) => m.id) },
+          details: { ids: shown.map((m) => m.id) },
         },
         { deliverAs: "followUp", triggerTurn: true },
         null,
@@ -1359,11 +1388,11 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
         debugLog(`${via} notice failed: ${outcome}`);
         return;
       }
-      for (const m of pending) {
+      for (const m of shown) {
         m.notifiedAt = now;
         writeMeta(m);
       }
-      debugLog(`${via}: surfaced ${pending.length} finished task(s)`);
+      debugLog(`${via}: surfaced ${shown.length} finished task(s)${pending.length > shown.length ? ` (${pending.length - shown.length} still pending)` : ""}`);
     } catch (e) {
       debugLog(`${via} notice failed: ${(e as Error).message}`);
     }
@@ -1401,13 +1430,16 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     const now = Date.now();
     const pumped = metas.filter((m) => m.state !== "running" && !m.notifiedAt && m.finishedAt && now - m.finishedAt < PRUNE_MS && canNotifyHere(m, now)).filter((m) => !readMeta(m.id)?.notifiedAt);
     if (!pumped.length) return {};
-    const lines = pumped.slice(0, 5).map((m) => `${stateIcon(m.state)} ${m.name} (${m.id}) — ${m.state}${m.exitCode != null ? `, exit=${m.exitCode}` : ""}, ran ${fmtDur(m.finishedAt - m.startedAt)}`);
-    const text = ["<system-reminder>", `Background task${pumped.length === 1 ? "" : "s"} finished since you were away:`, ...lines, "Inspect with bg_status / bg_log.", "</system-reminder>"].join("\n");
-    for (const m of pumped) {
+    // mark ONLY the shown tasks as notified — the rest stay undelivered and
+    // are injected on the session's next LLM call instead of being swallowed
+    const shown = pumped.slice(0, 5);
+    const lines = shown.map((m) => `${stateIcon(m.state)} ${m.name} (${m.id}) — ${m.state}${m.exitCode != null ? `, exit=${m.exitCode}` : ""}, ran ${fmtDur(m.finishedAt - m.startedAt)}`);
+    const text = ["<system-reminder>", `Background task${shown.length === 1 ? "" : "s"} finished since you were away:`, ...lines, "Inspect with bg_status / bg_log.", "</system-reminder>"].join("\n");
+    for (const m of shown) {
       m.notifiedAt = now;
       writeMeta(m);
     }
-    debugLog(`context: injected ${pumped.length} finished task notice(s)`);
+    debugLog(`context: injected ${shown.length} finished task notice(s)${pumped.length > shown.length ? ` (${pumped.length - shown.length} still pending)` : ""}`);
     return {
       messages: [
         ...(event?.messages ?? []),
