@@ -129,8 +129,13 @@ dense factual summary with file:line references.
 
 **Discovery:** `~/.pi/agent/agents/*.md` always; `<project>/.pi/agents/*.md`
 only behind project trust (confirmed via `ctx.isProjectTrusted()` or explicit
-`ctx.ui.confirm`). Project overrides user by name. Duplicate names within one
-dir → error in `/subagents doctor` (P3).
+`ctx.ui.confirm` — the confirm fallback lands with P2's background
+machinery). Project overrides user by name. Duplicate names within one
+dir → error in `/subagents doctor` (P3). **P1 trust rule (fail-closed):**
+project agents load only when the target cwd equals the session's project
+cwd AND that project is trusted — an explicit `cwd` override to a foreign
+repo deliberately falls back to user agents only (no UI trust prompt is
+reachable from a tool call; opening one arrives with P2).
 
 **Roster v1 (3 files, shipped in `agents/`, COPIED — not symlinked — to
 `~/.pi/agent/agents/` on install; agents are user-tunable):**
@@ -194,10 +199,11 @@ putting required conventions into the task/prompt.
   kill may leave it absent or stale).
 - `continue` (tool + command): spawn a fresh `pi --session <same file>` with
   the follow-up task. Validated: run exists, not currently `running`.
-  **Fallback (W7):** if the child's `session.jsonl` is absent or empty (killed
-  before pi's first flush), rebuild context from the tail of our captured
-  `transcript.jsonl` instead — spawn fresh with a condensed partial-transcript
-  summary, never fail the continue.
+  **Fallback (W7):** triggered when the child's `session.jsonl` is
+  absent/empty OR the previous run ended `timeout`/`killed` (a live-looking
+  session may be stale — W7 showed flush lag). Rebuild context from the tail
+  of our captured `transcript.jsonl` — spawn fresh with a condensed
+  partial-transcript summary, never fail the continue.
 
 ## 8. Background machinery (P2) — copied into `lib/`, bg-task untouched
 
@@ -307,7 +313,29 @@ loader — no runtime typechecking).
 5. **Timeout harshness on long worker runs** — worker gets 60 min by default
    and every timeout is resumable (§7); wrap-up warning in P3 softens it.
 
-## 14. Sources
+When `mcp:` is combined with a `tools:` allowlist, the adapter gateway tools
+(`mcp`, `mcpScript`) are added automatically — otherwise `--tools` would
+filter away the very tools the opt-in loaded. Test seams (NOT user-facing):
+`PI_SUBAGENT_PI_SCRIPT` (override the spawned binary; empty = unset) and
+`PI_SUBAGENT_BUNDLE_DIR`. The `getPiInvocation` host-binary pin matches only
+scripts that look like the pi CLI entrypoint — an arbitrary harness script
+must never be recursively spawned (found live during self-review).
+
+## 14. P1 implementation record (2026-09-05)
+
+Shipped as `extensions/subagent.ts` (+ `agents/{scout,worker,reviewer}.md`,
+`scripts/subagent-e2e.mjs`, `scripts/fixtures/fake-subagent-pi.mjs`, smoke-test
+integration). Reviewed along two axes (Standards vs Spec) by two parallel
+subagents — the extension's own first real job. Findings folded back in:
+stderr capped (32 KB), `turns` counted in usage, `/subagents list` shows
+elapsed + usage columns, roster `.md` files realigned to §5, stale-session
+recovery widened to timeout/killed runs, kill-vs-writer meta races merged via
+read-modify-write (`mergeMeta`), duplicated continue paths extracted,
+`getPiInvocation` hardened against recursive spawn. Accepted deviations
+(documented in §5/§6/§7): blocking default until P2, cwd-equality trust rule,
+ui.confirm fallback deferred, test-seam env knobs.
+
+## 15. Sources
 
 - pi 0.85.0 docs: `docs/extensions.md` (parallel tool execution, tool-compat),
   `docs/rpc.md` (steer/follow_up/abort/get_messages), `docs/json.md` (event

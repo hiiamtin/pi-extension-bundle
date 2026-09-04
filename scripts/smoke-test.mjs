@@ -16,7 +16,7 @@
 
 import { createRequire } from "node:module";
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -26,6 +26,16 @@ const pkgRoot = path.dirname(here);
 // isolate bg-task test tasks from the real state dir (~/.pi/agent/bg-tasks)
 import os from "node:os";
 process.env.PI_BG_STATE_DIR = path.join(os.tmpdir(), `pi-bg-smoke-${process.pid}`);
+const subagentRoot = path.join(os.tmpdir(), `pi-subagent-smoke-${process.pid}`);
+process.env.PI_CODING_AGENT_DIR = path.join(subagentRoot, "agent-dir");
+process.env.PI_SUBAGENT_STATE_DIR = path.join(subagentRoot, "state");
+process.env.PI_SUBAGENT_PI_SCRIPT = path.join(pkgRoot, "scripts", "fixtures", "fake-subagent-pi.mjs");
+process.env.FAKE_SUBAGENT_CAPTURE = path.join(subagentRoot, "spawn.jsonl");
+mkdirSync(path.join(process.env.PI_CODING_AGENT_DIR, "agents"), { recursive: true });
+writeFileSync(
+  path.join(process.env.PI_CODING_AGENT_DIR, "agents", "smoke.md"),
+  "---\nname: smoke\ndescription: Smoke-test agent.\ntools: [read]\ntimeout: 1\n---\n\nReply briefly.\n",
+);
 
 // --- installed pi version -------------------------------------------------
 let piVersion = "unknown";
@@ -134,6 +144,7 @@ const MIN_ARGS = {
   bg_log: { id: "nope-smoke" },
   bg_kill: { id: "nope-smoke" },
   bg_artifact: { path: "package.json" },
+  subagent: { agent: "smoke", task: "say OK" },
 };
 
 let failures = 0;
@@ -197,4 +208,5 @@ for (const name of names) {
 }
 
 console.log(failures === 0 ? "\nALL OK" : `\n${failures} FAILURE(S)`);
+rmSync(subagentRoot, { recursive: true, force: true });
 process.exit(failures === 0 ? 0 : 1);

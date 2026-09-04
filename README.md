@@ -4,6 +4,44 @@ pi coding agent extensions for the TinTin setup. Installed as a pi package.
 
 ## Extensions
 
+### subagent.ts — isolated specialist agents
+
+Registers one AI-first `subagent` tool. Each call spawns a clean-room pi child
+in its own context window and returns only the delegated result:
+
+```text
+subagent({ agent, task, model?, cwd? })   # new run (blocking in P1)
+subagent({ continue: runId, task })       # continue the same child session
+```
+
+Sibling calls in one model response run concurrently (default cap 4,
+`PI_SUBAGENT_MAX_CONCURRENT=1..16`). Every run persists under
+`~/.pi/agent/subagents/<id>/`: metadata, raw JSONL event transcript, child
+session, and full result. `/subagents list|cont|kill` is the human surface.
+Timeouts are resumable; defaults are scout 10m, reviewer 20m, worker 60m.
+
+Children start with no ambient extensions, skills, context files, templates,
+or themes. Agent frontmatter opts in exact resources:
+
+```yaml
+tools: [read, grep, code_search]
+extensions: [code-search]       # files shipped by this bundle
+skills: [some-bundled-skill]    # bundle, global, or trusted project skill
+mcp: [context7]                 # named servers from ~/.pi/agent/mcp.json
+```
+
+P1 is blocking foreground execution and continuation. Background notification
+mode is P2; `--mode rpc` live view/steering/graceful timeout wrap-up is a
+committed P3 feature. Full rationale and wire results: `docs/subagent.md`.
+
+Agent definitions ship in `agents/` but are copied — not symlinked — so they
+remain user-tunable:
+
+```bash
+mkdir -p ~/.pi/agent/agents
+cp -n agents/*.md ~/.pi/agent/agents/
+```
+
 ### code-search.ts — instant code search via semble
 
 Registers `code_search` + `code_find_related` tools wrapping semble's CLI
@@ -281,6 +319,7 @@ Design doc with full rationale: `docs/btw.md`.
 
 ```
 extensions/
+  subagent.ts      subagent tool + /subagents (isolated child sessions)
   ext.ts           /ext — manage extensions, packages & skills from within pi
   code-search.ts   code_search / code_find_related tools (semble CLI bridge)
   quota.ts         AI provider quota status + quota_check tool
@@ -290,10 +329,15 @@ extensions/
   tok-rate.ts      live tok/s in the working row (streaming deltas → setWorkingMessage)
   btw.ts           /btw — side-question command (real-fork, cache-friendly;
                    design: docs/btw.md)
+agents/
+  scout.md         read-only recon + bundle code-search extension
+  worker.md        general implementation worker
+  reviewer.md      read-only post-implementation review
 lib/
   tool-compat.ts   shared helpers: signature normalization + loud param validation
 scripts/
   smoke-test.mjs   run after any pi upgrade (see web-search section above)
+  subagent-e2e.mjs subprocess/session/continue/timeout/concurrency/resource e2e
   bg-e2e.mjs       functional end-to-end test for bg-task (fake ExtensionAPI)
   bg-regression.mjs regression tests for bg-task bugs + /bg clean/autocomplete
   tok-rate-e2e.mjs functional test for tok-rate (simulated stream events)

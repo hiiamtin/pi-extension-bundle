@@ -1,7 +1,7 @@
 {
   "name": "@tintin/pi-extensions",
   "version": "0.6.0",
-  "description": "pi extensions for the TinTin setup: AI quota status + web search + web fetch + background tasks (run/status/log/wait/artifact/kill, log watches, auto-bg interceptor, per-session ownership) + /btw side questions (cache-friendly real-fork, docs/btw.md)",
+  "description": "TinTin's pi extension bundle: isolated subagents, background tasks, code/web search, quota status, and cache-friendly side questions", 
   "keywords": [
     "pi-package"
   ],
@@ -11,5 +11,14 @@
     "extensions": [
       "./extensions"
     ]
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   }
 }
