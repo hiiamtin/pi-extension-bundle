@@ -52,6 +52,7 @@ process.env.PI_SUBAGENT_STATE_DIR = stateDir;
 process.env.PI_SUBAGENT_PI_SCRIPT = fakePi;
 process.env.PI_SUBAGENT_MAX_CONCURRENT = "2";
 process.env.FAKE_SUBAGENT_CAPTURE = captureFile;
+process.env.PI_SUBAGENT_DEBUG_LOG = path.join(root, "debug.log");
 
 // Bare node does not provide pi's package resolver. Link pi's bundled peer
 // packages into this gitignored node_modules exactly as the production loader does.
