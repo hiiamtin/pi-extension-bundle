@@ -19,6 +19,9 @@ Sibling calls in one model response run concurrently (default cap 4,
 `~/.pi/agent/subagents/<id>/`: metadata, raw JSONL event transcript, child
 session, and full result. `/subagents list|cont|kill` is the human surface.
 Timeouts are resumable; defaults are scout 10m, reviewer 20m, worker 60m.
+Every model-visible result includes its run id and the exact `continue` call
+shape, so the parent agent can iterate with the same child without polling
+or inspecting the state directory.
 
 Children start with no ambient extensions, skills, context files, templates,
 or themes. Agent frontmatter opts in exact resources:

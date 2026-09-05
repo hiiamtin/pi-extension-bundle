@@ -192,6 +192,12 @@ putting required conventions into the task/prompt.
   feed (for renderers) from `tool_execution_start/update/end`.
 - **Output truncation:** returned text capped at 200 KB / 5,000 lines
   (head+tail splice); full text always on disk in `result.md`.
+- **Model-visible run identity:** every final tool result appends a compact
+  orchestration footer inside the same character cap:
+  `[subagent run: <id> · <agent> · <state>]` plus the exact
+  `subagent({ continue: "<id>", task: "..." })` shape. The parent model can
+  therefore continue the child without a filesystem lookup; `result.md`
+  remains the raw child output without this footer.
 - **Timeout never loses work.** On expiry: SIGTERM → SIGKILL after 5 s →
   meta marked `timeout`; partial result = last assistant text if any; our
   captured `transcript.jsonl` is the authoritative post-mortem artifact

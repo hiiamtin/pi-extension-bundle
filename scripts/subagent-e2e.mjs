@@ -115,6 +115,8 @@ const result = await tool.execute(
 );
 const text = result.content?.[0]?.text ?? "";
 assert.match(text, /result for Task: find auth/);
+assert.match(text, new RegExp(`\\[subagent run: ${result.details.run.id} · scout · done\\]`));
+assert.match(text, new RegExp(`subagent\\(\\{ continue: "${result.details.run.id}"`));
 assert.equal(result.isError, undefined);
 assert(result.details?.run?.id, "result must expose a run id");
 assert.equal(result.details.run.agent, "scout");
@@ -134,7 +136,7 @@ const runDir = path.join(stateDir, result.details.run.id);
 assert(existsSync(path.join(runDir, "meta.json")), "run metadata must persist");
 assert(existsSync(path.join(runDir, "session.jsonl")), "child session must persist");
 assert(existsSync(path.join(runDir, "transcript.jsonl")), "raw event stream must persist");
-assert.equal(readFileSync(path.join(runDir, "result.md"), "utf8"), text);
+assert.equal(readFileSync(path.join(runDir, "result.md"), "utf8"), "result for Task: find auth", "result.md must remain the raw child output");
 
 const spawn = readFileSync(captureFile, "utf8").trim().split("\n").map(JSON.parse).find((event) => event.event === "start");
 assert.deepEqual(spawn.args.slice(0, 4), ["--mode", "json", "-p", "--session"]);
@@ -160,6 +162,7 @@ const continued = await tool.execute(
   { ...ctx, cwd: otherCwd },
 );
 assert.match(continued.content?.[0]?.text ?? "", /result for Task: address the review/);
+assert.match(continued.content?.[0]?.text ?? "", new RegExp(`\\[subagent run: ${result.details.run.id} · scout · done\\]`));
 assert.equal(continued.details?.run?.id, result.details.run.id, "continue must keep the run id");
 assert.equal(continued.details.run.state, "done");
 assert.equal(continued.details.run.usage.input, 202, "run metadata aggregates usage across continuations");
@@ -299,6 +302,7 @@ const truncated = await tool.execute("truncate", { agent: "scout", task: "large 
 delete process.env.FAKE_SUBAGENT_OUTPUT;
 assert.equal(truncated.details?.truncated, true);
 assert.match(truncated.content?.[0]?.text ?? "", /output truncated/);
+assert((truncated.content?.[0]?.text ?? "").length <= 1000, "model-visible footer must stay inside PI_SUBAGENT_OUT_CHARS");
 assert((truncated.content?.[0]?.text ?? "").includes("HHHH"));
 assert((truncated.content?.[0]?.text ?? "").includes("TTTT"));
 assert.equal(readFileSync(truncated.details.fullOutputPath, "utf8").length, 2408);

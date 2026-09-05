@@ -408,6 +408,17 @@ function truncateOutput(text: string): { text: string; truncated: boolean } {
   return { text: output, truncated: true };
 }
 
+function modelVisibleOutput(output: string, meta: RunMeta): string {
+  const footer = [
+    `[subagent run: ${meta.id} · ${meta.agent} · ${meta.state}]`,
+    `Continue with: subagent({ continue: "${meta.id}", task: "..." })`,
+  ].join("\n");
+  const separator = "\n\n";
+  const outputBudget = Math.max(0, MAX_OUTPUT_CHARS - separator.length - footer.length);
+  const bounded = output.length <= outputBudget ? output : `${output.slice(0, Math.max(0, outputBudget - 1))}…`;
+  return `${bounded}${separator}${footer}`;
+}
+
 function killProcessGroup(meta: RunMeta): void {
   try {
     process.kill(-meta.pgid, "SIGTERM");
@@ -673,7 +684,7 @@ async function runAgent(
     writeMeta(meta);
     const visible = truncateOutput(fullOutput);
     const result = {
-      content: [{ type: "text" as const, text: visible.text }],
+      content: [{ type: "text" as const, text: modelVisibleOutput(visible.text, meta) }],
       details: { run: meta, activities, fullOutputPath: meta.resultPath, truncated: visible.truncated },
       usage: {
         input: meta.usage.input,
