@@ -156,6 +156,7 @@ reachable from a tool call; opening one arrives with P2).
 | `scout` | `opencode-go/gpt-5.6-luna` · thinking low | read, grep, find, ls + `code_search` (via bundle ext) | 10 min | read-only recon; cheap/fast reasoning tier |
 | `worker` | `9router/snowy` | full | 60 min | real implementation work |
 | `reviewer` | `9router/snowy` · thinking high | read, grep, bash + `code_search`/`code_find_related` | 20 min | review/audit; 1M context for large diffs |
+| `research` | `9router/flash-research` · thinking low | web_search, web_fetch, read (via bundle exts) | 15 min | web research with cited sources; keeps heavy browsing out of the parent context |
 
 (`oracle` second-opinion agent joins in P3 as a pure `.md` — strong model +
 critique prompt.)

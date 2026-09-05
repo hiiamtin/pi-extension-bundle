@@ -339,6 +339,7 @@ agents/
   scout.md         read-only recon + bundle code-search extension
   worker.md        general implementation worker
   reviewer.md      read-only post-implementation review
+  research.md      web research with cited sources (web-search/web-fetch exts)
 lib/
   tool-compat.ts   shared helpers: signature normalization + loud param validation
 scripts/
