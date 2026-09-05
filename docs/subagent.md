@@ -1,8 +1,9 @@
 # Subagent Extension for Pi — Design Document
 
-> **Status: grilled & agreed with Tin (2026-09-05), not implemented. Wire
-> verification (§12) PASSED on pi 0.85.0.** This document supersedes the
-> earlier draft entirely — every decision below was re-derived through a
+> **Status: P1 IMPLEMENTED & LIVE-ACCEPTED (2026-09-05, HEAD `5b0d79a`).** Wire
+> verification (§12) PASSED on pi 0.85.0; see §14 for the implementation
+> record, roster pins, and the P2/P3 entry checklist. This document supersedes
+> the earlier draft entirely — every decision below was re-derived through a
 > structured grilling session (requirements first, then architecture, surface,
 > lifecycle).
 >
@@ -352,6 +353,39 @@ read-modify-write (`mergeMeta`), duplicated continue paths extracted,
 `getPiInvocation` hardened against recursive spawn. Accepted deviations
 (documented in §5/§6/§7): blocking default until P2, cwd-equality trust rule,
 ui.confirm fallback deferred, test-seam env knobs.
+
+### Status after live acceptance (all pushed, HEAD `5b0d79a`)
+
+- Gates: `subagent-e2e` (14 behavioral tests incl. trust/queue-kill/recovery),
+  `smoke-test` (both calling conventions, isolated state), `bg-e2e`,
+  `bg-regression` — ALL PASS.
+- Live-verified in real pi sessions: blocking run, model-visible run-id footer
+  + AI-driven continue on the same child (context preserved), worker edits on
+  a real tree, reviewer read-only boundary (scout correctly refuses bash),
+  sibling-call parallelism (two children started 11 ms apart), pinned models
+  resolve per roster.
+- Roster pins (shipped defaults, user-tunable in `~/.pi/agent/agents/`):
+  scout `opencode-go/gpt-5.6-luna` (thinking low), worker `9router/snowy`,
+  reviewer `9router/snowy` (thinking high, + code_search/code_find_related),
+  research `9router/flash-research` (web_search/web_fetch exts).
+- Deliberately untracked: `.agents/` (local skills) and `skills-lock.json`.
+
+### P2 entry checklist (next phase — background mode)
+
+1. Copy machinery from `bg-task.ts` into `lib/agent-runs.ts` (meta/heartbeat/
+   `canNotifyHere`/late-bound `sendToSession`/widget tick/kill escalation/
+   prune/debug-log cap) — bg-task.ts itself stays untouched; state dir stays
+   `~/.pi/agent/subagents/`.
+2. `run_in_background: true` (single mode first): return run id immediately,
+   notify the owner session on finish (followUp + triggerTurn), result.md as
+   artifact; adopt §8 invariants verbatim (seq-claim, notifiedAt-on-real-
+   delivery, never capture pi.sendMessage at module level).
+3. Add `ctx.ui.confirm` fallback for project agents in untrusted-but-promptable
+   sessions (deferred from P1).
+4. Extend `subagent-e2e.mjs` for background flows with fake-child timing.
+5. P3 (after P2): `--mode rpc` spawn upgrade (steer / live inspect / graceful
+   wrap-up before timeout kill), `doctor`, `pi.events` emits, optional
+   `oracle` agent (.md only).
 
 ## 15. Sources
 
