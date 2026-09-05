@@ -311,5 +311,185 @@ assert((truncated.content?.[0]?.text ?? "").includes("HHHH"));
 assert((truncated.content?.[0]?.text ?? "").includes("TTTT"));
 assert.equal(readFileSync(truncated.details.fullOutputPath, "utf8").length, 2408);
 
+// ─── P2: background runs ─────────────────────────────────────────────────────
+// The notification/session machinery lives in lib/agent-runs.ts (lifted from
+// bg-task.ts; see docs/subagent.md §8). Unit-level tests import it directly.
+const runs = await import(path.join(pkgRoot, "lib", "agent-runs.ts"));
+
+// ownership matrix: strict per-session notice ownership
+const ownerFile = path.join(root, "owner.jsonl");
+writeFileSync(ownerFile, "{}");
+const now = Date.now();
+assert.equal(runs.canNotifyHere(ownerFile, now - 1000, now, ownerFile), true, "own session always receives");
+assert.equal(runs.canNotifyHere(ownerFile, now - 1000, now, path.join(root, "other.jsonl")), false, "foreign run with live owner must wait");
+rmSync(ownerFile, { force: true });
+assert.equal(runs.canNotifyHere(ownerFile, now - 1000, now, path.join(root, "other.jsonl")), true, "deleted owner session is adoptable");
+assert.equal(runs.canNotifyHere(undefined, now - 61_000, now, undefined), true, "legacy no-owner run adopts after grace");
+assert.equal(runs.canNotifyHere(undefined, now - 1000, now, undefined), false, "legacy no-owner run waits during grace");
+
+// orphan finalize: dead process group → failed; live group and finished runs untouched
+const ioDir = path.join(root, "io-runs");
+mkdirSync(ioDir, { recursive: true });
+const ioMeta = (id) => path.join(ioDir, id, "meta.json");
+const ioWrite = (meta) => { mkdirSync(path.join(ioDir, meta.id), { recursive: true }); writeFileSync(ioMeta(meta.id), JSON.stringify(meta)); };
+const ioRead = (id) => { try { return JSON.parse(readFileSync(ioMeta(id), "utf8")); } catch { return null; } };
+const baseRun = (id, state, pgid, extra = {}) => ({ id, agent: "scout", task: `t-${id}`, cwd: root, state, pgid, pid: pgid, createdAt: now, startedAt: now, timeoutMin: 5, sessionFile: path.join(ioDir, id, "session.jsonl"), transcriptPath: path.join(ioDir, id, "transcript.jsonl"), resultPath: path.join(ioDir, id, "result.md"), usage: { turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 0, cost: 0, costInput: 0, costOutput: 0, costCacheRead: 0, costCacheWrite: 0 }, ...extra });
+ioWrite(baseRun("s-deadpgid", "running", 999_999_999));
+const { spawn: spawnRaw } = await import("node:child_process");
+const sleeper = spawnRaw("sleep", ["30"], { detached: true, stdio: "ignore" });
+ioWrite(baseRun("s-alivepgid", "running", sleeper.pid));
+ioWrite(baseRun("s-finished", "done", 999_999_999, { finishedAt: now }));
+const orphanIo = { list: () => ["s-deadpgid", "s-alivepgid", "s-finished"].map(ioRead), save: (m) => ioWrite(m) };
+const finalized = runs.finalizeOrphans(orphanIo, { now });
+assert.deepEqual(finalized, ["s-deadpgid"], "only dead-process-group runs may be finalized");
+assert.equal(ioRead("s-deadpgid").state, "failed");
+assert.match(ioRead("s-deadpgid").error, /host exited/);
+assert.equal(ioRead("s-alivepgid").state, "running", "live process group must stay running");
+assert.equal(ioRead("s-finished").state, "done", "finished runs must never be re-finalized");
+sleeper.kill("SIGKILL");
+
+// prune: old finished dirs removed, recent kept, running never pruned
+const pruned = [];
+const pruneIo = {
+  list: () => [
+    baseRun("s-old-done", "done", 1, { finishedAt: now - 8 * 24 * 3_600_000 }),
+    baseRun("s-new-done", "done", 1, { finishedAt: now - 1000 }),
+    baseRun("s-old-running", "running", 1, { finishedAt: undefined }),
+  ],
+  remove: (id) => pruned.push(id),
+};
+assert.deepEqual(runs.pruneRuns(pruneIo, { now, maxAgeMs: 7 * 24 * 3_600_000 }), ["s-old-done"], "only old finished runs may be pruned");
+assert.deepEqual(pruned, ["s-old-done"]);
+
+// ── background tool flow (in-process, fake child) ──
+const bgNotices = [];
+mod.default({
+  cwd: pkgRoot,
+  registerTool: (t) => (registered.subagent = t),
+  registerCommand: (n, c) => (commands[n] = c),
+  on: (name, handler) => { (hooks[name] ??= []).push(handler); },
+  sendMessage: (message, opts) => bgNotices.push({ message, opts }),
+});
+
+const bgSessionFile = path.join(root, "bg-session.jsonl");
+writeFileSync(bgSessionFile, "{}");
+const bgCtx = { ...ctx, sessionManager: { getSessionFile: () => bgSessionFile } };
+const fire = (event, eventCtx) => { for (const handler of hooks[event] ?? []) handler({}, eventCtx); };
+fire("session_start", { sessionManager: { getSessionFile: () => bgSessionFile } });
+
+process.env.FAKE_SUBAGENT_DELAY_MS = "600";
+writeFileSync(captureFile, "");
+const bgT0 = Date.now();
+const bgStart = await tool.execute("bg-start", { agent: "scout", task: "background please", run_in_background: true }, undefined, undefined, bgCtx);
+const bgLag = Date.now() - bgT0;
+delete process.env.FAKE_SUBAGENT_DELAY_MS;
+assert(bgLag < 400, `background call must return immediately (took ${bgLag}ms)`);
+assert.match(bgStart.content?.[0]?.text ?? "", /Background subagent started: s-[a-z0-9]+ \(scout\)/);
+assert.match(bgStart.content?.[0]?.text ?? "", /\/subagents kill /, "start text must expose the kill command");
+const bgId = (bgStart.content[0].text.match(/s-[a-z0-9]+/) || [])[0];
+assert(bgId, "start text must expose the run id");
+const bgMetaRead = () => JSON.parse(readFileSync(path.join(stateDir, bgId, "meta.json"), "utf8"));
+await waitFor(() => bgMetaRead().state === "done", 8000);
+await waitFor(() => !!bgMetaRead().notifiedAt, 3000);
+assert(bgNotices.length >= 1, "finish must push a notice into the owner session");
+const finishNotice = bgNotices.filter((n) => String(n.message?.content ?? "").includes(bgId)).at(-1);
+assert(finishNotice, "finish notice must reference the run id");
+assert.match(finishNotice.message.content, new RegExp(`'scout' \\(${bgId}\\) finished: done`));
+assert.match(finishNotice.message.content, /result for Task: background please/, "finish notice must carry a result tail");
+assert.match(finishNotice.message.content, new RegExp(`subagent\\(\\{ continue: "${bgId}"`));
+assert(finishNotice.message.content.includes(path.join(stateDir, bgId, "result.md")), "finish notice must point at the full result on disk");
+assert.equal(finishNotice.opts.deliverAs, "followUp", "owner in the foreground must be woken proactively");
+assert.equal(finishNotice.opts.triggerTurn, true);
+assert.equal(bgMetaRead().notifyTries, 1, "first delivery attempt must succeed via the targeted session api");
+
+// sweep catch-up: a finished unnotified run surfaces on the owner's next activation
+writeFileSync(path.join(stateDir, bgId, "meta.json"), JSON.stringify({ ...bgMetaRead(), notifiedAt: undefined }, null, 2));
+bgNotices.length = 0;
+fire("session_start", { sessionManager: { getSessionFile: () => bgSessionFile } });
+await waitFor(() => bgNotices.length > 0, 3000);
+assert.match(bgNotices[0].message.content, /finished since you were away/);
+assert(bgMetaRead().notifiedAt, "sweep must mark the run delivered");
+
+// strict ownership across sessions: a live foreign owner blocks adoption
+const foreignOwner = path.join(root, "foreign-owner.jsonl");
+writeFileSync(foreignOwner, "{}");
+process.env.FAKE_SUBAGENT_DELAY_MS = "400";
+const foreignStart = await tool.execute("foreign-bg", { agent: "scout", task: "foreign owner run", run_in_background: true }, undefined, undefined, { ...bgCtx, sessionManager: { getSessionFile: () => foreignOwner } });
+delete process.env.FAKE_SUBAGENT_DELAY_MS;
+const foreignId = (foreignStart.content[0].text.match(/s-[a-z0-9]+/) || [])[0];
+const foreignMetaRead = () => JSON.parse(readFileSync(path.join(stateDir, foreignId, "meta.json"), "utf8"));
+await waitFor(() => foreignMetaRead().state === "done", 8000);
+bgNotices.length = 0;
+fire("session_start", { sessionManager: { getSessionFile: () => bgSessionFile } });
+await sleep(300);
+assert(!bgNotices.some((notice) => String(notice.message?.content ?? "").includes(foreignId)), "a live foreign owner must block adoption");
+assert(!foreignMetaRead().notifiedAt);
+rmSync(foreignOwner, { force: true });
+fire("session_start", { sessionManager: { getSessionFile: () => bgSessionFile } });
+await waitFor(() => !!foreignMetaRead().notifiedAt, 3000);
+assert(foreignMetaRead().notifiedAt, "deleted owner session must make the run adoptable");
+
+// orphan finalize through the session hook: running meta with a dead pgid becomes failed
+const hookOrphan = { ...baseRun("s-hookorphan", "running", 999_999_999), resultPath: path.join(stateDir, "s-hookorphan", "result.md") };
+mkdirSync(path.join(stateDir, "s-hookorphan"), { recursive: true });
+writeFileSync(path.join(stateDir, "s-hookorphan", "meta.json"), JSON.stringify(hookOrphan));
+fire("tool_call", { sessionManager: { getSessionFile: () => bgSessionFile } });
+const orphanAfter = JSON.parse(readFileSync(path.join(stateDir, "s-hookorphan", "meta.json"), "utf8"));
+assert.equal(orphanAfter.state, "failed");
+assert.match(orphanAfter.error, /host exited/);
+assert(existsSync(path.join(stateDir, "s-hookorphan", "result.md")), "orphan finalize must leave a result file");
+
+// context pump: silent in single-session mode; injects a system-reminder in multi-session mode
+const markAllNotified = () => {
+  for (const id of readdirSync(stateDir)) {
+    const metaFile = path.join(stateDir, id, "meta.json");
+    if (!existsSync(metaFile)) continue;
+    const meta = JSON.parse(readFileSync(metaFile, "utf8"));
+    if (!meta.notifiedAt && meta.finishedAt && meta.state !== "running" && meta.state !== "queued") {
+      meta.notifiedAt = Date.now();
+      writeFileSync(metaFile, JSON.stringify(meta, null, 2));
+    }
+  }
+};
+markAllNotified();
+fire("session_start", { sessionManager: { getSessionFile: () => path.join(root, "second-session.jsonl") } });
+const baseMessages = [{ role: "user", content: [{ type: "text", text: "hi" }] }];
+const quietCtx = { sessionManager: { getSessionFile: () => path.join(root, "second-session.jsonl") } };
+const fireContext = (eventCtx) => {
+  let last = {};
+  for (const handler of hooks.context ?? []) {
+    const out = handler({ messages: baseMessages }, eventCtx);
+    if (out && Object.keys(out).length) last = out;
+  }
+  return last;
+};
+assert.deepEqual(fireContext(quietCtx), {}, "context pump must stay silent with nothing pending");
+writeFileSync(path.join(stateDir, bgId, "meta.json"), JSON.stringify({ ...bgMetaRead(), notifiedAt: undefined }, null, 2));
+// strict ownership: pumping from the WRONG session must not surface the run
+assert.deepEqual(fireContext(quietCtx), {}, "pending run of a live foreign owner must not be injected elsewhere");
+assert(!bgMetaRead().notifiedAt, "foreign pump must not mark the run delivered");
+// the owner session itself gets its pending notice injected on its next LLM call
+const pumped = fireContext({ sessionManager: { getSessionFile: () => bgSessionFile } });
+assert(pumped?.messages?.length === 2, "context pump must inject one reminder message");
+assert.match(pumped.messages[1].content[0].text, /<system-reminder>/);
+assert.match(pumped.messages[1].content[0].text, new RegExp(bgId));
+assert(bgMetaRead().notifiedAt, "context pump must mark delivered runs");
+
+// ── ui.confirm fallback for project agents in untrusted-but-promptable sessions ──
+const projectRoot2 = path.join(root, "project2");
+mkdirSync(path.join(projectRoot2, ".pi", "agents"), { recursive: true });
+writeFileSync(path.join(projectRoot2, ".pi", "agents", "pinner.md"), `---\nname: pinner\ndescription: Project-only agent.\ntools: [read]\n---\n\nPINNER PROMPT\n`);
+const confirmCalls = [];
+const untrustedBase = { ...ctx, cwd: projectRoot2, isProjectTrusted: () => false, hasUI: true };
+const denied = await tool.execute("confirm-deny", { agent: "pinner", task: "x" }, undefined, undefined, { ...untrustedBase, ui: { confirm: async (title, text) => { confirmCalls.push({ title, text }); return false; } } });
+assert.match(denied.content?.[0]?.text ?? "", /unknown agent 'pinner'/);
+assert.equal(confirmCalls.length, 1, "promptable untrusted session must be asked once");
+assert.match(confirmCalls[0].title, /[Aa]gent/);
+writeFileSync(captureFile, "");
+const allowed = await tool.execute("confirm-allow", { agent: "pinner", task: "use project agent" }, undefined, undefined, { ...untrustedBase, ui: { confirm: async () => true } });
+assert.equal(allowed.details?.run?.state, "done");
+const allowSpawn = readFileSync(captureFile, "utf8").trim().split("\n").map(JSON.parse).find((event) => event.event === "start");
+assert.equal(allowSpawn.args[allowSpawn.args.indexOf("--append-system-prompt") + 1], "PINNER PROMPT");
+
 console.log("ALL SUBAGENT E2E TESTS PASSED");
 rmSync(root, { recursive: true, force: true });

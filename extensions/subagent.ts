@@ -24,6 +24,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { extractToolArgs, requireString, textResult } from "../lib/tool-compat.ts";
+import {
+  captureExtensionApi,
+  deliverRunNotice,
+  finalizeOrphans,
+  pruneRuns,
+  pumpContext,
+  sweepFinishedRuns,
+  trackSession,
+  type RunNoticeMeta,
+} from "../lib/agent-runs.ts";
 
 function envInt(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number(process.env[name]);
@@ -156,7 +166,7 @@ type ToolCtx = {
   hasUI?: boolean;
   isProjectTrusted?: () => boolean;
   sessionManager?: { getSessionFile?: () => string | undefined };
-  ui?: { notify?: (message: string, level: string) => void };
+  ui?: { notify?: (message: string, level: string) => void; confirm?: (title: string, message: string) => Promise<boolean> };
 };
 
 type OnUpdate = (result: {
@@ -419,6 +429,23 @@ function modelVisibleOutput(output: string, meta: RunMeta): string {
   return `${bounded}${separator}${footer}`;
 }
 
+function bgStartText(id: string, agentName: string): string {
+  return [
+    `Background subagent started: ${id} (${agentName}).`,
+    "You will be notified here when it finishes; keep working meanwhile.",
+    `Progress: /subagents list · Stop: /subagents kill ${id}`,
+  ].join("\n");
+}
+
+// Fire-and-forget: when a background run settles, push its notice to the owner
+// session. Failed pushes stay pending — the sweep and context pump own them.
+function launchBackground(running: Promise<unknown>, id: string, runsIo: { list: () => RunMeta[]; save: (meta: RunNoticeMeta) => void }): void {
+  void running.then(() => {
+    const final = readMeta(id);
+    if (final && !final.notifiedAt) deliverRunNotice(final, runsIo);
+  }).catch(() => {});
+}
+
 function killProcessGroup(meta: RunMeta): void {
   try {
     process.kill(-meta.pgid, "SIGTERM");
@@ -484,6 +511,8 @@ async function continueRun(
   ctx: ToolCtx | undefined,
   signal: AbortSignal | undefined,
   onUpdate?: OnUpdate,
+  runsIo?: RunsIo,
+  bg = false,
 ): Promise<RunResult | string> {
   const existing = readMeta(id);
   if (!existing) return `error: run '${id}' not found — use /subagents list`;
@@ -491,16 +520,13 @@ async function continueRun(
   const cwd = existing.cwd || ctx?.cwd || process.cwd();
   const agent = discoverAgents(cwd, projectAgentsAllowed(cwd, ctx)).find((candidate) => candidate.name === existing.agent);
   if (!agent) return `error: agent '${existing.agent}' for run '${id}' is no longer available`;
-  return runAgent(
-    agent,
-    task,
-    cwd,
-    { model: existing.model, thinking: ctx?.thinkingLevel },
-    existing.ownerSession,
-    signal,
-    onUpdate,
-    existing,
-  );
+  const inherited = { model: existing.model, thinking: ctx?.thinkingLevel };
+  if (bg && runsIo) {
+    const running = runAgent(agent, task, cwd, inherited, existing.ownerSession, undefined, undefined, existing);
+    launchBackground(running, existing.id, runsIo);
+    return bgStartText(existing.id, agent.name);
+  }
+  return runAgent(agent, task, cwd, inherited, existing.ownerSession, signal, onUpdate, existing);
 }
 
 async function runAgent(
@@ -512,6 +538,7 @@ async function runAgent(
   signal: AbortSignal | undefined,
   onUpdate: OnUpdate | undefined,
   existing?: RunMeta,
+  onStart?: (meta: RunMeta) => void,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: RunDetails; usage?: Record<string, unknown> }> {
   const id = existing?.id ?? nextId();
   const dir = runDir(id);
@@ -550,6 +577,7 @@ async function runAgent(
         usage: emptyUsage(),
       };
   writeMeta(meta);
+  onStart?.(meta);
 
   const releaseSlot = await childSlots.acquire();
   const queuedState = readMeta(meta.id)?.state;
@@ -731,8 +759,56 @@ function listText(): string {
   }).join("\n");
 }
 
+type RunsIo = {
+  list: () => RunMeta[];
+  save: (meta: RunNoticeMeta) => void;
+  read?: (id: string) => RunNoticeMeta | null;
+  remove?: (id: string) => void;
+};
+
 export default function subagentExtension(pi: ExtensionAPI): void {
   mkdirSync(STATE_DIR, { recursive: true });
+  captureExtensionApi(pi);
+
+  const runsIo: RunsIo = {
+    list: () => listMetas(),
+    read: (id) => readMeta(id),
+    remove: (id) => rmSync(runDir(id), { recursive: true, force: true }),
+    save: (meta) => {
+      writeMeta(meta as RunMeta);
+      // orphan finalize leaves a result file so post-mortems never 404
+      if (meta.state === "failed" && meta.error?.startsWith("host exited") && !existsSync(meta.resultPath)) {
+        writeFileSync(meta.resultPath, meta.error);
+      }
+    },
+  };
+  const housekeep = () => {
+    try {
+      finalizeOrphans(runsIo);
+      pruneRuns(runsIo);
+    } catch {
+      // housekeeping must never crash the host
+    }
+  };
+  housekeep();
+  const housekeeper = setInterval(housekeep, 3_600_000);
+  housekeeper.unref?.();
+
+  const onActivity = (_event: unknown, eventCtx: unknown) => {
+    try {
+      trackSession(eventCtx);
+      housekeep();
+      sweepFinishedRuns(runsIo);
+    } catch {
+      // never crash the host
+    }
+  };
+  for (const event of ["session_start", "session_info_changed", "input", "tool_call"] as const) {
+    pi.on(event as never, (e: never, c: never) => onActivity(e, c));
+  }
+  pi.on("context" as never, (event: unknown, eventCtx: unknown) =>
+    pumpContext(runsIo, event as { messages?: Array<Record<string, unknown>> }, eventCtx));
+
   const initialAgents = discoverAgents(pi.cwd || process.cwd(), false);
   const catalog = initialAgents.slice(0, 8).map((agent) => `${agent.name}: ${agent.description}`).join("; ") || "none configured";
 
@@ -740,7 +816,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
     name: "subagent",
     label: "Subagent",
     description: [
-      "Delegate one task to an isolated specialist child. Blocking by default.",
+      "Delegate one task to an isolated specialist child. Blocking by default; pass run_in_background: true to return immediately and be notified on completion.",
       "For parallel work, emit every independent subagent call as sibling tool calls in the SAME assistant response; pi executes those calls concurrently.",
       "Do not call one subagent and wait before issuing another independent call. Wait only when the later task depends on an earlier result.",
       `Available user agents: ${catalog}.`,
@@ -749,7 +825,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       agent: Type.Optional(Type.String({ description: "Agent name for a new run" })),
       continue: Type.Optional(Type.String({ description: "Run id to continue instead of starting fresh" })),
       task: Type.String({ description: "Task or follow-up instruction" }),
-      run_in_background: Type.Optional(Type.Boolean({ description: "Return immediately and notify on completion (P2)" })),
+      run_in_background: Type.Optional(Type.Boolean({ description: "Return immediately and notify this session when the run finishes" })),
       model: Type.Optional(Type.String({ description: "Per-call provider/model override" })),
       cwd: Type.Optional(Type.String({ description: "Working directory override" })),
     }),
@@ -761,22 +837,42 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       const signal = modern ? cbArgs[2] as AbortSignal | undefined : undefined;
       const onUpdate = modern ? cbArgs[3] as OnUpdate | undefined : undefined;
       const ctx = (modern ? cbArgs[4] : undefined) as ToolCtx | undefined;
-      if (params.run_in_background === true) return textResult("background subagents arrive in P2; omit run_in_background for P1");
+      const wantsBg = params.run_in_background === true;
       if (typeof params.continue === "string" && params.continue.trim()) {
-        const outcome = await continueRun(params.continue.trim(), String(params.task).trim(), ctx, signal, onUpdate);
+        const outcome = await continueRun(params.continue.trim(), String(params.task).trim(), ctx, signal, onUpdate, runsIo, wantsBg);
         return typeof outcome === "string" ? textResult(outcome) : outcome;
       }
       const missingAgent = requireString(params, "agent");
       if (missingAgent) return textResult(missingAgent.errorText);
       const cwd = typeof params.cwd === "string" && params.cwd.trim() ? path.resolve(params.cwd) : ctx?.cwd || pi.cwd || process.cwd();
       const agents = discoverAgents(cwd, projectAgentsAllowed(cwd, ctx));
-      const agent = agents.find((candidate) => candidate.name === String(params.agent).trim());
+      let agent = agents.find((candidate) => candidate.name === String(params.agent).trim());
+      if (!agent) {
+        // Fallback deferred from P1: untrusted-but-promptable sessions may opt
+        // in to project agents for this single run via an explicit confirm.
+        const projectDir = nearestProjectAgentsDir(cwd);
+        const sameAsSession = path.resolve(cwd) === path.resolve(ctx?.cwd || cwd);
+        if (projectDir && sameAsSession && !ctx?.isProjectTrusted?.() && ctx?.hasUI) {
+          const approved = await ctx.ui?.confirm?.("Untrusted project agents", `Load project agents from ${projectDir} for this run?`);
+          if (approved) agent = discoverAgents(cwd, true).find((candidate) => candidate.name === String(params.agent).trim());
+        }
+      }
       if (!agent) return textResult(`error: unknown agent '${params.agent}'. Available: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`);
       const parentModel = ctx?.model?.provider && ctx.model.id ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
       const inheritedModel = typeof params.model === "string" && params.model.trim()
         ? params.model.trim()
         : agent.model ?? parentModel;
       const ownerSession = ctx?.sessionManager?.getSessionFile?.();
+      if (wantsBg) {
+        // No call signal: background runs outlive this tool call and are
+        // stopped via /subagents kill, not by parent-turn aborts.
+        let started: RunMeta | undefined;
+        const running = runAgent(agent, String(params.task).trim(), cwd, { model: inheritedModel, thinking: ctx?.thinkingLevel }, ownerSession, undefined, undefined, undefined, (meta) => { started = meta; });
+        const id = started?.id;
+        if (!id) return textResult("error: background run failed to initialize");
+        launchBackground(running, id, runsIo);
+        return textResult(bgStartText(id, agent.name));
+      }
       return runAgent(
         agent,
         String(params.task).trim(),

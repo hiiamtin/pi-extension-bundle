@@ -81,10 +81,16 @@ subagent({ continue: "<run-id>", task })                     // continue a finis
 - **Blocking by default** — the result returns into the same turn so the model
   can reason over it immediately (this is what keeps the agentic loop tight;
   CC works the same way).
-- **`run_in_background: true`** (P2): hand the run to the bg machinery; call
-  returns the run id immediately; completion is delivered to the owner session
-  via the bg-task notify path (result follows into the conversation; the
-  parent can keep chatting meanwhile).
+- **`run_in_background: true`** (implemented in P2): the call returns the run
+  id immediately (`Background subagent started: <id> (<agent>)` + kill hint);
+  the run keeps going (same semaphore, same timeout). On finish the owner
+  session is woken via the notification machinery in `lib/agent-runs.ts`
+  (§8): a result notice with tail + `result.md` path + continue hint, pushed
+  as `followUp`+`triggerTurn` when the owner is the active session, else
+  `nextTurn`. Undelivered notices surface through the guaranteed channels
+  (activation sweep, context-hook injection). Background runs ignore the
+  tool-call abort signal — they are stopped via `/subagents kill`, not by
+  parent-turn aborts.
 - **Parallel = N sibling tool calls in the SAME assistant response.** pi
   executes sibling calls concurrently by default (docs/extensions.md §tool
   execution). Calling one, waiting for its result, then calling another is
@@ -242,6 +248,27 @@ escalation, prune, debug-log capping, `envInt` knobs, settings file.
 State dir is separate (`~/.pi/agent/subagents/`, not `bg-tasks/`) so scans
 never collide.
 
+**Implemented in P2** as `lib/agent-runs.ts` — lifted: capture registry +
+`seq` claiming, strict `canNotifyHere` ownership, late-bound
+`sendToSession`, `notifyTries`/`notifiedAt`-on-real-delivery, activation
+sweep (session_start/session_info_changed/input/tool_call), context-hook
+injection (multi-session only), prune, capped debug log, orphan finalize.
+Deliberate deviations (all safer-or-simpler for the subagent shape):
+
+- **No heartbeat/orphan scanner:** P2 runs are in-process pipe children — if
+  the host dies, the child's stdout breaks and the process group disappears,
+  so a `running` meta with a dead pgid is finalized `failed` on the next scan
+  (heartbeat is redundant here).
+- **No widget tick:** `/subagents list` covers progress display; a UI widget
+  is deferred until it earns its complexity.
+- **No execute-ctx push in `sendToSession`:** the spawning call's ctx is
+  stale the moment the call returns; delivery uses targeted session apis
+  (claimed at session_start by `seq`) plus an ownership-gated single-session
+  fallback (blind push only when the only known session is the owner or the
+  owner file is gone — otherwise a restarted TUI would leak another
+  session's notice).
+- **No settings file:** nothing user-configurable yet.
+
 ## 9. Commands
 
 v1: `/subagents list` (table: id, agent, state, elapsed, usage) ·
@@ -372,6 +399,9 @@ ui.confirm fallback deferred, test-seam env knobs.
 
 ### P2 entry checklist (next phase — background mode)
 
+> **P2 DONE (2026-09-05, same day).** See the P2 record below the checklist;
+> items kept as written, with the deviations recorded in §8.
+
 1. Copy machinery from `bg-task.ts` into `lib/agent-runs.ts` (meta/heartbeat/
    `canNotifyHere`/late-bound `sendToSession`/widget tick/kill escalation/
    prune/debug-log cap) — bg-task.ts itself stays untouched; state dir stays
@@ -386,6 +416,25 @@ ui.confirm fallback deferred, test-seam env knobs.
 5. P3 (after P2): `--mode rpc` spawn upgrade (steer / live inspect / graceful
    wrap-up before timeout kill), `doctor`, `pi.events` emits, optional
    `oracle` agent (.md only).
+
+### P2 record (2026-09-05) — background mode + notify
+
+- `lib/agent-runs.ts`: capture registry (`globalThis`, seq-claiming), strict
+  ownership, late-bound `sendToSession` (targeted apis + ownership-gated
+  single-session fallback), `deliverRunNotice` (notifiedAt only on real
+  delivery, 12-try push cap), activation sweep, context-hook pump, orphan
+  finalize (dead pgid), 7-day prune, capped debug log. Deviations in §8.
+- `extensions/subagent.ts`: `run_in_background` fires the run without
+  awaiting (same semaphore/timeout), returns id + kill hint immediately;
+  `launchBackground` pushes the finish notice; `continue` also accepts
+  background. `ui.confirm` fallback lets untrusted-but-promptable sessions
+  opt in to project agents per run.
+- e2e coverage added: immediate return, finish notice content + followUp
+  opts + notifyTries, sweep catch-up, live-owner adoption block + adopt after
+  owner deletion, hook-driven orphan finalize (+ result file), prune matrix,
+  canNotifyHere matrix, single/multi-session context pump incl. the
+  foreign-owner negative, confirm deny/allow.
+- Gates after P2: subagent-e2e, smoke-test, bg-e2e, bg-regression — ALL PASS.
 
 ## 15. Sources
 
