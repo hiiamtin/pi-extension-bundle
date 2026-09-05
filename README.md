@@ -14,8 +14,11 @@ subagent({ agent, task, model?, cwd? })   # new run (blocking in P1)
 subagent({ continue: runId, task })       # continue the same child session
 ```
 
-Sibling calls in one model response run concurrently (default cap 4,
-`PI_SUBAGENT_MAX_CONCURRENT=1..16`). Every run persists under
+Independent work runs concurrently only when the model emits every sibling
+`subagent` call in the **same assistant response** (the tool description,
+prompt snippet, and system guidelines all teach this explicitly). Calling one,
+waiting, then calling the next is sequential. Default cap 4,
+`PI_SUBAGENT_MAX_CONCURRENT=1..16`. Every run persists under
 `~/.pi/agent/subagents/<id>/`: metadata, raw JSONL event transcript, child
 session, and full result. `/subagents list|cont|kill` is the human surface.
 Timeouts are resumable; defaults are scout 10m, reviewer 20m, worker 60m.

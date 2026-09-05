@@ -739,7 +739,18 @@ export default function subagentExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: `Delegate one task to an isolated specialist child. Blocking by default; sibling calls run in parallel. Available user agents: ${catalog}.`,
+    description: [
+      "Delegate one task to an isolated specialist child. Blocking by default.",
+      "For parallel work, emit every independent subagent call as sibling tool calls in the SAME assistant response; pi executes those calls concurrently.",
+      "Do not call one subagent and wait before issuing another independent call. Wait only when the later task depends on an earlier result.",
+      `Available user agents: ${catalog}.`,
+    ].join(" "),
+    promptSnippet: "Delegate one task; emit multiple subagent calls in the same response to run independent work concurrently",
+    promptGuidelines: [
+      "For independent delegated tasks, emit all subagent calls as sibling tool calls in the same assistant response so they execute concurrently; never issue them one-by-one.",
+      "Issue subagent calls sequentially only when a later task depends on an earlier result.",
+      "Use the run id in each subagent result footer to continue that same child after review or follow-up work instead of starting over.",
+    ],
     parameters: Type.Object({
       agent: Type.Optional(Type.String({ description: "Agent name for a new run" })),
       continue: Type.Optional(Type.String({ description: "Run id to continue instead of starting fresh" })),

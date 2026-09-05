@@ -84,11 +84,21 @@ subagent({ continue: "<run-id>", task })                     // continue a finis
   returns the run id immediately; completion is delivered to the owner session
   via the bg-task notify path (result follows into the conversation; the
   parent can keep chatting meanwhile).
-- **Parallel = N sibling tool calls in one assistant message.** pi executes
-  sibling calls concurrently by default (docs/extensions.md §tool execution).
-  We add an internal **semaphore** so live children never exceed the cap:
-  default **4**, `PI_SUBAGENT_MAX_CONCURRENT` (1–16). Calls beyond the cap
-  queue transparently (`state: "queued"` in meta).
+- **Parallel = N sibling tool calls in the SAME assistant response.** pi
+  executes sibling calls concurrently by default (docs/extensions.md §tool
+  execution). Calling one, waiting for its result, then calling another is
+  sequential — even if the tasks are independent. The model-facing contract
+  teaches this redundantly in the tool `description`, `promptSnippet`, and
+  `promptGuidelines`, including the inverse rule: sequential dispatch only
+  when a later task depends on an earlier result. We add an internal
+  **semaphore** so live children never exceed the cap: default **4**,
+  `PI_SUBAGENT_MAX_CONCURRENT` (1–16). Calls beyond the cap queue transparently
+  (`state: "queued"` in meta).
+
+  **Guarantee boundary:** this single-task schema cannot force a model to batch
+  independent calls in one response; prompt metadata makes the desired behavior
+  explicit and testable, but only a future explicit batch parameter could make
+  batching a code-level guarantee.
 - `model`: explicit `provider/id` overrides; default inherits parent
   (`ctx.model`). Same precedence for frontmatter (§5).
 - `continue` is **allowed cross-session** (a run is a disk artifact, not owned
