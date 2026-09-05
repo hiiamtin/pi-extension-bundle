@@ -1,7 +1,7 @@
 ---
 name: worker
 description: General-purpose implementation agent. Use for self-contained coding work that may edit files, run tests, and report completed changes.
-model: inherit
+model: 9router/snowy
 extensions: []
 skills: []
 mcp: []

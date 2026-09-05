@@ -151,11 +151,11 @@ reachable from a tool call; opening one arrives with P2).
 **Roster v1 (3 files, shipped in `agents/`, COPIED — not symlinked — to
 `~/.pi/agent/agents/` on install; agents are user-tunable):**
 
-| Agent | Tools | Timeout | Notes |
-|---|---|---|---|
-| `scout` | read, grep, find, ls + `code_search` (via bundle ext) | 10 min | read-only recon |
-| `worker` | full | 60 min | real implementation work |
-| `reviewer` | read, grep, bash (read-only intent) | 20 min | review/audit |
+| Agent | Model (TinTin default) | Tools | Timeout | Notes |
+|---|---|---|---|---|
+| `scout` | `opencode-go/gpt-5.6-luna` · thinking low | read, grep, find, ls + `code_search` (via bundle ext) | 10 min | read-only recon; cheap/fast reasoning tier |
+| `worker` | `9router/snowy` | full | 60 min | real implementation work |
+| `reviewer` | `9router/snowy` · thinking high | read, grep, bash + `code_search`/`code_find_related` | 20 min | review/audit; 1M context for large diffs |
 
 (`oracle` second-opinion agent joins in P3 as a pure `.md` — strong model +
 critique prompt.)

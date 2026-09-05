@@ -1,14 +1,18 @@
 ---
 name: reviewer
 description: Read-only code reviewer. Use after implementation to find correctness, regression, security, and spec-compliance problems before accepting changes.
-model: inherit
+model: 9router/snowy
 tools:
   - read
   - grep
   - bash
-extensions: []
+  - code_search
+  - code_find_related
+extensions:
+  - code-search
 skills: []
 mcp: []
+thinking: high
 timeout: 20
 ---
 
