@@ -92,10 +92,10 @@ const waitFor = async (predicate, timeoutMs = 3000) => {
 
 const tool = registered.subagent;
 assert(tool, "subagent tool must be registered");
-assert.match(tool.description, /same assistant response/i, "tool schema must teach real sibling-call parallelism");
-assert.match(tool.promptSnippet ?? "", /multiple.*same response/i, "available-tools snippet must teach parallel dispatch");
-assert(tool.promptGuidelines?.some((line) => /independent.*same assistant response/i.test(line)), "system guidelines must require sibling calls for independent tasks");
-assert(tool.promptGuidelines?.some((line) => /depends on.*earlier result/i.test(line)), "system guidelines must distinguish sequential dependencies");
+assert.match(tool.description, /independent.*same assistant response/i, "tool schema must teach real sibling-call parallelism");
+assert.match(tool.description, /depends on an earlier result/i, "tool schema must distinguish sequential dependencies");
+assert.equal(tool.promptSnippet, undefined, "parallel guidance belongs in the tool description only");
+assert.equal(tool.promptGuidelines, undefined, "parallel guidance must not duplicate system-prompt text");
 assert(commands.subagents, "/subagents command must be registered");
 
 const notices = [];

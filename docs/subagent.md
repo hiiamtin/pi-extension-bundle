@@ -87,10 +87,11 @@ subagent({ continue: "<run-id>", task })                     // continue a finis
 - **Parallel = N sibling tool calls in the SAME assistant response.** pi
   executes sibling calls concurrently by default (docs/extensions.md §tool
   execution). Calling one, waiting for its result, then calling another is
-  sequential — even if the tasks are independent. The model-facing contract
-  teaches this redundantly in the tool `description`, `promptSnippet`, and
-  `promptGuidelines`, including the inverse rule: sequential dispatch only
-  when a later task depends on an earlier result. We add an internal
+  sequential — even if the tasks are independent. The tool `description`
+  states this explicitly, including the inverse rule: sequential dispatch only
+  when a later task depends on an earlier result. Guidance lives in this one
+  model-facing contract instead of being duplicated into the system prompt.
+  We add an internal
   **semaphore** so live children never exceed the cap: default **4**,
   `PI_SUBAGENT_MAX_CONCURRENT` (1–16). Calls beyond the cap queue transparently
   (`state: "queued"` in meta).

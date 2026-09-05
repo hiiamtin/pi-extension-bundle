@@ -745,12 +745,6 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       "Do not call one subagent and wait before issuing another independent call. Wait only when the later task depends on an earlier result.",
       `Available user agents: ${catalog}.`,
     ].join(" "),
-    promptSnippet: "Delegate one task; emit multiple subagent calls in the same response to run independent work concurrently",
-    promptGuidelines: [
-      "For independent delegated tasks, emit all subagent calls as sibling tool calls in the same assistant response so they execute concurrently; never issue them one-by-one.",
-      "Issue subagent calls sequentially only when a later task depends on an earlier result.",
-      "Use the run id in each subagent result footer to continue that same child after review or follow-up work instead of starting over.",
-    ],
     parameters: Type.Object({
       agent: Type.Optional(Type.String({ description: "Agent name for a new run" })),
       continue: Type.Optional(Type.String({ description: "Run id to continue instead of starting fresh" })),
