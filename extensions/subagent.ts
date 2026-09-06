@@ -885,6 +885,39 @@ function transcriptTimeline(meta: RunMeta, limit = 12): string[] {
   return entries;
 }
 
+function messageText(message: Record<string, any> | undefined): string {
+  if (!message || !Array.isArray(message.content)) return "";
+  return message.content
+    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join(" ")
+    .trim();
+}
+
+function chatTranscript(meta: RunMeta, perMessageCap = 500, totalCap = 4_000): string {
+  const turns: string[] = [];
+  try {
+    for (const line of readFileSync(meta.transcriptPath, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line) as Record<string, any>;
+        if (event.type !== "message_end") continue;
+        const role = event.message?.role;
+        if (role !== "user" && role !== "assistant") continue;
+        const text = messageText(event.message);
+        if (!text) continue;
+        const label = role === "user" ? "you" : meta.agent;
+        const body = text.length <= perMessageCap ? text : `${text.slice(0, perMessageCap)}…`;
+        turns.push(`${label}: ${body}`);
+      } catch { /* skip malformed */ }
+    }
+  } catch { /* transcript optional */ }
+  if (!turns.length) return "(no dialogue captured — run may predate rpc mode)";
+  let out = turns.join("\n\n");
+  if (out.length > totalCap) out = `${out.slice(0, totalCap)}…\n(full history: ${meta.sessionFile})`;
+  return out;
+}
+
 function inspectFinishedSummary(meta: RunMeta): string {
   const end = meta.finishedAt ?? Date.now();
   const duration = fmtDur(end - (meta.startedAt ?? meta.createdAt));
@@ -1112,7 +1145,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
     getArgumentCompletions: (prefix: string) => {
       const normalized = prefix.trimStart();
       if (!normalized.includes(" ")) {
-        const commands = ["list", "cont", "kill", "steer", "inspect", "doctor"]
+        const commands = ["list", "cont", "kill", "steer", "inspect", "chat", "doctor"]
           .filter((value) => value.startsWith(normalized))
           .map((value) => ({ value, label: `${value} — ${{ list: "List runs", cont: "Continue a finished run", kill: "Stop a run", steer: "Redirect a running run", inspect: "View a run transcript", doctor: "Check environment health" }[value]}` }));
         return commands.length ? commands : null;
@@ -1187,6 +1220,17 @@ export default function subagentExtension(pi: ExtensionAPI): void {
           return;
         }
         ctx.ui?.notify?.(inspectFinishedSummary(meta), "info");
+        return;
+      }
+      const chat = input.match(/^chat\s+(\S+)$/);
+      if (chat) {
+        const [, id] = chat;
+        const meta = readMeta(id);
+        if (!meta) {
+          ctx.ui?.notify?.(`run '${id}' not found`, "warning");
+          return;
+        }
+        ctx.ui?.notify?.(`chat of ${id} · ${meta.agent}\n\n${chatTranscript(meta)}`, "info");
         return;
       }
       if (input === "doctor") {

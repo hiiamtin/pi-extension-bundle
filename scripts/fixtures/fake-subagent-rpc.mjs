@@ -90,13 +90,19 @@ process.stdin.on("data", (chunk) => {
       lastPrompt = String(cmd.message ?? "");
       respond(cmd, true);
       if (process.env.FAKE_RPC_HANG === "1") continue; // never emits turn_end
+      out({ type: "message_end", message: { role: "user", content: [{ type: "text", text: lastPrompt }], timestamp: Date.now() } });
       runTurn(finalText());
     } else if (cmd.type === "steer") {
       respond(cmd, true);
       if (process.env.FAKE_RPC_STEERABLE !== "1") continue; // wrap-up steers are silent here
       if (turnTimer) { clearTimeout(turnTimer); turnTimer = null; } // pivot abandons the in-flight turn
       const text = process.env.FAKE_RPC_STEER_OUTPUT || "STEER-OK";
-      turnTimer = setTimeout(() => { if (!exiting) { finished = true; emitTurn(text); } }, 300);
+      turnTimer = setTimeout(() => {
+        if (exiting) return;
+        out({ type: "message_end", message: { role: "user", content: [{ type: "text", text: String(cmd.message ?? "") }], timestamp: Date.now() } });
+        finished = true;
+        emitTurn(text);
+      }, 300);
     } else if (cmd.type === "abort") {
       respond(cmd, true);
       if (process.env.FAKE_RPC_WRAPUP_HONORS === "1" && !finished) {

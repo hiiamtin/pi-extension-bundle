@@ -555,6 +555,15 @@ assert(!steerTranscript.includes("message_update"), "transcript must exclude str
 assert(!steerTranscript.includes("agent_end"), "transcript must exclude oversized agent_end payloads");
 assert(steerTranscript.includes("tool_execution_start"), "transcript must keep consumed events");
 
+// /subagents chat: the actual dialogue (user/assistant turns) of a run
+notices.length = 0;
+await commands.subagents.handler(`chat ${steeredResult.details.run.id}`, ctx);
+const chatNotice = notices.map((notice) => notice.message).join("\n");
+assert.match(chatNotice, /you:/, "chat must label user turns");
+assert.match(chatNotice, /long running work/, "chat must show the delegated task text");
+assert.match(chatNotice, /pivot now/, "chat must show steering messages as user turns");
+assert.match(chatNotice, /scout:.*STEER-PIVOTED/s, "chat must show the assistant reply");
+
 // /subagents doctor: environment health report
 notices.length = 0;
 await commands.subagents.handler("doctor", ctx);
