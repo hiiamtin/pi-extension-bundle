@@ -650,9 +650,9 @@ assert(!bgNotices.some((notice) => String(notice.message?.content ?? "").include
   assert(viewLines.some((line) => line.includes("esc")), "viewer must show exit hint");
   // scroll + exit
   const before = component.scrollTop ?? 0;
-  component.handleInput?.({ name: "down" });
+  component.handleInput?.("\x1b[B");
   assert((component.scrollTop ?? 0) >= before, "down must scroll (or stay at end)");
-  component.handleInput?.({ name: "escape" });
+  component.handleInput?.("\x1b");
   assert.equal(doneSpyCalls.length, 1, "escape must close the viewer");
   // explicit id skips the picker
   customCalls.length = 0;
@@ -672,7 +672,7 @@ assert(!bgNotices.some((notice) => String(notice.message?.content ?? "").include
   const liveComponent = customCalls[0].factory(fakeTui, fakeTheme, {}, () => {});
   const liveHeader = liveComponent.render(100).join("\n");
   assert(/live/i.test(liveHeader), "viewer must mark running runs as live");
-  liveComponent.handleInput?.({ name: "escape" });
+  liveComponent.handleInput?.("\x1b");
   await livePromise;
 }
 

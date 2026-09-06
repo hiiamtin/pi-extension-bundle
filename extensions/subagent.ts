@@ -998,29 +998,40 @@ class SubagentViewer {
     this.scrollTop = Math.min(this.scrollTop, max);
   }
 
-  handleInput = (data: unknown): boolean => {
-    const key = data as { name?: string; shift?: boolean } | string | undefined;
-    const name = typeof key === "string" ? key : key?.name;
-    const shift = typeof key === "object" && key !== null ? key.shift === true : false;
+  // pi hands focused components RAW terminal data here (e.g. "q" is literally
+  // "q", escape is a bare "\x1b" byte, arrows are "\x1b[A"…). Parsed-key
+  // matching happens only via keybindings, which custom viewers don't get.
+  handleInput = (raw: unknown): boolean => {
+    const data = typeof raw === "string"
+      ? raw
+      : String((raw as { sequence?: string; name?: string } | undefined)?.sequence ?? (raw as { name?: string } | undefined)?.name ?? "");
     const max = Math.max(0, this.lines.length - VIEWER_ROWS);
-    if (name === "escape" || name === "q") {
+    // bare ESC = escape key (any longer sequence starting with ESC is a key
+    // like an arrow — fall through to the sequence table below)
+    if (data === "\x1b" || data === "q") {
       this.stopTimer();
       this.done();
       return true;
     }
-    if (name === "down" || name === "j") {
+    if (data === "\x03") {
+      // ctrl+c must never be swallowed by the viewer
+      this.stopTimer();
+      this.done();
+      return true;
+    }
+    if (data === "j" || data === "\x1b[B") {
       this.follow = false;
       this.scrollTop = Math.min(max, this.scrollTop + 1);
-    } else if (name === "up" || name === "k") {
+    } else if (data === "k" || data === "\x1b[A") {
       this.scrollTop = Math.max(0, this.scrollTop - 1);
-    } else if (name === "pageUp") {
-      this.scrollTop = Math.max(0, this.scrollTop - VIEWER_ROWS);
-    } else if (name === "pageDown" || name === "space") {
+    } else if (data === "\x1b[6~" || data === " ") {
       this.scrollTop = Math.min(max, this.scrollTop + VIEWER_ROWS);
-    } else if (name === "g" && !shift) {
+    } else if (data === "\x1b[5~") {
+      this.scrollTop = Math.max(0, this.scrollTop - VIEWER_ROWS);
+    } else if (data === "g") {
       this.follow = false;
       this.scrollTop = 0;
-    } else if ((name === "g" && shift) || name === "G" || name === "end") {
+    } else if (data === "G" || data === "\x1b[F") {
       this.follow = true;
       this.scrollTop = max;
     } else {
