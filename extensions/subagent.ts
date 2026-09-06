@@ -974,16 +974,16 @@ class SubagentViewer {
   private inputMode: string | null = null;
   private killArmedAt = 0;
   private flash: string | null = null;
+  private runsIo: RunsIo;
 
-  constructor(meta: RunMeta, tui: { requestRender: () => void }, done: () => void) {
+  constructor(meta: RunMeta, tui: { requestRender: () => void }, done: () => void, runsIo: RunsIo) {
     this.meta = meta;
     this.tui = tui;
     this.done = done;
+    this.runsIo = runsIo;
     this.refresh();
     if (meta.state === "running" || meta.state === "queued") {
       this.timer = setInterval(() => {
-        const fresh = readMeta(this.meta.id);
-        if (fresh) this.meta = fresh;
         this.refresh();
         if (this.meta.state !== "running" && this.meta.state !== "queued") this.stopTimer();
         this.tui.requestRender();
@@ -1004,6 +1004,8 @@ class SubagentViewer {
   }
 
   private refresh(): void {
+    const fresh = readMeta(this.meta.id);
+    if (fresh) this.meta = fresh;
     this.lines = buildViewerBody(this.meta);
     const max = Math.max(0, this.lines.length - VIEWER_ROWS);
     if (this.follow) this.scrollTop = max;
@@ -1018,6 +1020,7 @@ class SubagentViewer {
       ? raw
       : String((raw as { sequence?: string; name?: string } | undefined)?.sequence ?? (raw as { name?: string } | undefined)?.name ?? "");
     const max = Math.max(0, this.lines.length - VIEWER_ROWS);
+    this.refresh(); // actions must see the run's current state, not a stale snapshot
     // composing a steering message captures printable input; esc cancels
     if (this.inputMode !== null) {
       if (data === "\x1b") {
@@ -1026,7 +1029,22 @@ class SubagentViewer {
         const message = this.inputMode.trim();
         this.inputMode = null;
         if (message) {
-          void steerRun(this.meta.id, message).then(() => this.tui.requestRender());
+          if (this.meta.state === "running" && liveRuns.has(this.meta.id)) {
+            void steerRun(this.meta.id, message).then(() => this.tui.requestRender());
+          } else if (this.meta.state === "running" || this.meta.state === "queued") {
+            this.flash = "run is live in another process or session — open it there";
+          } else {
+            this.flash = "continue starting…";
+            void continueRun(this.meta.id, message, undefined, undefined, undefined, this.runsIo, true)
+              .then((outcome) => {
+                this.flash = typeof outcome === "string" ? outcome.split("\n")[0] : null;
+                this.tui.requestRender();
+              })
+              .catch((error: Error) => {
+                this.flash = `continue failed: ${error.message}`;
+                this.tui.requestRender();
+              });
+          }
         }
       } else if (data === "\x7f" || data === "\b") {
         this.inputMode = this.inputMode.slice(0, -1);
@@ -1049,12 +1067,11 @@ class SubagentViewer {
       this.done();
       return true;
     }
-    const live = this.meta.state === "running";
     if (data === "s") {
-      if (live && liveRuns.has(this.meta.id)) {
-        this.inputMode = "";
+      if (this.meta.state === "queued") {
+        this.flash = "run is still queued — not yet steerable";
       } else {
-        this.flash = "steer needs a run that is live in this process";
+        this.inputMode = "";
       }
       this.tui.requestRender();
       return true;
@@ -1146,7 +1163,7 @@ function buildViewerBody(meta: RunMeta): string[] {
 
 let shortcutArmed = false;
 
-async function openChatViewer(ctx: ToolCtx, id?: string): Promise<void> {
+async function openChatViewer(ctx: ToolCtx, id?: string, runsIo?: RunsIo): Promise<void> {
   let targetId = id;
   if (!targetId) {
     const sessionFile = ctx?.sessionManager?.getSessionFile?.();
@@ -1169,7 +1186,7 @@ async function openChatViewer(ctx: ToolCtx, id?: string): Promise<void> {
     return;
   }
   await ctx.ui?.custom?.((tui, _theme, _keybindings, done) =>
-    new SubagentViewer(target, tui as { requestRender: () => void }, done as () => void));
+    new SubagentViewer(target, tui as { requestRender: () => void }, done as () => void, runsIo));
 }
 
 // arm ctrl+alt+s once: opens the chat viewer picker even while a turn runs
@@ -1472,7 +1489,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       const chat = input.match(/^chat(?:\s+(\S+))?$/);
       if (chat) {
         if (ctx.hasUI && ctx.ui?.custom) {
-          await openChatViewer(ctx, chat[1]);
+          await openChatViewer(ctx, chat[1], runsIo);
           return;
         }
         const meta = chat[1] ? readMeta(chat[1]) : null;

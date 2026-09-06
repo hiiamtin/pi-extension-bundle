@@ -727,14 +727,28 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
   viewer.handleInput("\x1b");
   const closedEarly = viewer.render(100).length === 0;
   assert(!closedEarly, "esc while composing must cancel input, not the viewer");
-  // double-D kill
+  // steered run settles as done
+  await waitFor(() => JSON.parse(readFileSync(path.join(stateDir, liveRun.id, "meta.json"), "utf8")).state === "done", 5000);
+  // D on a finished run: hint only, never an accidental kill
   viewer.handleInput("D");
-  viewer.handleInput("D");
-  const killedResult = await livePromise;
-  delete process.env.FAKE_RPC_STEERABLE;
-  delete process.env.FAKE_SUBAGENT_DELAY_MS;
-  assert.equal(killedResult.details?.run?.state, "killed", "double-D must stop the run");
-  viewer.handleInput("\x1b"); // now esc closes (run finished)
+  assert(viewer.render(100).some((line) => line.includes("already finished")), "D on a finished run must hint instead of killing");
+  // s on a finished run: compose → sends a background continue on the same run id
+  viewer.handleInput("s");
+  assert(viewer.render(100).some((line) => line.includes("steer:")), "s on a finished run must open compose for a continue");
+  viewer.handleInput("t");
+  viewer.handleInput("a");
+  viewer.handleInput("l");
+  viewer.handleInput("k");
+  viewer.handleInput("\r");
+  const contMeta = await waitFor(() => {
+    const meta = JSON.parse(readFileSync(path.join(stateDir, liveRun.id, "meta.json"), "utf8"));
+    return meta.state === "running" ? meta : null;
+  }, 5000);
+  await waitFor(() => readFileSync(captureFile, "utf8").includes("Task: talk"), 4000);
+  const contSpawn = readFileSync(captureFile, "utf8").trim().split("\n").map(JSON.parse).filter((event) => event.event === "start").at(-1);
+  assert.equal(contSpawn.args.at(-1), "Task: talk", "continue must carry the composed message");
+  await waitFor(() => JSON.parse(readFileSync(path.join(stateDir, liveRun.id, "meta.json"), "utf8")).state === "done", 8000);
+  viewer.handleInput("\x1b"); // esc closes viewer
 }
 
 console.log("ALL SUBAGENT E2E TESTS PASSED");
