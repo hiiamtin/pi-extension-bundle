@@ -712,9 +712,19 @@ async function runAgent(
         }
       };
       rpcChild.onEvent((event) => {
-        try {
-          appendFileSync(meta.transcriptPath, `${JSON.stringify(event)}\n`);
-        } catch { /* transcript best-effort */ }
+        // transcript.jsonl keeps only the events we consume (activities,
+        // usage, recovery, inspect). message_update floods are streamed
+        // deltas and agent_end embeds the whole message array — keeping them
+        // bloats the file and breaks tail-based readers.
+        const keep = [
+          "agent_start", "turn_start", "turn_end",
+          "tool_execution_start", "tool_execution_end", "message_end",
+        ].includes(event.type);
+        if (keep) {
+          try {
+            appendFileSync(meta.transcriptPath, `${JSON.stringify(event)}\n`);
+          } catch { /* transcript best-effort */ }
+        }
         processEvent(event);
       });
       rpcChild.onStderr((text) => {
@@ -856,28 +866,22 @@ type RunsIo = {
 };
 
 function transcriptTailSummary(meta: RunMeta): string {
-  let transcript = "";
-  try {
-    transcript = readFileSync(meta.transcriptPath, "utf8").slice(-16_000);
-  } catch {
-    return "(no transcript captured)";
-  }
-  const messages: string[] = [];
   let tools = 0;
-  for (const line of transcript.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const event = JSON.parse(line) as Record<string, any>;
-      if (event.type === "tool_execution_start") tools += 1;
-      if (event.type === "message_end" && event.message?.role === "assistant") {
-        const text = assistantText(event.message);
-        if (text) messages.push(text);
-      }
-    } catch { /* skip malformed */ }
-  }
-  const last = messages.at(-1) ?? "(no assistant text)";
-  return `${tools} tool call(s) · last assistant text:
-${last.slice(0, 800)}`;
+  try {
+    const data = readFileSync(meta.transcriptPath, "utf8");
+    for (const line of data.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        if (JSON.parse(line).type === "tool_execution_start") tools += 1;
+      } catch { /* skip malformed */ }
+    }
+  } catch { /* transcript optional */ }
+  let result = "";
+  try {
+    result = readFileSync(meta.resultPath, "utf8").trim();
+  } catch { /* result optional */ }
+  return `${tools} tool call(s) · final result:
+${result.slice(0, 800) || "(no output)"}`;
 }
 
 function collectDoctorReport(cwd: string, ctx: ToolCtx | undefined): string[] {

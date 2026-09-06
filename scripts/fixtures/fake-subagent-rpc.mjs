@@ -56,6 +56,10 @@ const assistantMessage = (text, stopReason = "stop") => ({
 const emitTurn = (text) => {
   out({ type: "turn_start" });
   out({ type: "tool_execution_start", toolCallId: "fake-tool-1", toolName: "read", args: { path: "README.md" } });
+  // stream noise: deltas + message_start — the parent must NOT persist these
+  for (let i = 0; i < 120; i++) out({ type: "message_update", delta: `chunk-${i}-${"x".repeat(60)}` });
+  out({ type: "message_start", message: { role: "assistant", content: [] } });
+  out({ type: "tool_execution_end", toolCallId: "fake-tool-1", status: "success" });
   out({ type: "message_end", message: assistantMessage(text) });
   out({ type: "turn_end" });
 };
@@ -113,5 +117,13 @@ process.stdin.on("data", (chunk) => {
     }
   }
 });
-process.stdin.on("end", () => { exiting = true; capture("end"); process.exit(0); });
+process.stdin.on("end", () => {
+  if (!exiting) {
+    out({ type: "agent_end", messages: [assistantMessage(finalText())], note: "large payload line" });
+    out({ type: "agent_settled" });
+  }
+  exiting = true;
+  capture("end");
+  process.exit(0);
+});
 process.on("SIGTERM", () => { exiting = true; capture("sigterm"); process.exit(1); });

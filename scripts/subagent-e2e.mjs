@@ -542,7 +542,13 @@ assert.equal(hungContinue.details?.run?.state, "done");
 // /subagents inspect: transcript view for finished runs
 notices.length = 0;
 await commands.subagents.handler(`inspect ${steeredResult.details.run.id}`, ctx);
-assert(notices.some((notice) => /STEER-PIVOTED|inspect/.test(notice.message)), "inspect must surface the run transcript tail");
+const inspectNotice = notices.map((notice) => notice.message).join("\n");
+assert.match(inspectNotice, /STEER-PIVOTED/, "inspect must show the final result text");
+assert.match(inspectNotice, /1 tool call\(s\)/, "inspect must count tool calls from the transcript");
+const steerTranscript = readFileSync(path.join(stateDir, steeredResult.details.run.id, "transcript.jsonl"), "utf8");
+assert(!steerTranscript.includes("message_update"), "transcript must exclude streamed deltas");
+assert(!steerTranscript.includes("agent_end"), "transcript must exclude oversized agent_end payloads");
+assert(steerTranscript.includes("tool_execution_start"), "transcript must keep consumed events");
 
 // /subagents doctor: environment health report
 notices.length = 0;
