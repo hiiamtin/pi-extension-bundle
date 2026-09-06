@@ -93,6 +93,7 @@ process.stdin.on("data", (chunk) => {
       out({ type: "message_end", message: { role: "user", content: [{ type: "text", text: lastPrompt }], timestamp: Date.now() } });
       runTurn(finalText());
     } else if (cmd.type === "steer") {
+      capture("steer", { message: String(cmd.message ?? "") });
       respond(cmd, true);
       if (process.env.FAKE_RPC_STEERABLE !== "1") continue; // wrap-up steers are silent here
       if (turnTimer) { clearTimeout(turnTimer); turnTimer = null; } // pivot abandons the in-flight turn

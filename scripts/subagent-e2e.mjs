@@ -681,5 +681,65 @@ notices.length = 0;
 await commands.subagents.handler(`chat ${steeredResult.details.run.id}`, { ...ctx, hasUI: false });
 assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fallback must keep working");
 
+// P4: global shortcut matcher + in-viewer steer/kill
+{
+  const matches = mod.matchesViewerShortcut;
+  assert.equal(matches("\x1b\x13"), true, "ESC-prefixed ctrl+s must match");
+  assert.equal(matches("\x1b[115;6u"), true, "kitty ctrl+alt+s must match");
+  assert.equal(matches("q"), false, "printable keys must never match");
+  assert.equal(matches("\x1b[B"), false, "arrow sequences must never match");
+  assert.equal(matches("\x13"), false, "bare ctrl+s (XOFF) must not be hijacked");
+}
+
+// in-viewer actions: s = steer a live child, D×2 = stop the run
+{
+  const customCalls = [];
+  const fakeTheme = { fg: (_k, t) => t, bold: (t) => t };
+  const actionCtx = {
+    ...ctx,
+    hasUI: true,
+    ui: {
+      notify: (message, level) => notices.push({ message, level }),
+      select: async (_title, options) => options[0],
+      custom: async (factory) => {
+        customCalls.push(factory);
+        return undefined;
+      },
+    },
+  };
+  writeFileSync(captureFile, "");
+  process.env.FAKE_RPC_STEERABLE = "1";
+  process.env.FAKE_SUBAGENT_DELAY_MS = "2500";
+  const livePromise = tool.execute("action-live", { agent: "scout", task: "viewer actions run" }, undefined, undefined, ctx);
+  const liveRun = await waitFor(() => readdirSync(stateDir)
+    .map((entry) => JSON.parse(readFileSync(path.join(stateDir, entry, "meta.json"), "utf8")))
+    .find((meta) => meta.task === "viewer actions run" && meta.state === "running"));
+  // steer via s + typed text + enter
+  customCalls.length = 0;
+  await commands.subagents.handler(`chat ${liveRun.id}`, actionCtx);
+  const viewer = customCalls[0]({ requestRender: () => {} }, fakeTheme, {}, () => {});
+  viewer.handleInput("s");
+  viewer.handleInput("p");
+  viewer.handleInput("i");
+  viewer.handleInput("v");
+  viewer.handleInput("\r");
+  await waitFor(() => readFileSync(captureFile, "utf8").includes('"steer"'), 4000);
+  const steerEvent = readFileSync(captureFile, "utf8").trim().split("\n").map(JSON.parse).find((event) => event.event === "steer");
+  assert.equal(steerEvent.message, "piv");
+  // esc inside input mode cancels input (does not close the viewer)
+  viewer.handleInput("s");
+  viewer.handleInput("\x1b");
+  const closedEarly = viewer.render(100).length === 0;
+  assert(!closedEarly, "esc while composing must cancel input, not the viewer");
+  // double-D kill
+  viewer.handleInput("D");
+  viewer.handleInput("D");
+  const killedResult = await livePromise;
+  delete process.env.FAKE_RPC_STEERABLE;
+  delete process.env.FAKE_SUBAGENT_DELAY_MS;
+  assert.equal(killedResult.details?.run?.state, "killed", "double-D must stop the run");
+  viewer.handleInput("\x1b"); // now esc closes (run finished)
+}
+
 console.log("ALL SUBAGENT E2E TESTS PASSED");
 rmSync(root, { recursive: true, force: true });

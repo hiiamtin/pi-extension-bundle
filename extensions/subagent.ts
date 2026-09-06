@@ -176,7 +176,7 @@ type ToolCtx = {
   hasUI?: boolean;
   isProjectTrusted?: () => boolean;
   sessionManager?: { getSessionFile?: () => string | undefined };
-  ui?: { notify?: (message: string, level: string) => void; confirm?: (title: string, message: string) => Promise<boolean> };
+  ui?: { notify?: (message: string, level: string) => void; confirm?: (title: string, message: string) => Promise<boolean>; onTerminalInput?: (handler: (data: string) => boolean) => (() => void) | void };
 };
 
 type OnUpdate = (result: {
@@ -954,6 +954,18 @@ function inspectFinishedSummary(meta: RunMeta): string {
 // a fixed body height and scrolls internally
 const VIEWER_ROWS = 14;
 
+// global viewer shortcut: ctrl+alt+s — encodings vary by terminal protocol
+// (ESC-prefixed legacy, kitty CSI-u). Bare ctrl+s (XOFF) is never hijacked.
+export function matchesViewerShortcut(data: string): boolean {
+  return data === "\x1b\x13" || data === "\x1b[115;6u" || data === "\x1b[115;7u";
+}
+
+function killRunNow(meta: RunMeta): void {
+  writeMeta({ ...meta, state: "killed" });
+  mergeMeta(meta.id, (current) => ({ ...current, state: "killed" }));
+  if (meta.state === "running") killProcessGroup(meta);
+}
+
 class SubagentViewer {
   private meta: RunMeta;
   private tui: { requestRender: () => void };
@@ -962,6 +974,9 @@ class SubagentViewer {
   private scrollTop = 0;
   private follow = true;
   private timer: NodeJS.Timeout | null = null;
+  private inputMode: string | null = null;
+  private killArmedAt = 0;
+  private flash: string | null = null;
 
   constructor(meta: RunMeta, tui: { requestRender: () => void }, done: () => void) {
     this.meta = meta;
@@ -1006,6 +1021,24 @@ class SubagentViewer {
       ? raw
       : String((raw as { sequence?: string; name?: string } | undefined)?.sequence ?? (raw as { name?: string } | undefined)?.name ?? "");
     const max = Math.max(0, this.lines.length - VIEWER_ROWS);
+    // composing a steering message captures printable input; esc cancels
+    if (this.inputMode !== null) {
+      if (data === "\x1b") {
+        this.inputMode = null;
+      } else if (data === "\r" || data === "\n") {
+        const message = this.inputMode.trim();
+        this.inputMode = null;
+        if (message) {
+          void steerRun(this.meta.id, message).then(() => this.tui.requestRender());
+        }
+      } else if (data === "\x7f" || data === "\b") {
+        this.inputMode = this.inputMode.slice(0, -1);
+      } else if (data && !data.startsWith("\x1b")) {
+        this.inputMode += data;
+      }
+      this.tui.requestRender();
+      return true;
+    }
     // bare ESC = escape key (any longer sequence starting with ESC is a key
     // like an arrow — fall through to the sequence table below)
     if (data === "\x1b" || data === "q") {
@@ -1017,6 +1050,30 @@ class SubagentViewer {
       // ctrl+c must never be swallowed by the viewer
       this.stopTimer();
       this.done();
+      return true;
+    }
+    const live = this.meta.state === "running";
+    if (data === "s") {
+      if (live && liveRuns.has(this.meta.id)) {
+        this.inputMode = "";
+      } else {
+        this.flash = "steer needs a run that is live in this process";
+      }
+      this.tui.requestRender();
+      return true;
+    }
+    if (data === "D") {
+      if (this.meta.state !== "running" && this.meta.state !== "queued") {
+        this.flash = "run already finished";
+      } else if (Date.now() - this.killArmedAt < 5_000) {
+        this.killArmedAt = 0;
+        this.flash = null;
+        killRunNow(this.meta);
+      } else {
+        this.killArmedAt = Date.now();
+        this.flash = "press D again to STOP this run";
+      }
+      this.tui.requestRender();
       return true;
     }
     if (data === "j" || data === "\x1b[B") {
@@ -1051,7 +1108,11 @@ class SubagentViewer {
     const visible = this.lines.slice(this.scrollTop, this.scrollTop + VIEWER_ROWS);
     const padded = [...visible];
     while (padded.length < VIEWER_ROWS) padded.push("");
-    const footer = "\x1b[2m↑↓/jk scroll · g/G top/end · esc/q back\x1b[0m";
+    const footer = this.inputMode !== null
+      ? `\x1b[1;36msteer:\x1b[0m ${this.inputMode}\x1b[2m▏ · enter send · esc cancel\x1b[0m`
+      : this.flash
+        ? `\x1b[1;33m${this.flash}\x1b[0m`
+        : "\x1b[2m↑↓/jk scroll · g/G top/end · s steer · D stop · esc/q back\x1b[0m";
     return [header, ...padded, footer].map((line) => truncateToWidth(line, width));
   }
 }
@@ -1084,6 +1145,45 @@ function buildViewerBody(meta: RunMeta): string[] {
   } catch { /* transcript optional */ }
   if (!lines.length) lines.push("(no dialogue captured)");
   return lines;
+}
+
+let shortcutArmed = false;
+
+async function openChatViewer(ctx: ToolCtx, id?: string): Promise<void> {
+  let targetId = id;
+  if (!targetId) {
+    const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+    const metas = listMetas();
+    const owned = sessionFile ? metas.filter((run) => run.ownerSession === sessionFile) : [];
+    const pool = (owned.length ? owned : metas).slice(0, 20);
+    if (!pool.length) {
+      ctx.ui?.notify?.("no subagent runs yet", "warning");
+      return;
+    }
+    const labels = pool.map((run) => `${run.id} · ${run.agent} · ${run.state} · ${run.task.slice(0, 44)}`);
+    const picked = await ctx.ui?.select?.("Subagent runs — pick one to view:", labels);
+    const chosen = pool[labels.indexOf(picked ?? "")];
+    if (!chosen) return;
+    targetId = chosen.id;
+  }
+  const target = readMeta(targetId);
+  if (!target) {
+    ctx.ui?.notify?.(`run '${targetId}' not found`, "warning");
+    return;
+  }
+  await ctx.ui?.custom?.((tui, _theme, _keybindings, done) =>
+    new SubagentViewer(target, tui as { requestRender: () => void }, done as () => void));
+}
+
+// arm ctrl+alt+s once: opens the chat viewer picker even while a turn runs
+function armViewerShortcut(ctx: ToolCtx): void {
+  if (shortcutArmed || !ctx.hasUI || !ctx.ui?.onTerminalInput) return;
+  shortcutArmed = true;
+  ctx.ui.onTerminalInput((data: string) => {
+    if (!matchesViewerShortcut(data)) return false;
+    void openChatViewer(ctx);
+    return true;
+  });
 }
 
 function collectDoctorReport(cwd: string, ctx: ToolCtx | undefined): string[] {
@@ -1370,39 +1470,17 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       }
       const chat = input.match(/^chat(?:\s+(\S+))?$/);
       if (chat) {
-        const id = chat[1];
+        armViewerShortcut(ctx);
         if (ctx.hasUI && ctx.ui?.custom) {
-          let targetId = id;
-          if (!targetId) {
-            const sessionFile = ctx?.sessionManager?.getSessionFile?.();
-            const metas = listMetas();
-            const owned = sessionFile ? metas.filter((run) => run.ownerSession === sessionFile) : [];
-            const pool = (owned.length ? owned : metas).slice(0, 20);
-            if (!pool.length) {
-              ctx.ui?.notify?.("no subagent runs yet", "warning");
-              return;
-            }
-            const labels = pool.map((run) => `${run.id} · ${run.agent} · ${run.state} · ${run.task.slice(0, 44)}`);
-            const picked = await ctx.ui.select?.("Subagent runs — pick one to view:", labels);
-            const chosen = pool[labels.indexOf(picked ?? "")];
-            if (!chosen) return;
-            targetId = chosen.id;
-          }
-          const target = readMeta(targetId);
-          if (!target) {
-            ctx.ui?.notify?.(`run '${targetId}' not found`, "warning");
-            return;
-          }
-          await ctx.ui.custom((tui, _theme, _keybindings, done) =>
-            new SubagentViewer(target, tui as { requestRender: () => void }, done as () => void));
+          await openChatViewer(ctx, chat[1]);
           return;
         }
-        const meta = id ? readMeta(id) : null;
+        const meta = chat[1] ? readMeta(chat[1]) : null;
         if (!meta) {
-          ctx.ui?.notify?.(id ? `run '${id}' not found` : "no run id given (and no TUI available)", "warning");
+          ctx.ui?.notify?.(chat[1] ? `run '${chat[1]}' not found` : "no run id given (and no TUI available)", "warning");
           return;
         }
-        ctx.ui?.notify?.(`chat of ${id} · ${meta.agent}\n\n${chatTranscript(meta)}`, "info");
+        ctx.ui?.notify?.(`chat of ${chat[1]} · ${meta.agent}\n\n${chatTranscript(meta)}`, "info");
         return;
       }
       if (input === "doctor") {
