@@ -998,8 +998,10 @@ class SubagentViewer {
     this.scrollTop = Math.min(this.scrollTop, max);
   }
 
-  onKey = (key: unknown): boolean => {
-    const name = typeof key === "string" ? key : (key as { name?: string } | undefined)?.name;
+  handleInput = (data: unknown): boolean => {
+    const key = data as { name?: string; shift?: boolean } | string | undefined;
+    const name = typeof key === "string" ? key : key?.name;
+    const shift = typeof key === "object" && key !== null ? key.shift === true : false;
     const max = Math.max(0, this.lines.length - VIEWER_ROWS);
     if (name === "escape" || name === "q") {
       this.stopTimer();
@@ -1011,16 +1013,18 @@ class SubagentViewer {
       this.scrollTop = Math.min(max, this.scrollTop + 1);
     } else if (name === "up" || name === "k") {
       this.scrollTop = Math.max(0, this.scrollTop - 1);
-    } else if (name === "pageup") {
+    } else if (name === "pageUp") {
       this.scrollTop = Math.max(0, this.scrollTop - VIEWER_ROWS);
-    } else if (name === "pagedown" || name === " ") {
+    } else if (name === "pageDown" || name === "space") {
       this.scrollTop = Math.min(max, this.scrollTop + VIEWER_ROWS);
-    } else if (name === "g" || name === "home") {
+    } else if (name === "g" && !shift) {
       this.follow = false;
       this.scrollTop = 0;
-    } else if (name === "G" || name === "end") {
+    } else if ((name === "g" && shift) || name === "G" || name === "end") {
       this.follow = true;
       this.scrollTop = max;
+    } else {
+      return false; // unhandled — let pi's default handling see it
     }
     this.tui.requestRender();
     return true;
@@ -1278,7 +1282,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       if (!normalized.includes(" ")) {
         const commands = ["list", "cont", "kill", "steer", "inspect", "chat", "doctor"]
           .filter((value) => value.startsWith(normalized))
-          .map((value) => ({ value, label: `${value} — ${{ list: "List runs", cont: "Continue a finished run", kill: "Stop a run", steer: "Redirect a running run", inspect: "View a run transcript", doctor: "Check environment health" }[value]}` }));
+          .map((value) => ({ value, label: `${value} — ${{ list: "List runs", cont: "Continue a finished run", kill: "Stop a run", steer: "Redirect a running run", inspect: "View a run report", chat: "Open a run's chat viewer", doctor: "Check environment health" }[value]}` }));
         return commands.length ? commands : null;
       }
       const match = normalized.match(/^(cont|kill|steer)\s+(\S*)$/);
