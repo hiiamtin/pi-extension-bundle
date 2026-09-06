@@ -72,6 +72,7 @@ if (!existsSync(typeboxTarget)) symlinkSync(path.join(piRoot, "node_modules", "t
 
 const registered = {};
 const commands = {};
+const shortcuts = [];
 const hooks = {};
 const mod = await import(path.join(pkgRoot, "extensions", "subagent.ts"));
 mod.default({
@@ -79,6 +80,7 @@ mod.default({
   registerTool: (tool) => (registered[tool.name] = tool),
   registerCommand: (name, command) => (commands[name] = command),
   on: (name, handler) => { (hooks[name] ??= []).push(handler); },
+  registerShortcut: (shortcut, opts) => { (shortcuts ??= []).push({ shortcut, opts }); },
 });
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -99,6 +101,8 @@ assert.match(tool.description, /depends on an earlier result/i, "tool schema mus
 assert.equal(tool.promptSnippet, undefined, "parallel guidance belongs in the tool description only");
 assert.equal(tool.promptGuidelines, undefined, "parallel guidance must not duplicate system-prompt text");
 assert(commands.subagents, "/subagents command must be registered");
+const viewerShortcut = shortcuts.find((entry) => entry.shortcut === "ctrl+alt+s");
+assert(viewerShortcut, "ctrl+alt+s must be registered for the chat viewer");
 
 const notices = [];
 const ctx = {
@@ -373,6 +377,7 @@ mod.default({
   registerTool: (t) => (registered.subagent = t),
   registerCommand: (n, c) => (commands[n] = c),
   on: (name, handler) => { (hooks[name] ??= []).push(handler); },
+  registerShortcut: (shortcut, opts) => { (shortcuts ??= []).push({ shortcut, opts }); },
   sendMessage: (message, opts) => bgNotices.push({ message, opts }),
 });
 
@@ -580,6 +585,7 @@ mod.default({
   registerTool: (t) => (registered.subagent = t),
   registerCommand: (n, c) => (commands[n] = c),
   on: (name, handler) => { (hooks[name] ??= []).push(handler); },
+  registerShortcut: (shortcut, opts) => { (shortcuts ??= []).push({ shortcut, opts }); },
   events: { emit: (name, data) => lifecycleEvents.push({ name, data }) },
 });
 writeFileSync(captureFile, "");
@@ -680,16 +686,6 @@ assert(!bgNotices.some((notice) => String(notice.message?.content ?? "").include
 notices.length = 0;
 await commands.subagents.handler(`chat ${steeredResult.details.run.id}`, { ...ctx, hasUI: false });
 assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fallback must keep working");
-
-// P4: global shortcut matcher + in-viewer steer/kill
-{
-  const matches = mod.matchesViewerShortcut;
-  assert.equal(matches("\x1b\x13"), true, "ESC-prefixed ctrl+s must match");
-  assert.equal(matches("\x1b[115;6u"), true, "kitty ctrl+alt+s must match");
-  assert.equal(matches("q"), false, "printable keys must never match");
-  assert.equal(matches("\x1b[B"), false, "arrow sequences must never match");
-  assert.equal(matches("\x13"), false, "bare ctrl+s (XOFF) must not be hijacked");
-}
 
 // in-viewer actions: s = steer a live child, D×2 = stop the run
 {

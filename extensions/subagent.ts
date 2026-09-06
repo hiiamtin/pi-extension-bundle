@@ -176,7 +176,7 @@ type ToolCtx = {
   hasUI?: boolean;
   isProjectTrusted?: () => boolean;
   sessionManager?: { getSessionFile?: () => string | undefined };
-  ui?: { notify?: (message: string, level: string) => void; confirm?: (title: string, message: string) => Promise<boolean>; onTerminalInput?: (handler: (data: string) => boolean) => (() => void) | void };
+  ui?: { notify?: (message: string, level: string) => void; confirm?: (title: string, message: string) => Promise<boolean> };
 };
 
 type OnUpdate = (result: {
@@ -954,11 +954,8 @@ function inspectFinishedSummary(meta: RunMeta): string {
 // a fixed body height and scrolls internally
 const VIEWER_ROWS = 14;
 
-// global viewer shortcut: ctrl+alt+s — encodings vary by terminal protocol
-// (ESC-prefixed legacy, kitty CSI-u). Bare ctrl+s (XOFF) is never hijacked.
-export function matchesViewerShortcut(data: string): boolean {
-  return data === "\x1b\x13" || data === "\x1b[115;6u" || data === "\x1b[115;7u";
-}
+// global viewer shortcut — registered via pi.registerShortcut so key parsing
+// is pi's problem (works across terminals); armed from startup, not lazily.
 
 function killRunNow(meta: RunMeta): void {
   writeMeta({ ...meta, state: "killed" });
@@ -1176,14 +1173,17 @@ async function openChatViewer(ctx: ToolCtx, id?: string): Promise<void> {
 }
 
 // arm ctrl+alt+s once: opens the chat viewer picker even while a turn runs
-function armViewerShortcut(ctx: ToolCtx): void {
-  if (shortcutArmed || !ctx.hasUI || !ctx.ui?.onTerminalInput) return;
+function armViewerShortcut(pi: ExtensionAPI): void {
+  if (shortcutArmed) return;
   shortcutArmed = true;
-  ctx.ui.onTerminalInput((data: string) => {
-    if (!matchesViewerShortcut(data)) return false;
-    void openChatViewer(ctx);
-    return true;
-  });
+  try {
+    pi.registerShortcut?.("ctrl+alt+s", {
+      description: "Open subagent chat viewer",
+      handler: async (ctx: ToolCtx) => {
+        await openChatViewer(ctx);
+      },
+    });
+  } catch { /* shortcuts must never break startup */ }
 }
 
 function collectDoctorReport(cwd: string, ctx: ToolCtx | undefined): string[] {
@@ -1240,6 +1240,7 @@ function collectDoctorReport(cwd: string, ctx: ToolCtx | undefined): string[] {
 export default function subagentExtension(pi: ExtensionAPI): void {
   mkdirSync(STATE_DIR, { recursive: true });
   captureExtensionApi(pi);
+  armViewerShortcut(pi);
   emitLifecycle = (event, data) => {
     try {
       (pi as { events?: { emit?: (name: string, payload: unknown) => void } }).events?.emit?.(event, data);
@@ -1470,7 +1471,6 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       }
       const chat = input.match(/^chat(?:\s+(\S+))?$/);
       if (chat) {
-        armViewerShortcut(ctx);
         if (ctx.hasUI && ctx.ui?.custom) {
           await openChatViewer(ctx, chat[1]);
           return;
