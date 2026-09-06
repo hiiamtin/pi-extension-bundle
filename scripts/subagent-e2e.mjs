@@ -539,12 +539,17 @@ assert.equal(hung.details?.run?.state, "timeout");
 const hungContinue = await tool.execute("resume-hang", { continue: hung.details.run.id, task: "finish it" }, undefined, undefined, ctx);
 assert.equal(hungContinue.details?.run?.state, "done");
 
-// /subagents inspect: transcript view for finished runs
+// /subagents inspect: full report for finished runs
 notices.length = 0;
 await commands.subagents.handler(`inspect ${steeredResult.details.run.id}`, ctx);
 const inspectNotice = notices.map((notice) => notice.message).join("\n");
 assert.match(inspectNotice, /STEER-PIVOTED/, "inspect must show the final result text");
-assert.match(inspectNotice, /1 tool call\(s\)/, "inspect must count tool calls from the transcript");
+assert.match(inspectNotice, /timeline:/, "inspect must include a tool-call timeline");
+assert.match(inspectNotice, /1\.\s*read/, "timeline entries must list tool names in order");
+assert.match(inspectNotice, /task:/, "inspect must show the delegated task");
+assert.match(inspectNotice, /usage:/, "inspect must show usage totals");
+assert.match(inspectNotice, /transcript:/, "inspect must point at the transcript on disk");
+assert.match(inspectNotice, /final result:/, "inspect must show the final result");
 const steerTranscript = readFileSync(path.join(stateDir, steeredResult.details.run.id, "transcript.jsonl"), "utf8");
 assert(!steerTranscript.includes("message_update"), "transcript must exclude streamed deltas");
 assert(!steerTranscript.includes("agent_end"), "transcript must exclude oversized agent_end payloads");

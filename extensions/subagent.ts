@@ -865,23 +865,46 @@ type RunsIo = {
   remove?: (id: string) => void;
 };
 
-function transcriptTailSummary(meta: RunMeta): string {
-  let tools = 0;
+function transcriptTimeline(meta: RunMeta, limit = 12): string[] {
+  const entries: string[] = [];
   try {
-    const data = readFileSync(meta.transcriptPath, "utf8");
-    for (const line of data.split("\n")) {
+    for (const line of readFileSync(meta.transcriptPath, "utf8").split("\n")) {
       if (!line.trim()) continue;
       try {
-        if (JSON.parse(line).type === "tool_execution_start") tools += 1;
+        const event = JSON.parse(line) as Record<string, any>;
+        if (event.type === "tool_execution_start") {
+          entries.push(`${entries.length + 1}. ${String(event.toolName ?? "tool")} ${JSON.stringify(event.args ?? {}).slice(0, 100)}`);
+        }
       } catch { /* skip malformed */ }
     }
   } catch { /* transcript optional */ }
+  if (entries.length > limit) {
+    const hidden = entries.length - limit;
+    return [...entries.slice(0, limit), `… +${hidden} more`];
+  }
+  return entries;
+}
+
+function inspectFinishedSummary(meta: RunMeta): string {
+  const end = meta.finishedAt ?? Date.now();
+  const duration = fmtDur(end - (meta.startedAt ?? meta.createdAt));
+  const tokens = meta.usage.totalTokens || meta.usage.input + meta.usage.cacheRead + meta.usage.output;
+  const usage = `${meta.usage.turns} turns · ${tokens} tok · $${meta.usage.cost.toFixed(4)}`;
+  const timeline = transcriptTimeline(meta);
+  const timelineBlock = timeline.length ? [`timeline:`, ...timeline.map((entry) => `  ${entry}`)] : ["timeline: (no tool calls)"];
   let result = "";
-  try {
-    result = readFileSync(meta.resultPath, "utf8").trim();
-  } catch { /* result optional */ }
-  return `${tools} tool call(s) · final result:
-${result.slice(0, 800) || "(no output)"}`;
+  try { result = readFileSync(meta.resultPath, "utf8").trim(); } catch { /* optional */ }
+  return [
+    `run ${meta.id} · ${meta.agent} · ${meta.state} · ${duration}`,
+    `model: ${meta.model ?? "(child-reported)"}`,
+    `usage: ${usage}`,
+    `task: ${meta.task.slice(0, 120)}`,
+    ...timelineBlock,
+    `final result:`,
+    result.slice(0, 1_600) || "(no output)",
+    `transcript: ${meta.transcriptPath}`,
+    `session: ${meta.sessionFile}`,
+  ].join("\n");
 }
 
 function collectDoctorReport(cwd: string, ctx: ToolCtx | undefined): string[] {
@@ -1163,7 +1186,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
           ctx.ui?.notify?.(`run '${id}' not found`, "warning");
           return;
         }
-        ctx.ui?.notify?.(`run ${id} · ${meta.agent} · ${meta.state}\n${transcriptTailSummary(meta)}`, "info");
+        ctx.ui?.notify?.(inspectFinishedSummary(meta), "info");
         return;
       }
       if (input === "doctor") {
