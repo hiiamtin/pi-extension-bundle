@@ -5,7 +5,7 @@
 // skills, and MCP servers back in. See docs/subagent.md.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { hyperlink, Text } from "@earendil-works/pi-tui";
+import { hyperlink, Text, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { parse as parseYaml } from "yaml";
 import { spawn } from "node:child_process";
@@ -894,6 +894,13 @@ function messageText(message: Record<string, any> | undefined): string {
     .trim();
 }
 
+// speaker colors for chat rendering — the notify channel wraps the whole
+// message in theme dim, so embedded SGR codes make labels pop and bodies fall
+// back to normal weight. Honors NO_COLOR.
+const CHAT_STYLE = process.env.NO_COLOR
+  ? { user: "", agent: "", dim: "", reset: "" }
+  : { user: "\x1b[1;36m", agent: "\x1b[1;35m", dim: "\x1b[2m", reset: "\x1b[0m" };
+
 function chatTranscript(meta: RunMeta, perMessageCap = 500, totalCap = 4_000): string {
   const turns: string[] = [];
   try {
@@ -906,15 +913,18 @@ function chatTranscript(meta: RunMeta, perMessageCap = 500, totalCap = 4_000): s
         if (role !== "user" && role !== "assistant") continue;
         const text = messageText(event.message);
         if (!text) continue;
-        const label = role === "user" ? "you" : meta.agent;
+        const label = role === "user"
+          ? `${CHAT_STYLE.user}you:${CHAT_STYLE.reset}`
+          : `${CHAT_STYLE.agent}${meta.agent}:${CHAT_STYLE.reset}`;
         const body = text.length <= perMessageCap ? text : `${text.slice(0, perMessageCap)}…`;
-        turns.push(`${label}: ${body}`);
+        turns.push(`${label} ${body}`);
       } catch { /* skip malformed */ }
     }
   } catch { /* transcript optional */ }
   if (!turns.length) return "(no dialogue captured — run may predate rpc mode)";
-  let out = turns.join("\n\n");
-  if (out.length > totalCap) out = `${out.slice(0, totalCap)}…\n(full history: ${meta.sessionFile})`;
+  const separator = `\n\n${CHAT_STYLE.dim}──────${CHAT_STYLE.reset}\n\n`;
+  let out = turns.join(separator);
+  if (out.length > totalCap) out = `${out.slice(0, totalCap)}…\n${CHAT_STYLE.dim}(full history: ${meta.sessionFile})${CHAT_STYLE.reset}`;
   return out;
 }
 
@@ -938,6 +948,127 @@ function inspectFinishedSummary(meta: RunMeta): string {
     `transcript: ${meta.transcriptPath}`,
     `session: ${meta.sessionFile}`,
   ].join("\n");
+}
+
+// viewer constants — the chat viewer docks where the editor is, so it keeps
+// a fixed body height and scrolls internally
+const VIEWER_ROWS = 14;
+
+class SubagentViewer {
+  private meta: RunMeta;
+  private tui: { requestRender: () => void };
+  private done: () => void;
+  private lines: string[] = [];
+  private scrollTop = 0;
+  private follow = true;
+  private timer: NodeJS.Timeout | null = null;
+
+  constructor(meta: RunMeta, tui: { requestRender: () => void }, done: () => void) {
+    this.meta = meta;
+    this.tui = tui;
+    this.done = done;
+    this.refresh();
+    if (meta.state === "running" || meta.state === "queued") {
+      this.timer = setInterval(() => {
+        const fresh = readMeta(this.meta.id);
+        if (fresh) this.meta = fresh;
+        this.refresh();
+        if (this.meta.state !== "running" && this.meta.state !== "queued") this.stopTimer();
+        this.tui.requestRender();
+      }, 1_000);
+      this.timer.unref?.();
+    }
+  }
+
+  private stopTimer(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+
+  dispose(): void {
+    this.stopTimer();
+  }
+
+  private refresh(): void {
+    this.lines = buildViewerBody(this.meta);
+    const max = Math.max(0, this.lines.length - VIEWER_ROWS);
+    if (this.follow) this.scrollTop = max;
+    this.scrollTop = Math.min(this.scrollTop, max);
+  }
+
+  onKey = (key: unknown): boolean => {
+    const name = typeof key === "string" ? key : (key as { name?: string } | undefined)?.name;
+    const max = Math.max(0, this.lines.length - VIEWER_ROWS);
+    if (name === "escape" || name === "q") {
+      this.stopTimer();
+      this.done();
+      return true;
+    }
+    if (name === "down" || name === "j") {
+      this.follow = false;
+      this.scrollTop = Math.min(max, this.scrollTop + 1);
+    } else if (name === "up" || name === "k") {
+      this.scrollTop = Math.max(0, this.scrollTop - 1);
+    } else if (name === "pageup") {
+      this.scrollTop = Math.max(0, this.scrollTop - VIEWER_ROWS);
+    } else if (name === "pagedown" || name === " ") {
+      this.scrollTop = Math.min(max, this.scrollTop + VIEWER_ROWS);
+    } else if (name === "g" || name === "home") {
+      this.follow = false;
+      this.scrollTop = 0;
+    } else if (name === "G" || name === "end") {
+      this.follow = true;
+      this.scrollTop = max;
+    }
+    this.tui.requestRender();
+    return true;
+  };
+
+  render(width: number): string[] {
+    this.refresh();
+    const max = Math.max(0, this.lines.length - VIEWER_ROWS);
+    if (this.follow) this.scrollTop = max;
+    this.scrollTop = Math.min(this.scrollTop, max);
+    const live = this.meta.state === "running" || this.meta.state === "queued" ? " · \x1b[1;33mLIVE\x1b[0m" : "";
+    const header = `\x1b[1msubagent viewer\x1b[0m ${this.meta.id} · ${this.meta.agent} · ${this.meta.state}${live}`;
+    const visible = this.lines.slice(this.scrollTop, this.scrollTop + VIEWER_ROWS);
+    const padded = [...visible];
+    while (padded.length < VIEWER_ROWS) padded.push("");
+    const footer = "\x1b[2m↑↓/jk scroll · g/G top/end · esc/q back\x1b[0m";
+    return [header, ...padded, footer].map((line) => truncateToWidth(line, width));
+  }
+}
+
+function buildViewerBody(meta: RunMeta): string[] {
+  const lines: string[] = [];
+  try {
+    for (const line of readFileSync(meta.transcriptPath, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      let event: Record<string, any>;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (event.type === "tool_execution_start") {
+        lines.push(`${CHAT_STYLE.dim}  · ${String(event.toolName ?? "tool")} ${JSON.stringify(event.args ?? {}).slice(0, 90)}${CHAT_STYLE.reset}`);
+      } else if (event.type === "message_end") {
+        const role = event.message?.role;
+        if (role !== "user" && role !== "assistant") continue;
+        const text = messageText(event.message);
+        if (!text) continue;
+        const label = role === "user"
+          ? `${CHAT_STYLE.user}you:${CHAT_STYLE.reset}`
+          : `${CHAT_STYLE.agent}${meta.agent}:${CHAT_STYLE.reset}`;
+        const textLines = text.split("\n");
+        textLines.forEach((chunk, index) => lines.push(index === 0 ? `${label} ${chunk}` : `  ${chunk}`));
+      }
+    }
+  } catch { /* transcript optional */ }
+  if (!lines.length) lines.push("(no dialogue captured)");
+  return lines;
 }
 
 function collectDoctorReport(cwd: string, ctx: ToolCtx | undefined): string[] {
@@ -1222,12 +1353,38 @@ export default function subagentExtension(pi: ExtensionAPI): void {
         ctx.ui?.notify?.(inspectFinishedSummary(meta), "info");
         return;
       }
-      const chat = input.match(/^chat\s+(\S+)$/);
+      const chat = input.match(/^chat(?:\s+(\S+))?$/);
       if (chat) {
-        const [, id] = chat;
-        const meta = readMeta(id);
+        const id = chat[1];
+        if (ctx.hasUI && ctx.ui?.custom) {
+          let targetId = id;
+          if (!targetId) {
+            const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+            const metas = listMetas();
+            const owned = sessionFile ? metas.filter((run) => run.ownerSession === sessionFile) : [];
+            const pool = (owned.length ? owned : metas).slice(0, 20);
+            if (!pool.length) {
+              ctx.ui?.notify?.("no subagent runs yet", "warning");
+              return;
+            }
+            const labels = pool.map((run) => `${run.id} · ${run.agent} · ${run.state} · ${run.task.slice(0, 44)}`);
+            const picked = await ctx.ui.select?.("Subagent runs — pick one to view:", labels);
+            const chosen = pool[labels.indexOf(picked ?? "")];
+            if (!chosen) return;
+            targetId = chosen.id;
+          }
+          const target = readMeta(targetId);
+          if (!target) {
+            ctx.ui?.notify?.(`run '${targetId}' not found`, "warning");
+            return;
+          }
+          await ctx.ui.custom((tui, _theme, _keybindings, done) =>
+            new SubagentViewer(target, tui as { requestRender: () => void }, done as () => void));
+          return;
+        }
+        const meta = id ? readMeta(id) : null;
         if (!meta) {
-          ctx.ui?.notify?.(`run '${id}' not found`, "warning");
+          ctx.ui?.notify?.(id ? `run '${id}' not found` : "no run id given (and no TUI available)", "warning");
           return;
         }
         ctx.ui?.notify?.(`chat of ${id} · ${meta.agent}\n\n${chatTranscript(meta)}`, "info");

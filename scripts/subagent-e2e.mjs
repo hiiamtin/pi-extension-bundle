@@ -615,5 +615,71 @@ fire("session_start", { sessionManager: { getSessionFile: () => bgSessionFile } 
 await sleep(250);
 assert(!bgNotices.some((notice) => String(notice.message?.content ?? "").includes(inlineRun.details.run.id)), "inline-delivered run must never resurface in sweeps");
 
+// /subagents chat (TUI): opens the interactive viewer — no id → picker first
+{
+  const fakeTheme = { fg: (_k, t) => t, bold: (t) => t };
+  const customCalls = [];
+  const selectCalls = [];
+  const tuiCtx = {
+    ...ctx,
+    hasUI: true,
+    ui: {
+      notify: (message, level) => notices.push({ message, level }),
+      select: async (title, options) => {
+        selectCalls.push({ title, options });
+        return options.find((option) => option.includes(steeredResult.details.run.id));
+      },
+      custom: async (factory, opts) => {
+        customCalls.push({ factory, opts });
+        return undefined;
+      },
+    },
+  };
+  // no id → picker must list session runs, selecting one opens the viewer
+  await commands.subagents.handler("chat", tuiCtx);
+  assert.equal(customCalls.length, 1, "picker selection must open the viewer");
+  assert.equal(selectCalls.length, 1);
+  assert(selectCalls[0].options.some((option) => option.includes(steeredResult.details.run.id)));
+  const doneSpyCalls = [];
+  const fakeTui = { requestRender: () => {} };
+  const component = customCalls[0].factory(fakeTui, fakeTheme, {}, (value) => doneSpyCalls.push(value));
+  assert(component, "viewer factory must return a component");
+  const viewLines = component.render(100);
+  assert(viewLines.some((line) => line.includes("STEER-PIVOTED")), "viewer must render the assistant turn");
+  assert(viewLines.some((line) => line.includes("long running work")), "viewer must render the user turn");
+  assert(viewLines.some((line) => line.includes("esc")), "viewer must show exit hint");
+  // scroll + exit
+  const before = component.scrollTop ?? 0;
+  component.onKey?.({ name: "down" });
+  assert((component.scrollTop ?? 0) >= before, "down must scroll (or stay at end)");
+  component.onKey?.({ name: "escape" });
+  assert.equal(doneSpyCalls.length, 1, "escape must close the viewer");
+  // explicit id skips the picker
+  customCalls.length = 0;
+  selectCalls.length = 0;
+  await commands.subagents.handler(`chat ${steeredResult.details.run.id}`, tuiCtx);
+  assert.equal(customCalls.length, 1, "explicit id must open the viewer directly");
+  assert.equal(selectCalls.length, 0, "explicit id must skip the picker");
+  // running run gets a live marker
+  process.env.FAKE_SUBAGENT_DELAY_MS = "1500";
+  const livePromise = tool.execute("viewer-live", { agent: "scout", task: "live viewer run" }, undefined, undefined, ctx);
+  const liveId = await waitFor(() => readdirSync(stateDir)
+    .map((entry) => JSON.parse(readFileSync(path.join(stateDir, entry, "meta.json"), "utf8")))
+    .find((meta) => meta.task === "live viewer run" && meta.state === "running")).then((meta) => meta.id);
+  customCalls.length = 0;
+  await commands.subagents.handler(`chat ${liveId}`, tuiCtx);
+  delete process.env.FAKE_SUBAGENT_DELAY_MS;
+  const liveComponent = customCalls[0].factory(fakeTui, fakeTheme, {}, () => {});
+  const liveHeader = liveComponent.render(100).join("\n");
+  assert(/live/i.test(liveHeader), "viewer must mark running runs as live");
+  liveComponent.onKey?.({ name: "escape" });
+  await livePromise;
+}
+
+// non-TUI fallback: chat without a UI keeps the plain notify transcript
+notices.length = 0;
+await commands.subagents.handler(`chat ${steeredResult.details.run.id}`, { ...ctx, hasUI: false });
+assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fallback must keep working");
+
 console.log("ALL SUBAGENT E2E TESTS PASSED");
 rmSync(root, { recursive: true, force: true });
