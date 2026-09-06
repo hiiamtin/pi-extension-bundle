@@ -574,5 +574,17 @@ assert(rootCompletions?.some((item) => item.value === "inspect"), "inspect must 
 assert(rootCompletions?.some((item) => item.value === "doctor"), "doctor must be a root command");
 assert(rootCompletions.length <= 8);
 
+// renderResult: click-to-inspect — run id is an OSC 8 link to result.md, hint line present
+{
+  const fakeTheme = { fg: (_k, t) => t, bold: (t) => t, success: (t) => t, error: (t) => t, muted: (t) => t, dim: (t) => t, toolTitle: (t) => t, toolOutput: (t) => t };
+  const rendered = tool.renderResult({ content: [{ type: "text", text: "body" }], details: { run: JSON.parse(readFileSync(path.join(stateDir, evented.details.run.id, "meta.json"), "utf8")), activities: [{ toolName: "read", args: {} }] } }, { expanded: true }, fakeTheme);
+  const lines = rendered.render(200);
+  const joined = lines.join("\n");
+  assert(joined.includes("\x1b]8;;file://"), "run id must be an OSC 8 hyperlink");
+  assert(joined.includes(evented.details.run.resultPath), "hyperlink must target result.md");
+  assert(joined.includes(`/subagents inspect ${evented.details.run.id}`), "expanded view must show the inspect hint");
+  assert(joined.includes("1 tool call(s)"), "expanded view must show the activity count");
+}
+
 console.log("ALL SUBAGENT E2E TESTS PASSED");
 rmSync(root, { recursive: true, force: true });

@@ -5,7 +5,7 @@
 // skills, and MCP servers back in. See docs/subagent.md.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { hyperlink, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { parse as parseYaml } from "yaml";
 import { spawn } from "node:child_process";
@@ -1054,7 +1054,14 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       const usage = `${run.usage.input + run.usage.cacheRead} in · ${run.usage.output} out · $${run.usage.cost.toFixed(4)}`;
       const output = result.content?.[0]?.text ?? "(no output)";
       const body = options.expanded ? output : output.split("\n").slice(-8).join("\n");
-      return new Text(`${icon} ${theme.fg("toolTitle", theme.bold(run.agent))} ${theme.fg("muted", run.id)}\n${theme.fg("toolOutput", body)}\n${theme.fg("dim", usage)}`, 0, 0);
+      // OSC 8: terminals that support it make the run id clickable — it opens
+      // the full result.md in the OS editor handler (click-to-inspect)
+      const idText = run.resultPath ? hyperlink(run.id, `file://${run.resultPath}`) : run.id;
+      const inspectHint = theme.fg("dim", `/subagents inspect ${run.id}`);
+      const extra = options.expanded
+        ? `\n${theme.fg("dim", `${details.activities.length} tool call(s) · full result: ${run.resultPath} · ${inspectHint}`)}`
+        : `\n${theme.fg("dim", inspectHint)}`;
+      return new Text(`${icon} ${theme.fg("toolTitle", theme.bold(run.agent))} ${theme.fg("muted", idText)}\n${theme.fg("toolOutput", body)}\n${theme.fg("dim", usage)}${extra}`, 0, 0);
     },
   });
 
