@@ -8,7 +8,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { parse as parseYaml } from "yaml";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   appendFileSync,
   existsSync,
@@ -24,6 +24,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { extractToolArgs, requireString, textResult } from "../lib/tool-compat.ts";
+import { startRpcChild, type RpcChild } from "../lib/rpc-child.ts";
 import {
   captureExtensionApi,
   deliverRunNotice,
@@ -53,6 +54,15 @@ const MAX_OUTPUT_LINES = envInt("PI_SUBAGENT_OUT_LINES", 5_000, 100, 50_000);
 const RECOVERY_TRANSCRIPT_CHARS = 24_000;
 const STDERR_CAP_CHARS = 32_000;
 const KILL_ESCALATE_MS = 5_000;
+// timeout: wrap-up steer → wait grace → abort → SIGTERM → SIGKILL
+const WRAPUP_MS = envInt("PI_SUBAGENT_WRAPUP_SEC", 45, 0, 600) * 1000;
+// after turn_end, wait this long for a steered turn to begin before declaring idle
+const STEER_QUIET_MS = 700;
+
+// live rpc children of in-flight runs (this process only) — steer targets
+const liveRuns = new Map<string, { child: RpcChild }>();
+// lifecycle bus set by the factory from pi.events (guarded — hosts may omit it)
+let emitLifecycle: (event: string, data: Record<string, unknown>) => void = () => {};
 const CLEAN_ROOM_FLAGS = [
   "--no-extensions",
   "--no-skills",
@@ -486,7 +496,7 @@ function recoveryTask(meta: RunMeta): string {
 }
 
 function buildArgs(agent: AgentConfig, meta: RunMeta, cwd: string, inherited: { model?: string; thinking?: string }, recovering: boolean): { args: string[]; mcpConfig?: string } {
-  const args = ["--mode", "json", "-p", "--session", meta.sessionFile, ...CLEAN_ROOM_FLAGS];
+  const args = ["--mode", "rpc", "--session", meta.sessionFile, ...CLEAN_ROOM_FLAGS];
   if (meta.model) args.push("--model", meta.model);
   const thinking = agent.thinking ?? inherited.thinking;
   if (thinking) args.push("--thinking", thinking);
@@ -516,7 +526,8 @@ async function continueRun(
 ): Promise<RunResult | string> {
   const existing = readMeta(id);
   if (!existing) return `error: run '${id}' not found — use /subagents list`;
-  if (existing.state === "running" || existing.state === "queued") return `error: run '${id}' is still ${existing.state}`;
+  if (existing.state === "running") return steerRun(id, task);
+  if (existing.state === "queued") return `error: run '${id}' is still queued — not yet steerable`;
   const cwd = existing.cwd || ctx?.cwd || process.cwd();
   const agent = discoverAgents(cwd, projectAgentsAllowed(cwd, ctx)).find((candidate) => candidate.name === existing.agent);
   if (!agent) return `error: agent '${existing.agent}' for run '${id}' is no longer available`;
@@ -527,6 +538,18 @@ async function continueRun(
     return bgStartText(existing.id, agent.name);
   }
   return runAgent(agent, task, cwd, inherited, existing.ownerSession, signal, onUpdate, existing);
+}
+
+function steerRun(id: string, message: string): Promise<string> {
+  const live = liveRuns.get(id);
+  if (!live) {
+    return Promise.resolve(`error: run '${id}' is not live in this process (already finished, or spawned by another session or before a reload)`);
+  }
+  return live.child.request({ type: "steer", message })
+    .then((response) => response.success === false
+      ? `error: steer rejected for run '${id}'`
+      : `Steered run ${id} — instruction delivered; still running. The result arrives as usual (call result or background notice).`)
+    .catch((error: unknown) => `error: steer failed for run '${id}': ${(error as Error).message}`);
 }
 
 async function runAgent(
@@ -601,9 +624,13 @@ async function runAgent(
   let finalOutput = "";
   let stderr = "";
   let forcedState: RunState | null = null;
-  let child: ChildProcess | null = null;
+  let completedQuietly = false;
+  let timeoutArmed = false;
+  let rpcChild: RpcChild | null = null;
   let timeoutTimer: NodeJS.Timeout | null = null;
   let abortHandler: (() => void) | null = null;
+  let wrapTimer: NodeJS.Timeout | null = null;
+  let killTimer: NodeJS.Timeout | null = null;
   const recovering = !!existing && (!existsSync(existing.sessionFile) || statSync(existing.sessionFile).size === 0 || existing.state === "timeout" || existing.state === "killed");
   let args: string[];
   let mcpConfig: string | undefined;
@@ -632,28 +659,34 @@ async function runAgent(
   try {
     const exit = await new Promise<{ code: number | null; signal: string | null }>((resolve) => {
       const invocation = getPiInvocation(args);
-      child = spawn("nice", ["-n", "15", "ionice", "-c3", invocation.command, ...invocation.args], {
-        cwd,
-        detached: true,
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      meta.pid = child.pid ?? 0;
-      meta.pgid = child.pid ?? 0;
+      // the rpc child gets the task via a prompt request, not argv
+      const prompt = args.pop() as string;
+      rpcChild = startRpcChild("nice", ["-n", "15", "ionice", "-c3", invocation.command, ...invocation.args], { cwd });
+      liveRuns.set(meta.id, { child: rpcChild });
+      meta.pid = rpcChild.pid;
+      meta.pgid = rpcChild.pid;
       writeMeta(meta);
+      emitLifecycle("subagent:started", { id: meta.id, agent: meta.agent, model: meta.model, state: meta.state });
 
-      let buffer = "";
-      const processLine = (line: string) => {
-        if (!line.trim()) return;
-        let event: Record<string, any>;
-        try { event = JSON.parse(line); } catch { return; }
+      // Completion = agent idle (turn_end) with no steered turn starting within
+      // the quiet window — a steer delivered between turns starts a new turn.
+      let turnEndTimer: NodeJS.Timeout | null = null;
+      const markTurnEnd = () => {
+        if (turnEndTimer) return;
+        turnEndTimer = setTimeout(() => resolveExit({ code: 0, signal: null, quiet: true }), STEER_QUIET_MS);
+        turnEndTimer.unref?.();
+      };
+      const clearTurnEnd = () => {
+        if (turnEndTimer) { clearTimeout(turnEndTimer); turnEndTimer = null; }
+      };
+
+      const processEvent = (event: Record<string, any>) => {
         if (event.type === "tool_execution_start") {
           activities.push({ toolName: String(event.toolName ?? "tool"), args: event.args ?? {} });
           emit();
         }
-        if (event.type === "turn_start") {
-          // turn count is derived from assistant message_end events in applyUsage
-        }
+        if (event.type === "turn_start") clearTurnEnd();
+        if (event.type === "turn_end") markTurnEnd();
         if (event.type === "message_end" && event.message?.role === "assistant") {
           applyUsage(meta.usage, event.message);
           const text = assistantText(event.message);
@@ -666,25 +699,44 @@ async function runAgent(
           emit();
         }
       };
-      child.stdout?.on("data", (chunk: Buffer) => {
-        appendFileSync(meta.transcriptPath, chunk);
-        buffer += chunk.toString("utf8");
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) processLine(line);
+      rpcChild.onEvent((event) => {
+        try {
+          appendFileSync(meta.transcriptPath, `${JSON.stringify(event)}\n`);
+        } catch { /* transcript best-effort */ }
+        processEvent(event);
       });
-      child.stderr?.on("data", (chunk: Buffer) => {
-        stderr += chunk.toString("utf8");
+      rpcChild.onStderr((text) => {
+        stderr += text;
         if (stderr.length > STDERR_CAP_CHARS) stderr = stderr.slice(-STDERR_CAP_CHARS);
       });
-      child.on("close", (code, childSignal) => {
-        if (buffer.trim()) processLine(buffer);
-        resolve({ code, signal: childSignal });
-      });
-      child.on("error", (error) => {
-        stderr += error.message;
+
+      // send the task as an rpc prompt; acceptance resolves fast, events stream after
+      rpcChild.request({ type: "prompt", message: prompt }, 30_000).catch((error: Error) => {
+        rpcChild.kill("SIGTERM");
+        stderr += `prompt rejected: ${error.message}`;
         resolve({ code: 1, signal: null });
       });
+
+      // graceful wrap-up on timeout: steer → wait grace → abort → SIGTERM group
+      const armTimeout = () => {
+        if (forcedState) return;
+        rpcChild.request({
+          type: "steer",
+          message: "Time is up: wrap up NOW. Stop exploring and return your best partial answer immediately.",
+        }).catch(() => { /* child may be gone */ });
+        wrapTimer = setTimeout(() => {
+          if (forcedState) return;
+          timeoutArmed = true;
+          rpcChild.request({ type: "abort" }).catch(() => { /* fall through to kill */ });
+          killTimer = setTimeout(() => {
+            if (forcedState) return;
+            forcedState = "timeout";
+            killProcessGroup(meta);
+          }, KILL_ESCALATE_MS);
+          killTimer.unref?.();
+        }, WRAPUP_MS);
+        wrapTimer.unref?.();
+      };
 
       const stop = (state: RunState) => {
         if (forcedState) return;
@@ -695,21 +747,43 @@ async function runAgent(
       if (signal?.aborted) abortHandler();
       else signal?.addEventListener("abort", abortHandler, { once: true });
       if (meta.timeoutMin > 0) {
-        timeoutTimer = setTimeout(() => stop("timeout"), meta.timeoutMin * 60_000);
+        timeoutTimer = setTimeout(armTimeout, meta.timeoutMin * 60_000);
         timeoutTimer.unref?.();
       }
+
+      // resolve on transport exit; "quiet" turns it into a clean exit below
+      let quietDone = false;
+      function resolveExit(value: { code: number | null; signal: string | null; quiet?: boolean }) {
+        if (value.quiet) completedQuietly = true;
+        if (quietDone) return;
+        quietDone = true;
+        resolve(value);
+      }
+      rpcChild.exit.then((value) => resolveExit(value));
     });
+
+    // quiet completion resolved the race early: close stdin and let the child
+    // exit; escalate to SIGTERM if it lingers so runs never leave zombies
+    if (rpcChild && !rpcChild.exited) {
+      rpcChild.closeStdin();
+      await Promise.race([rpcChild.exit, new Promise((resolve) => setTimeout(resolve, 1_500))]);
+      if (!rpcChild.exited) rpcChild.kill("SIGTERM");
+    }
 
     meta.exitCode = exit.code;
     meta.signal = exit.signal;
     meta.finishedAt = Date.now();
     const persistedState = readMeta(meta.id)?.state;
     const externallyStopped = persistedState === "killed" || persistedState === "timeout" ? persistedState : null;
-    meta.state = forcedState ?? externallyStopped ?? (exit.code === 0 && !meta.error ? "done" : "failed");
+    // wrap-up finished inside the grace window = done; exceeded (abort/kill) = timeout
+    meta.state = forcedState ?? externallyStopped
+      ?? (completedQuietly || (exit.code === 0 && !meta.error && !timeoutArmed) ? "done"
+        : timeoutArmed && exit.code === 0 && !meta.error ? "timeout" : "failed");
     if (!meta.error && meta.state === "failed") meta.error = stderr.trim() || `child exited ${exit.code}`;
     const fullOutput = finalOutput || meta.error || stderr.trim() || "(no output)";
     writeFileSync(meta.resultPath, fullOutput);
     writeMeta(meta);
+    emitLifecycle("subagent:finished", { id: meta.id, agent: meta.agent, state: meta.state });
     const visible = truncateOutput(fullOutput);
     const result = {
       content: [{ type: "text" as const, text: modelVisibleOutput(visible.text, meta) }],
@@ -733,8 +807,11 @@ async function runAgent(
   } finally {
     releaseSlot();
     if (timeoutTimer) clearTimeout(timeoutTimer);
+    if (wrapTimer) clearTimeout(wrapTimer);
+    if (killTimer) clearTimeout(killTimer);
     if (abortHandler) signal?.removeEventListener("abort", abortHandler);
     if (mcpConfig) rmSync(mcpConfig, { force: true });
+    liveRuns.delete(meta.id);
   }
 }
 
@@ -766,9 +843,90 @@ type RunsIo = {
   remove?: (id: string) => void;
 };
 
+function transcriptTailSummary(meta: RunMeta): string {
+  let transcript = "";
+  try {
+    transcript = readFileSync(meta.transcriptPath, "utf8").slice(-16_000);
+  } catch {
+    return "(no transcript captured)";
+  }
+  const messages: string[] = [];
+  let tools = 0;
+  for (const line of transcript.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line) as Record<string, any>;
+      if (event.type === "tool_execution_start") tools += 1;
+      if (event.type === "message_end" && event.message?.role === "assistant") {
+        const text = assistantText(event.message);
+        if (text) messages.push(text);
+      }
+    } catch { /* skip malformed */ }
+  }
+  const last = messages.at(-1) ?? "(no assistant text)";
+  return `${tools} tool call(s) · last assistant text:
+${last.slice(0, 800)}`;
+}
+
+function collectDoctorReport(cwd: string, ctx: ToolCtx | undefined): string[] {
+  const lines: string[] = ["subagents doctor"];
+  const invocation = getPiInvocation(["--mode", "rpc"]);
+  lines.push(`${invocation.command === "pi" || existsSync(invocation.command) ? "OK" : "WARN"} pi invocation: ${invocation.command} ${invocation.args.join(" ")}`.trim());
+  try {
+    const probe = path.join(STATE_DIR, `.doctor-${process.pid}`);
+    mkdirSync(STATE_DIR, { recursive: true });
+    writeFileSync(probe, "ok");
+    rmSync(probe, { force: true });
+    lines.push(`OK state dir writable: ${STATE_DIR}`);
+  } catch (error) {
+    lines.push(`FAIL state dir not writable: ${STATE_DIR} (${(error as Error).message})`);
+  }
+  const userAgents = loadAgentsFromDir(path.join(AGENT_DIR, "agents"), "user");
+  const projectDir = nearestProjectAgentsDir(cwd);
+  const projectAgents = projectDir && projectAgentsAllowed(cwd, ctx) ? loadAgentsFromDir(projectDir, "project") : [];
+  lines.push(`OK agents parsed: ${userAgents.length} user${projectAgents.length ? ` + ${projectAgents.length} project (${projectDir})` : ""}`);
+  const byName = new Map<string, number>();
+  for (const agent of [...userAgents, ...projectAgents]) byName.set(agent.name, (byName.get(agent.name) ?? 0) + 1);
+  const duplicates = [...byName.entries()].filter(([, count]) => count > 1);
+  if (duplicates.length) lines.push(`WARN duplicate agent names (project overrides user): ${duplicates.map(([name]) => name).join(", ")}`);
+  const agents = [...userAgents, ...projectAgents];
+  for (const agent of agents) {
+    for (const extension of agent.extensions) {
+      try {
+        resolveBundleExtension(extension);
+      } catch (error) {
+        lines.push(`FAIL agent '${agent.name}' extension: ${(error as Error).message}`);
+      }
+    }
+    for (const skill of agent.skills) {
+      try {
+        findSkill(skill, cwd);
+      } catch (error) {
+        lines.push(`FAIL agent '${agent.name}' skill: ${(error as Error).message}`);
+      }
+    }
+    if (agent.mcp.length) {
+      try {
+        const source = JSON.parse(readFileSync(path.join(AGENT_DIR, "mcp.json"), "utf8")) as { mcpServers?: Record<string, unknown> };
+        const missing = agent.mcp.filter((name) => !(name in (source.mcpServers ?? {})));
+        if (missing.length) lines.push(`FAIL agent '${agent.name}' mcp servers not in mcp.json: ${missing.join(", ")}`);
+      } catch (error) {
+        lines.push(`FAIL agent '${agent.name}' mcp.json unreadable: ${(error as Error).message}`);
+      }
+    }
+  }
+  if (!lines.some((line) => line.startsWith("FAIL"))) lines.push("OK no problems found");
+  return lines;
+}
+
 export default function subagentExtension(pi: ExtensionAPI): void {
   mkdirSync(STATE_DIR, { recursive: true });
   captureExtensionApi(pi);
+  emitLifecycle = (event, data) => {
+    try {
+      (pi as { events?: { emit?: (name: string, payload: unknown) => void } }).events?.emit?.(event, data);
+    } catch { /* events bus must never break runs */ }
+  };
 
   const runsIo: RunsIo = {
     list: () => listMetas(),
@@ -905,16 +1063,20 @@ export default function subagentExtension(pi: ExtensionAPI): void {
     getArgumentCompletions: (prefix: string) => {
       const normalized = prefix.trimStart();
       if (!normalized.includes(" ")) {
-        const commands = ["list", "cont", "kill"]
+        const commands = ["list", "cont", "kill", "steer", "inspect", "doctor"]
           .filter((value) => value.startsWith(normalized))
-          .map((value) => ({ value, label: `${value} — ${value === "list" ? "List runs" : value === "cont" ? "Continue a run" : "Stop a run"}` }));
+          .map((value) => ({ value, label: `${value} — ${{ list: "List runs", cont: "Continue a finished run", kill: "Stop a run", steer: "Redirect a running run", inspect: "View a run transcript", doctor: "Check environment health" }[value]}` }));
         return commands.length ? commands : null;
       }
-      const match = normalized.match(/^(cont|kill)\s+(\S*)$/);
+      const match = normalized.match(/^(cont|kill|steer)\s+(\S*)$/);
       if (!match) return null;
       const [, action, idPrefix] = match;
       const eligible = listMetas()
-        .filter((run) => action === "cont" ? run.state !== "running" && run.state !== "queued" : run.state === "running" || run.state === "queued")
+        .filter((run) => action === "cont"
+          ? run.state !== "running" && run.state !== "queued"
+          : action === "kill"
+            ? run.state === "running" || run.state === "queued"
+            : run.state === "running")
         .filter((run) => run.id.startsWith(idPrefix) || run.agent.toLowerCase().includes(idPrefix.toLowerCase()))
         .slice(0, 8)
         .map((run) => ({ value: `${action} ${run.id}`, label: `${run.agent} · ${run.id} · ${run.state} · ${run.task.slice(0, 40)}` }));
@@ -947,6 +1109,41 @@ export default function subagentExtension(pi: ExtensionAPI): void {
         );
         return;
       }
+      const steer = input.match(/^steer\s+(\S+)\s+([\s\S]+)$/);
+      if (steer) {
+        const [, id, message] = steer;
+        const outcome = await steerRun(id, message.trim());
+        ctx.ui?.notify?.(outcome, outcome.startsWith("error") ? "warning" : "info");
+        return;
+      }
+      const inspect = input.match(/^inspect\s+(\S+)$/);
+      if (inspect) {
+        const [, id] = inspect;
+        const live = liveRuns.get(id);
+        if (live) {
+          try {
+            const response = await live.child.request({ type: "get_messages" });
+            const messages = (response?.data?.messages ?? []) as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
+            const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
+            const text = lastAssistant?.content?.filter((part) => part.type === "text").map((part) => part.text).join(" ") ?? "(no assistant text yet)";
+            ctx.ui?.notify?.(`live run ${id}: ${messages.length} message(s) so far\nLast assistant text:\n${text.slice(0, 800)}`, "info");
+          } catch (error) {
+            ctx.ui?.notify?.(`inspect failed for '${id}': ${(error as Error).message}`, "warning");
+          }
+          return;
+        }
+        const meta = readMeta(id);
+        if (!meta) {
+          ctx.ui?.notify?.(`run '${id}' not found`, "warning");
+          return;
+        }
+        ctx.ui?.notify?.(`run ${id} · ${meta.agent} · ${meta.state}\n${transcriptTailSummary(meta)}`, "info");
+        return;
+      }
+      if (input === "doctor") {
+        ctx.ui?.notify?.(collectDoctorReport(ctx?.cwd || pi.cwd || process.cwd(), ctx).join("\n"), "info");
+        return;
+      }
       const cont = input.match(/^cont\s+(\S+)\s+([\s\S]+)$/);
       if (cont) {
         const [, id, task] = cont;
@@ -955,7 +1152,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
         else ctx.ui?.notify?.(result.content[0].text, result.details.run.state === "done" ? "info" : "error");
         return;
       }
-      ctx.ui?.notify?.(`usage: /subagents list | cont <id> <message> | kill <id>`, "warning");
+      ctx.ui?.notify?.(`usage: /subagents list | cont <id> <message> | kill <id> | steer <id> <message> | inspect <id> | doctor`, "warning");
     },
   });
 }

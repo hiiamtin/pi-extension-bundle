@@ -14,7 +14,7 @@ const root = path.join(os.tmpdir(), `pi-subagent-e2e-${process.pid}`);
 const agentDir = path.join(root, "agent-dir");
 const stateDir = path.join(root, "state");
 const captureFile = path.join(root, "spawn.jsonl");
-const fakePi = path.join(here, "fixtures", "fake-subagent-pi.mjs");
+const fakePi = path.join(here, "fixtures", "fake-subagent-rpc.mjs");
 
 rmSync(root, { recursive: true, force: true });
 mkdirSync(path.join(agentDir, "agents"), { recursive: true });
@@ -53,6 +53,7 @@ process.env.PI_SUBAGENT_PI_SCRIPT = fakePi;
 process.env.PI_SUBAGENT_MAX_CONCURRENT = "2";
 process.env.FAKE_SUBAGENT_CAPTURE = captureFile;
 process.env.PI_SUBAGENT_DEBUG_LOG = path.join(root, "debug.log");
+process.env.PI_SUBAGENT_WRAPUP_SEC = "1"; // short grace so timeout tests stay fast
 
 // Bare node does not provide pi's package resolver. Link pi's bundled peer
 // packages into this gitignored node_modules exactly as the production loader does.
@@ -143,8 +144,11 @@ assert(existsSync(path.join(runDir, "session.jsonl")), "child session must persi
 assert(existsSync(path.join(runDir, "transcript.jsonl")), "raw event stream must persist");
 assert.equal(readFileSync(path.join(runDir, "result.md"), "utf8"), "result for Task: find auth", "result.md must remain the raw child output");
 
-const spawn = readFileSync(captureFile, "utf8").trim().split("\n").map(JSON.parse).find((event) => event.event === "start");
-assert.deepEqual(spawn.args.slice(0, 4), ["--mode", "json", "-p", "--session"]);
+const spawnedEvent = readFileSync(captureFile, "utf8").trim().split("\n").map(JSON.parse).find((event) => event.event === "start");
+assert(spawnedEvent.rpcMode, "child must be spawned in rpc mode");
+const spawn = spawnedEvent;
+assert.deepEqual(spawn.args.slice(0, 3), ["--mode", "rpc", "--session"]);
+assert(!spawn.args.includes("-p"), "rpc children must not use -p");
 assert(spawn.args.includes("--no-extensions"));
 assert(spawn.args.includes("--no-skills"));
 assert(spawn.args.includes("--no-context-files"));
@@ -224,7 +228,7 @@ assert.equal(queuedStarts.length, 0, "cancelled queued run must never spawn a ch
 process.env.FAKE_SUBAGENT_DELAY_MS = "3000";
 const timedOut = await tool.execute("timeout", { agent: "slow", task: "long work" }, undefined, undefined, ctx);
 assert.equal(timedOut.details?.run?.state, "timeout");
-assert.notEqual(timedOut.details.run.exitCode, 0);
+assert.match(timedOut.content?.[0]?.text ?? '', /timeout/, "footer must carry the timeout state");
 const timedId = timedOut.details.run.id;
 delete process.env.FAKE_SUBAGENT_DELAY_MS;
 const afterTimeout = await tool.execute("resume-timeout", { continue: timedId, task: "finish it" }, undefined, undefined, ctx);
@@ -491,6 +495,84 @@ const allowed = await tool.execute("confirm-allow", { agent: "pinner", task: "us
 assert.equal(allowed.details?.run?.state, "done");
 const allowSpawn = readFileSync(captureFile, "utf8").trim().split("\n").map(JSON.parse).find((event) => event.event === "start");
 assert.equal(allowSpawn.args[allowSpawn.args.indexOf("--append-system-prompt") + 1], "PINNER PROMPT");
+
+// ─── P3: rpc upgrade — steer / graceful wrap-up / inspect / doctor / events ──
+
+// steer a running run via continue
+process.env.FAKE_RPC_STEERABLE = "1";
+process.env.FAKE_RPC_STEER_OUTPUT = "STEER-PIVOTED";
+writeFileSync(captureFile, "");
+process.env.FAKE_SUBAGENT_DELAY_MS = "4000";
+const steerPromise = tool.execute("steer-target", { agent: "scout", task: "long running work" }, undefined, undefined, ctx);
+const steerRun = await waitFor(() => readdirSync(stateDir)
+  .map((id) => JSON.parse(readFileSync(path.join(stateDir, id, "meta.json"), "utf8")))
+  .find((meta) => meta.task === "long running work" && meta.state === "running"));
+await sleep(500); // let the in-flight turn be cancellable
+const steerOutcome = await tool.execute("steer-call", { continue: steerRun.id, task: "pivot now" }, undefined, undefined, ctx);
+delete process.env.FAKE_SUBAGENT_DELAY_MS;
+assert.match(steerOutcome.content?.[0]?.text ?? "", new RegExp(`Steered run ${steerRun.id}`));
+assert.match(steerOutcome.content?.[0]?.text ?? "", /still running/);
+const steeredResult = await steerPromise;
+delete process.env.FAKE_RPC_STEERABLE;
+delete process.env.FAKE_RPC_STEER_OUTPUT;
+assert.equal(steeredResult.details?.run?.state, "done");
+assert.match(steeredResult.content?.[0]?.text ?? "", /STEER-PIVOTED/, "steered run must deliver the pivoted answer");
+const steerSpawns = readFileSync(captureFile, "utf8").trim().split("\n").map(JSON.parse).filter((event) => event.event === "start");
+assert.equal(steerSpawns.length, 1, "steering must reuse the live child, never spawn a second one");
+
+// graceful wrap-up: timeout fires → wrap-up steer → child finishes inside grace → done
+process.env.FAKE_RPC_WRAPUP_HONORS = "1";
+process.env.FAKE_SUBAGENT_DELAY_MS = "3000";
+const wrapped = await tool.execute("wrapup", { agent: "slow", task: "grace work" }, undefined, undefined, ctx);
+delete process.env.FAKE_RPC_WRAPUP_HONORS;
+delete process.env.FAKE_SUBAGENT_DELAY_MS;
+assert.equal(wrapped.details?.run?.state, "done", "wrap-up completed inside the grace window is a done run");
+assert.match(wrapped.content?.[0]?.text ?? "", /wrapped up on request/);
+
+// timeout exceeded: child ignores wrap-up → abort → forced stop
+process.env.FAKE_RPC_HANG = "1";
+process.env.FAKE_SUBAGENT_DELAY_MS = "3000";
+const hung = await tool.execute("hung", { agent: "slow", task: "hang work" }, undefined, undefined, ctx);
+delete process.env.FAKE_RPC_HANG;
+delete process.env.FAKE_SUBAGENT_DELAY_MS;
+assert.equal(hung.details?.run?.state, "timeout");
+const hungContinue = await tool.execute("resume-hang", { continue: hung.details.run.id, task: "finish it" }, undefined, undefined, ctx);
+assert.equal(hungContinue.details?.run?.state, "done");
+
+// /subagents inspect: transcript view for finished runs
+notices.length = 0;
+await commands.subagents.handler(`inspect ${steeredResult.details.run.id}`, ctx);
+assert(notices.some((notice) => /STEER-PIVOTED|inspect/.test(notice.message)), "inspect must surface the run transcript tail");
+
+// /subagents doctor: environment health report
+notices.length = 0;
+await commands.subagents.handler("doctor", ctx);
+const doctorText = notices.map((notice) => notice.message).join("\n");
+assert.match(doctorText, /doctor/);
+assert.match(doctorText, /state dir/i);
+assert.match(doctorText, /agents?/i);
+assert.match(doctorText, /OK|FAIL/);
+
+// pi.events lifecycle emits
+const lifecycleEvents = [];
+mod.default({
+  cwd: pkgRoot,
+  registerTool: (t) => (registered.subagent = t),
+  registerCommand: (n, c) => (commands[n] = c),
+  on: (name, handler) => { (hooks[name] ??= []).push(handler); },
+  events: { emit: (name, data) => lifecycleEvents.push({ name, data }) },
+});
+writeFileSync(captureFile, "");
+const evented = await tool.execute("events", { agent: "scout", task: "emit lifecycle" }, undefined, undefined, ctx);
+assert.equal(evented.details?.run?.state, "done");
+assert(lifecycleEvents.some((entry) => entry.name === "subagent:started" && entry.data.id === evented.details.run.id), "must emit subagent:started");
+assert(lifecycleEvents.some((entry) => entry.name === "subagent:finished" && entry.data.id === evented.details.run.id && entry.data.state === "done"), "must emit subagent:finished");
+
+// completion completions argument for getArgumentCompletions must include inspect/doctor
+const rootCompletions = commands.subagents.getArgumentCompletions("");
+assert(rootCompletions?.some((item) => item.value === "inspect"), "inspect must be a root command");
+assert(rootCompletions?.some((item) => item.value === "doctor"), "doctor must be a root command");
+assert(rootCompletions.length <= 8);
 
 console.log("ALL SUBAGENT E2E TESTS PASSED");
 rmSync(root, { recursive: true, force: true });

@@ -164,6 +164,7 @@ reachable from a tool call; opening one arrives with P2).
 | `worker` | `9router/snowy` | full | 60 min | real implementation work |
 | `reviewer` | `9router/snowy` · thinking high | read, grep, bash + `code_search`/`code_find_related` | 20 min | review/audit; 1M context for large diffs |
 | `research` | `9router/flash-research` · thinking low | web_search, web_fetch, read (via bundle exts) | 15 min | web research with cited sources; keeps heavy browsing out of the parent context |
+| `oracle` | `9router/smartmode` · thinking high | read, grep, bash + `code_search`/`code_find_related` | 20 min | independent second opinion on hard calls; verdict-first answers |
 
 (`oracle` second-opinion agent joins in P3 as a pure `.md` — strong model +
 critique prompt.)
@@ -271,10 +272,16 @@ Deliberate deviations (all safer-or-simpler for the subagent shape):
 
 ## 9. Commands
 
-v1: `/subagents list` (table: id, agent, state, elapsed, usage) ·
-`/subagents cont <id> <message>` · `/subagents kill <id>`.
-P3: `inspect <id>` (transcript view), `doctor` (binary found, agents parse,
-state dir writable, no duplicate names).
+`/subagents list` (table: id, agent, state, elapsed, usage) ·
+`/subagents cont <id> <message>` (continue a finished run) ·
+`/subagents kill <id>` · `/subagents steer <id> <message>` (redirect a live
+rpc child mid-run) · `/subagents inspect <id>` (live: `get_messages` tail;
+finished: transcript tail) · `/subagents doctor` (pi invocation, state dir
+writable, agents parse, duplicate names, referenced extensions/skills/mcp
+resolvable).
+
+Steering is also model-facing: `subagent({ continue: "<id>", task })` on a
+RUNNING run delivers the task as a steering message instead of erroring.
 
 ## 10. Naming & configuration
 
@@ -293,7 +300,30 @@ Env knobs: `PI_SUBAGENT_MAX_CONCURRENT` (4, 1–16) · `PI_SUBAGENT_TIMEOUT_MIN`
 
 ## 11. Phasing
 
-| Phase | Scope |
+**P3 record (2026-09-05) — rpc upgrade, DONE.**
+
+- Children now spawn `pi --mode rpc` (no `-p`); the task goes to the child as
+  an rpc `prompt` request (`lib/rpc-child.ts`: manual LF framing per protocol
+  docs — never readline — id-correlated requests, capped stderr). Agent events
+  are identical to json mode, so usage/activities/result code is unchanged.
+- Completion = `turn_end` with no steered turn starting within a 700 ms quiet
+  window (steering delivered between turns starts a new turn). stdin is then
+  half-closed; a lingering child gets SIGTERM (no zombies).
+- **Steer:** `subagent({ continue: id, task })` or `/subagents steer` on a
+  running run pushes a `steer` into the live child (in-process registry;
+  cross-process/reload steers fail loudly). W9b verified real pi honors it
+  mid-tool-execution.
+- **Graceful timeout:** expiry steers "wrap up NOW" → grace
+  `PI_SUBAGENT_WRAPUP_SEC` (45s) → `abort` → SIGTERM group → SIGKILL.
+  Finishing inside the grace window = `done`; only exceeding it = `timeout`.
+- **`inspect` / `doctor`:** see §9. **`pi.events`:** `subagent:started` /
+  `subagent:finished` emitted through `pi.events` (guarded for hosts without
+  a bus). **`oracle` agent** added to the roster (§5).
+- Gates: e2e (incl. steer/pivot, wrap-up-in-grace, hang-timeout, inspect,
+  doctor, events), smoke-test now also spawns a real rpc child under BOTH
+  calling conventions, bg-e2e, bg-regression — ALL PASS.
+
+Per-phase scope:| Phase | Scope |
 |---|---|
 | **P1 — core** | discovery + frontmatter (incl. `timeout`, resolution of `tools/extensions/skills/mcp`) + spawn json -p + JSONL parse + usage aggregation + truncation + blocking + **continue (tool param + command)** + parallel-via-sibling-calls + semaphore + renderCall/renderResult + `/subagents list\|cont\|kill` + roster `.md` files |
 | **P2 — background** | `run_in_background` + lift machinery into `lib/agent-runs.ts` + notify/ownership + prune + bg tests isolation (`PI_BG_STATE_DIR`-style env) |
@@ -316,6 +346,11 @@ loader — no runtime typechecking).
 | W4 | `--append-system-prompt` accepts direct text | ✅ marker echoed; no temp file needed |
 | W5 | `-e <bundle ext>` additive with `--no-extensions` | ✅ `code_search` loaded AND invoked; clean-room preserved |
 | W6 | `--skill <path>` additive with `--no-skills` | ✅ marker skill named by the child |
+| W9a | `--mode rpc`: prompt via stdin, event schema, usage fields | ✅ identical `message_end`/usage schema to json mode; session file flushed immediately (no W7 lag); clean exit on stdin EOF |
+| W9b | `steer` mid-tool-execution | ✅ accepted; model pivots and answers the steering instead (W9 run: `STEER-OK`, stop=stop) |
+| W9c | `abort` while streaming | ✅ accepted; clean termination; partial output preserved |
+| W9d | `get_messages` while live | ✅ full conversation returned (powers `/subagents inspect`) |
+| W9e | rpc exit semantics | ✅ no exit command; child exits on stdin EOF → transport half-closes after idle, SIGTERM fallback kills stragglers |
 | W7 | SIGTERM mid-run | ✅ exit 143; **caveat:** pi's session file flushes lazily — absent/stale after early kill |
 | W8 | adapter via `-e` + `--mcp-config <filtered tmp>` | ✅ clean start, empty stderr, normal completion |
 

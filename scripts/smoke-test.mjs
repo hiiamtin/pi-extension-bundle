@@ -16,7 +16,7 @@
 
 import { createRequire } from "node:module";
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -29,8 +29,9 @@ process.env.PI_BG_STATE_DIR = path.join(os.tmpdir(), `pi-bg-smoke-${process.pid}
 const subagentRoot = path.join(os.tmpdir(), `pi-subagent-smoke-${process.pid}`);
 process.env.PI_CODING_AGENT_DIR = path.join(subagentRoot, "agent-dir");
 process.env.PI_SUBAGENT_STATE_DIR = path.join(subagentRoot, "state");
-process.env.PI_SUBAGENT_PI_SCRIPT = path.join(pkgRoot, "scripts", "fixtures", "fake-subagent-pi.mjs");
+process.env.PI_SUBAGENT_PI_SCRIPT = path.join(pkgRoot, "scripts", "fixtures", "fake-subagent-rpc.mjs");
 process.env.FAKE_SUBAGENT_CAPTURE = path.join(subagentRoot, "spawn.jsonl");
+process.env.PI_SUBAGENT_DEBUG_LOG = path.join(subagentRoot, "debug.log");
 mkdirSync(path.join(process.env.PI_CODING_AGENT_DIR, "agents"), { recursive: true });
 writeFileSync(
   path.join(process.env.PI_CODING_AGENT_DIR, "agents", "smoke.md"),
@@ -203,6 +204,35 @@ for (const name of names) {
       failures++;
     } else {
       console.log(`ok   ${name} [${conv}] -> ${text.split("\n")[0].slice(0, 90)}`);
+    }
+  }
+}
+
+// --- real subagent spawn over rpc (both conventions must reach a child) ---
+{
+  const tool = registered.subagent;
+  if (!tool) {
+    console.log("FAIL subagent spawn: tool not registered");
+    failures++;
+  } else {
+    const smokeCtx = {
+      cwd: pkgRoot,
+      model: { provider: "smoke", id: "smoke-model" },
+      isProjectTrusted: () => true,
+      sessionManager: { getSessionFile: () => path.join(subagentRoot, "session.jsonl") },
+    };
+    const modern = await tool.execute("smoke-spawn", { agent: "smoke", task: "say OK" }, new AbortController().signal, undefined, smokeCtx);
+    const okModern = modern?.details?.run?.state === "done" && /result for Task: say OK/.test(modern.content?.[0]?.text ?? "");
+    console.log(`${okModern ? "ok  " : "FAIL"} subagent spawn [modern] -> ${okModern ? "done" : (modern?.content?.[0]?.text ?? "").slice(0, 90)}`);
+    if (!okModern) failures++;
+    const legacy = await tool.execute({ agent: "smoke", task: "say OK again" });
+    const okLegacy = legacy?.details?.run?.state === "done";
+    console.log(`${okLegacy ? "ok  " : "FAIL"} subagent spawn [legacy] -> ${okLegacy ? "done" : (legacy?.content?.[0]?.text ?? "").slice(0, 90)}`);
+    if (!okLegacy) failures++;
+    const spawned = readFileSync(path.join(subagentRoot, "spawn.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)).filter((event) => event.event === "start");
+    if (spawned.length < 2 || !spawned.every((event) => event.rpcMode)) {
+      console.log("FAIL subagent spawn: children must run in rpc mode");
+      failures++;
     }
   }
 }

@@ -340,14 +340,15 @@ agents/
   worker.md        general implementation worker
   reviewer.md      read-only post-implementation review
   research.md      web research with cited sources (web-search/web-fetch exts)
+  oracle.md        independent second opinion on hard calls (smartmode, high)
 lib/
   tool-compat.ts   shared helpers: signature normalization + loud param validation
   agent-runs.ts    notification/session machinery for background subagent runs
                    (lifted from bg-task; design + deviations: docs/subagent.md §8)
 scripts/
   smoke-test.mjs   run after any pi upgrade (see web-search section above)
-  subagent-e2e.mjs subprocess/session/continue/timeout/concurrency/resource
-                   + background notify e2e
+  subagent-e2e.mjs subprocess/rpc/steer/wrap-up/continue/timeout/concurrency/
+                   background-notify e2e
   bg-e2e.mjs       functional end-to-end test for bg-task (fake ExtensionAPI)
   bg-regression.mjs regression tests for bg-task bugs + /bg clean/autocomplete
   tok-rate-e2e.mjs functional test for tok-rate (simulated stream events)
