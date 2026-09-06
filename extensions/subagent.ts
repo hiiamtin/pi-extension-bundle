@@ -439,6 +439,15 @@ function modelVisibleOutput(output: string, meta: RunMeta): string {
   return `${bounded}${separator}${footer}`;
 }
 
+// Foreground results are delivered inline the moment runAgent resolves —
+// mark them notified so sweeps never resurface them as "finished since you
+// were away" noise. Already-marked runs are left untouched.
+function markInlineDelivered(id: string): void {
+  try {
+    mergeMeta(id, (current) => (current.notifiedAt ? current : { ...current, notifiedAt: Date.now() }));
+  } catch { /* meta is best-effort */ }
+}
+
 function bgStartText(id: string, agentName: string): string {
   return [
     `Background subagent started: ${id} (${agentName}).`,
@@ -537,7 +546,10 @@ async function continueRun(
     launchBackground(running, existing.id, runsIo);
     return bgStartText(existing.id, agent.name);
   }
-  return runAgent(agent, task, cwd, inherited, existing.ownerSession, signal, onUpdate, existing);
+  return runAgent(agent, task, cwd, inherited, existing.ownerSession, signal, onUpdate, existing).then((result) => {
+    markInlineDelivered(existing.id);
+    return result;
+  });
 }
 
 function steerRun(id: string, message: string): Promise<string> {
@@ -1039,7 +1051,10 @@ export default function subagentExtension(pi: ExtensionAPI): void {
         ownerSession,
         signal,
         onUpdate,
-      );
+      ).then((result) => {
+        markInlineDelivered((result.details as RunDetails).run.id);
+        return result;
+      });
     },
     renderCall(args: Record<string, unknown>, theme: any) {
       const name = typeof args.continue === "string" ? `continue ${args.continue}` : String(args.agent ?? "...");

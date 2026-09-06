@@ -586,5 +586,14 @@ assert(rootCompletions.length <= 8);
   assert(joined.includes("1 tool call(s)"), "expanded view must show the activity count");
 }
 
+// blocking runs are delivered inline → must be marked notified (no sweep noise)
+const inlineRun = await tool.execute("inline-notify", { agent: "scout", task: "inline delivery" }, undefined, undefined, ctx);
+const inlineMeta = JSON.parse(readFileSync(path.join(stateDir, inlineRun.details.run.id, "meta.json"), "utf8"));
+assert(inlineMeta.notifiedAt, "inline-delivered run must be marked notified immediately");
+bgNotices.length = 0;
+fire("session_start", { sessionManager: { getSessionFile: () => bgSessionFile } });
+await sleep(250);
+assert(!bgNotices.some((notice) => String(notice.message?.content ?? "").includes(inlineRun.details.run.id)), "inline-delivered run must never resurface in sweeps");
+
 console.log("ALL SUBAGENT E2E TESTS PASSED");
 rmSync(root, { recursive: true, force: true });
