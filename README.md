@@ -335,6 +335,9 @@ extensions/
   tok-rate.ts      live tok/s in the working row (streaming deltas → setWorkingMessage)
   btw.ts           /btw — side-question command (real-fork, cache-friendly;
                    design: docs/btw.md)
+Mention agents while typing: `#scout` autocompletes and asks the model to
+delegate to that agent (`@` stays reserved for pi file mentions).
+
 agents/
   scout.md         read-only recon + bundle code-search extension
   worker.md        general implementation worker

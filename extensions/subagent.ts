@@ -1375,16 +1375,16 @@ export default function subagentExtension(pi: ExtensionAPI): void {
         applyCompletion: (lines: string[], line: number, col: number, item: { value: string }, prefix: string) => void;
         shouldTriggerFileCompletion?: (lines: string[], line: number, col: number) => boolean;
       }) => ({
-        triggerCharacters: ["@"],
+        triggerCharacters: ["#"],
         async getSuggestions(lines: string[], line: number, col: number, options: unknown) {
           const before = (lines[line] ?? "").slice(0, col);
-          const match = before.match(/(?:^|[ \t])@([a-zA-Z0-9_-]*)$/);
+          const match = before.match(/(?:^|[ \t])#([a-zA-Z0-9_-]*)$/);
           if (!match) return current.getSuggestions(lines, line, col, options);
           const token = match[1].toLowerCase();
           const agents = enabledAgents(discoverAgents(cwd || process.cwd(), false)).filter((agent) => agent.name.toLowerCase().startsWith(token));
           return {
-            prefix: `@${match[1]}`,
-            items: agents.map((agent) => ({ value: `@${agent.name}`, label: `${agent.name} — ${agent.description}` })),
+            prefix: `#${match[1]}`,
+            items: agents.map((agent) => ({ value: `#${agent.name}`, label: `${agent.name} — ${agent.description}` })),
           };
         },
         applyCompletion(lines: string[], line: number, col: number, item: { value: string }, prefix: string) {
@@ -1425,7 +1425,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       "Delegate one task to an isolated specialist child. Blocking by default; pass run_in_background: true to return immediately and be notified on completion.",
       "For parallel work, emit every independent subagent call as sibling tool calls in the SAME assistant response; pi executes those calls concurrently.",
       "Do not call one subagent and wait before issuing another independent call. Wait only when the later task depends on an earlier result.",
-      "Users may mention agents as @name in their message (e.g. '@scout find the auth flow') — treat that as a request to delegate that task to that agent via this tool.",
+      "Users may mention agents as #name in their message (e.g. '#scout find the auth flow') — treat that as a request to delegate that task to that agent via this tool. @path mentions are file attachments, not agent references.",
       `Available user agents: ${catalog}.`,
     ].join(" "),
     parameters: Type.Object({

@@ -107,6 +107,10 @@ subagent({ continue: "<run-id>", task })                     // continue a finis
   independent calls in one response; prompt metadata makes the desired behavior
   explicit and testable, but only a future explicit batch parameter could make
   batching a code-level guarantee.
+- **`#agent` mentions**: typing `#scout` in the editor autocompletes
+  discovered agents (editor autocomplete provider, trigger `#`); the mention
+  is plain text — the tool description tells the model that `#name` means
+  "delegate this task to that agent". `@path` stays pi's file mention.
 - `model`: explicit `provider/id` overrides; default inherits parent
   (`ctx.model`). Same precedence for frontmatter (§5).
 - `continue` is **allowed cross-session** (a run is a disk artifact, not owned
