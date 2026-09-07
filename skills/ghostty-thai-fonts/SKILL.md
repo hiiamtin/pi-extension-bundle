@@ -1,5 +1,6 @@
 ---
 name: ghostty-thai-fonts
+disable-model-invocation: true
 description: Manage Thai fonts in the Ghostty terminal — find/download Thai fonts from Google Fonts, measure glyph widths against the terminal cell (overlap detection), set font-codepoint-map and adjust-cell-width in the Ghostty config, generate preview images comparing all installed Thai fonts, and build custom monospace Thai fonts from proportional ones. Use when the user mentions changing, finding, measuring, or building Thai fonts for Ghostty.
 ---
 
