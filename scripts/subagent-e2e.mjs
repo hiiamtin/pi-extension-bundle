@@ -852,6 +852,7 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
   const result = await wrapped.getSuggestions(["@sc"], 0, 3, {});
   assert(result.prefix === "@sc", "provider must expose the typed prefix");
   assert(result.items.some((item) => item.value === "@scout"), "@sc must complete to @scout");
+  assert(result.items.every((item) => !item.value.includes("oracle")), "suggestions must filter by typed prefix");
   const idle = await wrapped.getSuggestions(["hello world"], 0, 11, {});
   assert.deepEqual(idle, { prefix: "", items: [] }, "non-@ text must fall through to the built-in provider");
 }

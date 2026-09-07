@@ -1380,7 +1380,8 @@ export default function subagentExtension(pi: ExtensionAPI): void {
           const before = (lines[line] ?? "").slice(0, col);
           const match = before.match(/(?:^|[ \t])@([a-zA-Z0-9_-]*)$/);
           if (!match) return current.getSuggestions(lines, line, col, options);
-          const agents = enabledAgents(discoverAgents(cwd || process.cwd(), false));
+          const token = match[1].toLowerCase();
+          const agents = enabledAgents(discoverAgents(cwd || process.cwd(), false)).filter((agent) => agent.name.toLowerCase().startsWith(token));
           return {
             prefix: `@${match[1]}`,
             items: agents.map((agent) => ({ value: `@${agent.name}`, label: `${agent.name} — ${agent.description}` })),
