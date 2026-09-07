@@ -24,7 +24,7 @@ Manage Thai fonts for the Ghostty terminal on macOS.
 
 ## Commands
 
-All via: `"$HOME/.pi/agent/skills/ghostty-thai-fonts/scripts/thaifont" <mode>`
+All via: `scripts/thaifont <mode>` (relative to this skill's directory)
 
 ```bash
 thaifont list                     # all Thai-capable fonts installed on the system
