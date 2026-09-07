@@ -280,6 +280,15 @@ missing param fails loudly instead of silently sending `undefined` upstream.
 Ask a quick question mid-task without polluting the main conversation.
 Design doc with full rationale: `docs/btw.md`.
 
+### 9router.ts — dynamic 9Router provider & model discovery
+
+Registers the `9router` OpenAI-compatible model provider dynamically on startup:
+- Discovers live models & combos from `${NINEROUTER_URL}/models` (default: `http://9router.tintindev.com/v1`)
+- Maps real context windows (e.g. 1M for Gemini, MiniMax, GLM-5.3, Opus 4.6+, Qwen 3.7+), max tokens, reasoning, and vision modalities
+- Pre-resolves combos (`snowy`, `flash-research`, `coder`, `smartmode`) with member bottlenecks
+- Offline cache stored in `~/.pi/agent/9router-models-cache.json` for resilient startup
+- `/9router-sync` command to refresh models dynamically without restarting pi
+
 - **/btw <question>** — new side thread: replays the main thread's real request
   prefix (same system prompt, tools, message history) + the question appended
   last. The identical prefix is what makes provider prompt-cache hits work
@@ -335,6 +344,7 @@ extensions/
   tok-rate.ts      live tok/s in the working row (streaming deltas → setWorkingMessage)
   btw.ts           /btw — side-question command (real-fork, cache-friendly;
                    design: docs/btw.md)
+  9router.ts       dynamic 9Router provider & model discovery + /9router-sync
 Mention agents while typing: `#scout` autocompletes and asks the model to
 delegate to that agent (`@` stays reserved for pi file mentions).
 
