@@ -280,15 +280,6 @@ missing param fails loudly instead of silently sending `undefined` upstream.
 Ask a quick question mid-task without polluting the main conversation.
 Design doc with full rationale: `docs/btw.md`.
 
-### 9router.ts — dynamic 9Router provider & model discovery
-
-Registers the `9router` OpenAI-compatible model provider dynamically on startup:
-- Discovers live models & combos from `${NINEROUTER_URL}/models` (default: `http://9router.tintindev.com/v1`)
-- Maps real context windows (e.g. 1M for Gemini, MiniMax, GLM-5.3, Opus 4.6+, Qwen 3.7+), max tokens, reasoning, and vision modalities
-- Pre-resolves combos (`snowy`, `flash-research`, `coder`, `smartmode`) with member bottlenecks
-- Offline cache stored in `~/.pi/agent/9router-models-cache.json` for resilient startup
-- `/9router-sync` command to refresh models dynamically without restarting pi
-
 - **/btw <question>** — new side thread: replays the main thread's real request
   prefix (same system prompt, tools, message history) + the question appended
   last. The identical prefix is what makes provider prompt-cache hits work
@@ -311,6 +302,18 @@ Registers the `9router` OpenAI-compatible model provider dynamically on startup:
   a cheaper model), `thinkingLevel`, `cacheRetention` ("none"|"short"|"long").
 - Debug: set `BTW_DEBUG_DUMP=/tmp/btw.json` to dump the exact assembled
   request context (for verifying cache-prefix identity; see docs/btw.md §9).
+
+### 9router.ts — dynamic 9Router provider & model discovery
+
+Registers the `9router` OpenAI-compatible model provider dynamically on startup without needing to manually write models in `models.json`:
+- **Live Discovery**: Discovers active models & combos from `${NINEROUTER_URL}/models` (default: `http://9router.tintindev.com/v1`).
+- **Deep Capability Mapping**: Accurately sets `contextWindow` (e.g. 1M for Gemini, MiniMax M3, GLM-5.3, Opus 4.6+, Qwen 3.7+; 400k for GPT-5.6 series), `maxTokens`, extended `reasoning: true`, and multimodal input (`["text", "image"]`) via vendor tables and regex heuristics.
+- **Combo Bottlenecking**: Auto-configures known combos (`snowy`, `flash-research`, `coder`, `smartmode`) and any `owned_by: "combo"` models with appropriate context limits and vision capabilities.
+- **Offline & Resilient**: 4-second fetch timeout with local caching at `~/.pi/agent/9router-models-cache.json`. If network is unreachable, falls back to cache or core presets so pi never hangs.
+- **/9router-sync**: Slash command to refresh the model list dynamically while pi is running.
+- **Environment & Auth**:
+  - `NINEROUTER_URL`: endpoint (default: `http://9router.tintindev.com/v1`).
+  - `NINEROUTER_KEY` (or `ROUTER9_ENDPOINT_KEY`): API key. Recommended to inject via `infisical run -- pi` (zero disk footprint) or macOS Keychain to avoid plaintext secrets on disk.
 
 ## Conventions for new extensions
 
