@@ -436,6 +436,44 @@ ui.confirm fallback deferred, test-seam env knobs.
   research `9router/flash-research` (web_search/web_fetch exts).
 - Deliberately untracked: `.agents/` (local skills) and `skills-lock.json`.
 
+### P4 record (2026-09-06) — interactive viewer, fleet widget, mentions, toggles
+
+Live-verified in the real TUI and in pi-web/ttyd (browser terminal).
+
+- **Chat viewer** (`/subagents chat [id]`, global `ctrl+alt+s` via
+  `pi.registerShortcut`): `ui.custom` component — colored you/agent dialogue
+  with tool calls interleaved in place, fixed-height scrolling
+  (arrows/jk/PgUp/PgDn/g/G/space), running runs re-read state every second
+  (LIVE marker). `esc`/`q`/`ctrl+c` exit; pi hands focused components RAW
+  terminal data, so keys are matched as bytes, not parsed names.
+- **Two-way actions**: `s` composes a message — live run ⇒ steer, finished
+  run ⇒ background continue on the SAME run id (viewer follows, LIVE again).
+  `D` twice stops the run (explicit two-press confirmation).
+- **Quiet vs notify (per-round policy `meta.notifyOnDone`)**: AI
+  `subagent({continue})` always notifies (push + triggerTurn). Viewer sends
+  default QUIET (user is watching; completion silently marked delivered —
+  sweeps never resurface it); `n` toggles notify:on for the next send (full
+  push). Steering never changes the policy — it belongs to whoever started
+  the latest round. Every new round resets notifiedAt/notifyTries (inherited
+  markers used to silence all future completions).
+- **FleetView widget** (key `subagents`, placement belowEditor): run count +
+  per-run id/agent/state/elapsed/task lines while anything is active, clears
+  when idle; refreshed on start/settle/inline-delivery, session activity,
+  and a 2s ticker. Setter captured from the first TUI context carrying
+  `ui.setWidget`.
+- **Agent mentions**: `#name` (editor autocomplete provider, trigger `#`,
+  prefix-filtered) — plain text; the tool description teaches the model that
+  `#name` = delegate. `@path` stays pi's file mention.
+- **Roster & toggles**: `/subagents agents` (model/tools/timeout/state),
+  `agents off|on <name>` per-session in-memory disable;
+  `enabled: false` frontmatter = durable disable (hidden from catalog, loud
+  invoke/continue errors). Disabled vs unknown invoke errors are distinct.
+- **Known platform limits**: `#` autocomplete popup and `ctrl+alt+s` do not
+  fire in browser terminals (ttyd) — macOS Option-key encoding and browser
+  key interception; works in real terminal emulators. `ui.custom` viewer,
+  widget, and commands DO work in pi-web (it renders extension custom UI and
+  forwards keys).
+
 ### P2 entry checklist (next phase — background mode)
 
 > **P2 DONE (2026-09-05, same day).** See the P2 record below the checklist;
