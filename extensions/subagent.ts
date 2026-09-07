@@ -28,6 +28,7 @@ import { startRpcChild, type RpcChild } from "../lib/rpc-child.ts";
 import {
   captureExtensionApi,
   deliverRunNotice,
+  sendToSession,
   finalizeOrphans,
   pruneRuns,
   pumpContext,
@@ -1535,7 +1536,10 @@ export default function subagentExtension(pi: ExtensionAPI): void {
         const [, action, namePrefix] = agentsSub;
         const names = enabledFallbackList();
         if (!action) {
-          return names.slice(0, 8).map((name) => ({ value: `agents ${name}`, label: `${name} — enable/disable for this session` }));
+          return [
+            { value: "agents full", label: "full — detailed roster into chat" },
+            ...names.slice(0, 7).map((name) => ({ value: `agents ${name}`, label: `${name} — enable/disable for this session` })),
+          ];
         }
         return names
           .filter((name) => name.startsWith(namePrefix))
@@ -1614,17 +1618,25 @@ export default function subagentExtension(pi: ExtensionAPI): void {
         ctx.ui?.notify?.(inspectFinishedSummary(meta), "info");
         return;
       }
-      const rosterMatch = input.match(/^agents(?:\s+(off|on)\s+(\S+))?$/);
+      const rosterMatch = input.match(/^agents(?:\s+(full|off|on)(?:\s+(\S+))?)?$/);
       if (rosterMatch) {
         const [, action, name] = rosterMatch;
         const agents = discoverAgents(ctx?.cwd || pi.cwd || process.cwd(), projectAgentsAllowed(ctx?.cwd || pi.cwd || process.cwd(), ctx));
-        if (!action) {
+        if (action === "full") {
           const lines = agents.map((agent) => {
             const state = agent.enabled ? "on" : sessionDisabled.has(agent.name) ? "off (session)" : "off (frontmatter)";
             const tools = agent.tools ? `${agent.tools.length} tools` : "all tools";
-            return `${agent.enabled ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${agent.name} · ${agent.model ?? "inherit"} · ${tools} · ${agent.timeoutMin}min · ${state}\n    ${agent.description}`;
+            return `${agent.enabled ? "✓" : "✗"} ${agent.name} · ${agent.model ?? "inherit"} · ${tools} · ${agent.timeoutMin}min · ${state}\n    ${agent.description}`;
           });
-          ctx.ui?.notify?.([`subagent agents (${agents.length}):`, ...lines, "toggle: /subagents agents off|on <name> (session only)"].join("\n"), "info");
+          const report = [`subagent agents (${agents.length}):`, ...lines, "toggle: /subagents agents off|on <name> (session only)"].join("\n");
+          const sent = sendToSession({ customType: "subagent-agents", display: true, content: report, details: {} }, { deliverAs: "followUp", triggerTurn: false }, ctx?.sessionManager?.getSessionFile?.());
+          if (!sent.ok) ctx.ui?.notify?.(report, "info");
+          return;
+        }
+        if (!action) {
+          const marks = agents.map((agent) => `${agent.enabled ? "✓" : "✗"}${agent.name}`).join(" ");
+          const off = agents.filter((agent) => !agent.enabled).map((agent) => agent.name);
+          ctx.ui?.notify?.(`subagents (${agents.length}): ${marks} · off: ${off.length ? off.join(", ") : "none"} · toggle: agents off|on <name>`, "info");
           return;
         }
         const target = agents.find((agent) => agent.name === name);

@@ -822,8 +822,18 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
   notices.length = 0;
   await commands.subagents.handler("agents", ctx);
   const roster = notices.map((notice) => notice.message).join("\n");
-  assert.match(roster, /scout/, "roster must list scout");
-  assert.match(roster, /disabled/, "roster must include the disabled agent");
+  assert.match(roster, /subagents \(5\)/, "compact roster header");
+  assert.match(roster, /✓scout/, "roster must list scout");
+  assert.match(roster, /off: disabled/, "roster must surface the disabled agent");
+  assert(!roster.includes("\x1b"), "roster must not embed ANSI codes");
+  // full roster rides the chat channel (like bg notices) — persistent, readable
+  bgNotices.length = 0;
+  await commands.subagents.handler("agents full", ctx);
+  await waitFor(() => bgNotices.length > 0, 3000);
+  const fullRoster = bgNotices.at(-1)?.message?.content ?? "";
+  assert.match(fullRoster, /Research with one skill and one MCP server/, "full roster must carry descriptions");
+  assert.match(fullRoster, /✗ disabled/, "full roster must mark the disabled agent");
+  assert(!fullRoster.includes("\x1b"), "full roster must not embed ANSI codes");
   notices.length = 0;
   await commands.subagents.handler("agents off scout", ctx);
   const offRun = await tool.execute("roster-off", { agent: "scout", task: "x" }, undefined, undefined, ctx);

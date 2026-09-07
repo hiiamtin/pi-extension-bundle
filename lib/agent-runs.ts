@@ -147,7 +147,7 @@ export function canNotifyHere(
 // The blind fallback must additionally respect ownership (fallbackAllowed):
 // otherwise a restarted single-session host would leak another session's
 // notice into the one session it knows.
-function sendToSession(message: unknown, opts: unknown, target?: string, fallbackAllowed = true): { ok: boolean; outcome: string } {
+export function sendToSession(message: unknown, opts: unknown, target?: string, fallbackAllowed = true): { ok: boolean; outcome: string } {
   const tried: string[] = [];
   let outcome = "sendMessage unavailable";
   const trySend = (label: string, fn: unknown): boolean => {
