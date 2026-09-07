@@ -175,7 +175,6 @@ type Frontmatter = {
 
 type ToolCtx = {
   cwd?: string;
-  mode?: string;
   model?: { provider?: string; id?: string };
   thinkingLevel?: string;
   hasUI?: boolean;
@@ -1652,8 +1651,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       }
       const chat = input.match(/^chat(?:\s+(\S+))?$/);
       if (chat) {
-        // the viewer is a TUI component — non-TUI hosts (pi-web rpc) get text
-        if (ctx.hasUI && ctx.mode === "tui" && ctx.ui?.custom) {
+          if (ctx.hasUI && ctx.ui?.custom) {
           await openChatViewer(ctx, chat[1], runsIo);
           return;
         }

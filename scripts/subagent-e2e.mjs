@@ -635,7 +635,6 @@ assert(!bgNotices.some((notice) => String(notice.message?.content ?? "").include
   const selectCalls = [];
   const tuiCtx = {
     ...ctx,
-    mode: "tui",
     hasUI: true,
     ui: {
       notify: (message, level) => notices.push({ message, level }),
@@ -701,7 +700,6 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
   const fakeTheme = { fg: (_k, t) => t, bold: (t) => t };
   const actionCtx = {
     ...ctx,
-    mode: "tui",
     mode: "tui",
     hasUI: true,
     ui: {
