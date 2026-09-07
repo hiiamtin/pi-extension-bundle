@@ -448,6 +448,7 @@ function markInlineDelivered(id: string): void {
   try {
     mergeMeta(id, (current) => (current.notifiedAt ? current : { ...current, notifiedAt: Date.now() }));
   } catch { /* meta is best-effort */ }
+  updateFleetWidget();
 }
 
 function bgStartText(id: string, agentName: string): string {
@@ -456,6 +457,26 @@ function bgStartText(id: string, agentName: string): string {
     "You will be notified here when it finishes; keep working meanwhile.",
     `Progress: /subagents list · Stop: /subagents kill ${id}`,
   ].join("\n");
+}
+
+// FleetView widget (below editor): compact live summary of active runs.
+// The setter is captured from the first TUI context that provides it.
+let fleetSetWidget: ((key: string, lines?: string[]) => void) | null = null;
+
+function updateFleetWidget(): void {
+  if (!fleetSetWidget) return;
+  const active = listMetas().filter((run) => run.state === "running" || run.state === "queued");
+  if (!active.length) {
+    fleetSetWidget("subagents", undefined);
+    return;
+  }
+  const now = Date.now();
+  const lines = [`${active.length} subagent run(s) active · ctrl+alt+s viewer`];
+  for (const run of active.slice(0, 5)) {
+    const elapsed = fmtDur(now - (run.startedAt ?? run.createdAt));
+    lines.push(`  ${run.id} · ${run.agent} · ${run.state} · ${elapsed} · ${run.task.slice(0, 40)}`);
+  }
+  fleetSetWidget("subagents", lines);
 }
 
 // Fire-and-forget: when a background run settles, push its notice to the owner
@@ -471,7 +492,7 @@ function launchBackground(running: Promise<unknown>, id: string, runsIo: RunsIo)
       return;
     }
     deliverRunNotice(final, runsIo);
-  }).catch(() => {});
+  }).catch(() => {}).finally(() => updateFleetWidget());
 }
 
 function killProcessGroup(meta: RunMeta): void {
@@ -629,6 +650,7 @@ async function runAgent(
       };
   writeMeta(meta);
   onStart?.(meta);
+  updateFleetWidget();
 
   const releaseSlot = await childSlots.acquire();
   const queuedState = readMeta(meta.id)?.state;
@@ -850,6 +872,7 @@ async function runAgent(
     if (abortHandler) signal?.removeEventListener("abort", abortHandler);
     if (mcpConfig) rmSync(mcpConfig, { force: true });
     liveRuns.delete(meta.id);
+    updateFleetWidget();
   }
 }
 
@@ -1311,10 +1334,15 @@ export default function subagentExtension(pi: ExtensionAPI): void {
   housekeep();
   const housekeeper = setInterval(housekeep, 3_600_000);
   housekeeper.unref?.();
+  const fleetTicker = setInterval(updateFleetWidget, 2_000);
+  fleetTicker.unref?.();
 
   const onActivity = (_event: unknown, eventCtx: unknown) => {
     try {
       trackSession(eventCtx);
+      const eventUi = (eventCtx as { ui?: { setWidget?: (key: string, lines?: string[], opts?: unknown) => void } } | undefined)?.ui;
+      if (eventUi?.setWidget) fleetSetWidget = (key, lines) => eventUi.setWidget(key, lines, { placement: "belowEditor" });
+      updateFleetWidget();
       housekeep();
       sweepFinishedRuns(runsIo);
     } catch {

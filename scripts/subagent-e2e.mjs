@@ -105,6 +105,7 @@ const viewerShortcut = shortcuts.find((entry) => entry.shortcut === "ctrl+alt+s"
 assert(viewerShortcut, "ctrl+alt+s must be registered for the chat viewer");
 
 const notices = [];
+const widgetCalls = [];
 const ctx = {
   cwd: pkgRoot,
   model: { provider: "parent", id: "parent-model" },
@@ -112,7 +113,7 @@ const ctx = {
   hasUI: false,
   isProjectTrusted: () => true,
   sessionManager: { getSessionFile: () => path.join(root, "parent-session.jsonl") },
-  ui: { notify: (message, level) => notices.push({ message, level }) },
+  ui: { notify: (message, level) => notices.push({ message, level }), setWidget: (key, lines) => widgetCalls.push({ key, lines }) },
 };
 
 const updates = [];
@@ -777,6 +778,27 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
   await waitFor(() => bgNotices.length > noticesBeforeNotify, 3000);
   assert(bgNotices.slice(noticesBeforeNotify).some((notice) => String(notice.message?.content ?? "").includes("ping")), "notify:on continue must push a completion notice");
   viewer.handleInput("\x1b"); // esc closes viewer
+}
+
+// FleetView widget: active runs surface below the editor
+{
+  const widgetStart = widgetCalls.length;
+  fire("session_start", {
+    sessionManager: { getSessionFile: () => path.join(root, "parent-session.jsonl") },
+    ui: { setWidget: (key, lines) => widgetCalls.push({ key, lines }) },
+  });
+  process.env.FAKE_SUBAGENT_DELAY_MS = "1200";
+  const wPromise = tool.execute("widget-live", { agent: "scout", task: "fleet widget run", run_in_background: true }, undefined, undefined, ctx);
+  const wRun = await waitFor(() => readdirSync(stateDir)
+    .map((entry) => JSON.parse(readFileSync(path.join(stateDir, entry, "meta.json"), "utf8")))
+    .find((meta) => meta.task === "fleet widget run" && meta.state === "running"));
+  const wCall = await waitFor(() => widgetCalls.slice(widgetStart).reverse().find((call) => call.lines?.some((line) => line.includes(wRun.id) && line.includes("running"))), 4000);
+  assert.equal(wCall.key, "subagents", "widget key must be subagents");
+  assert.match(wCall.lines[0], /1 subagent run\(s\) active/, "widget header must count active runs");
+  await wPromise;
+  delete process.env.FAKE_SUBAGENT_DELAY_MS;
+  await waitFor(() => widgetCalls.length > 0 && widgetCalls[widgetCalls.length - 1].lines === undefined, 5000);
+  assert(widgetCalls[widgetCalls.length - 1].lines === undefined, "widget must clear when no runs are active");
 }
 
 console.log("ALL SUBAGENT E2E TESTS PASSED");
