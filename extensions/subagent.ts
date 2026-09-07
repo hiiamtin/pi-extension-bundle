@@ -120,6 +120,8 @@ interface RunMeta {
   exitCode?: number | null;
   signal?: string | null;
   error?: string;
+  /** completion notify policy for the LATEST run round: false = quiet (viewer send), default/true = push+turn */
+  notifyOnDone?: boolean;
   sessionFile: string;
   transcriptPath: string;
   resultPath: string;
@@ -458,10 +460,17 @@ function bgStartText(id: string, agentName: string): string {
 
 // Fire-and-forget: when a background run settles, push its notice to the owner
 // session. Failed pushes stay pending — the sweep and context pump own them.
-function launchBackground(running: Promise<unknown>, id: string, runsIo: { list: () => RunMeta[]; save: (meta: RunNoticeMeta) => void }): void {
+function launchBackground(running: Promise<unknown>, id: string, runsIo: RunsIo): void {
   void running.then(() => {
     const final = readMeta(id);
-    if (final && !final.notifiedAt) deliverRunNotice(final, runsIo);
+    if (!final || final.notifiedAt) return;
+    if (final.notifyOnDone === false) {
+      // quiet round (user sent it from the viewer and is watching there):
+      // mark delivered so sweeps never resurface it — no chat push, no turn
+      mergeMeta(id, (current) => (current.notifiedAt ? current : { ...current, notifiedAt: Date.now() }));
+      return;
+    }
+    deliverRunNotice(final, runsIo);
   }).catch(() => {});
 }
 
@@ -532,6 +541,7 @@ async function continueRun(
   onUpdate?: OnUpdate,
   runsIo?: RunsIo,
   bg = false,
+  notifyOnDone?: boolean,
 ): Promise<RunResult | string> {
   const existing = readMeta(id);
   if (!existing) return `error: run '${id}' not found — use /subagents list`;
@@ -542,7 +552,7 @@ async function continueRun(
   if (!agent) return `error: agent '${existing.agent}' for run '${id}' is no longer available`;
   const inherited = { model: existing.model, thinking: ctx?.thinkingLevel };
   if (bg && runsIo) {
-    const running = runAgent(agent, task, cwd, inherited, existing.ownerSession, undefined, undefined, existing);
+    const running = runAgent(agent, task, cwd, inherited, existing.ownerSession, undefined, undefined, existing, { notifyOnDone });
     launchBackground(running, existing.id, runsIo);
     return bgStartText(existing.id, agent.name);
   }
@@ -573,6 +583,7 @@ async function runAgent(
   signal: AbortSignal | undefined,
   onUpdate: OnUpdate | undefined,
   existing?: RunMeta,
+  opts?: { notifyOnDone?: boolean },
   onStart?: (meta: RunMeta) => void,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: RunDetails; usage?: Record<string, unknown> }> {
   const id = existing?.id ?? nextId();
@@ -592,6 +603,11 @@ async function runAgent(
         signal: undefined,
         error: undefined,
         timeoutMin: agent.timeoutMin,
+        // a new round is a new notification cycle — never inherit the
+        // previous round's delivered marker or retry counter
+        notifiedAt: undefined,
+        notifyTries: undefined,
+        ...(opts?.notifyOnDone !== undefined ? { notifyOnDone: opts.notifyOnDone } : {}),
       }
     : {
         id,
@@ -975,6 +991,7 @@ class SubagentViewer {
   private killArmedAt = 0;
   private flash: string | null = null;
   private runsIo: RunsIo;
+  private notifyNext = false; // viewer sends default quiet; n toggles
 
   constructor(meta: RunMeta, tui: { requestRender: () => void }, done: () => void, runsIo: RunsIo) {
     this.meta = meta;
@@ -1034,17 +1051,17 @@ class SubagentViewer {
           } else if (this.meta.state === "running" || this.meta.state === "queued") {
             this.flash = "run is live in another process or session — open it there";
           } else {
-            this.flash = "continue starting…";
-            void continueRun(this.meta.id, message, undefined, undefined, undefined, this.runsIo, true)
-              .then((outcome) => {
-                this.flash = typeof outcome === "string" ? outcome.split("\n")[0] : null;
-                this.tui.requestRender();
-              })
-              .catch((error: Error) => {
-                this.flash = `continue failed: ${error.message}`;
-                this.tui.requestRender();
-              });
-          }
+          this.flash = "continue starting…";
+          void continueRun(this.meta.id, message, undefined, undefined, undefined, this.runsIo, true, this.notifyNext)
+            .then((outcome) => {
+              this.flash = typeof outcome === "string" ? outcome.split("\n")[0] : null;
+              this.tui.requestRender();
+            })
+            .catch((error: Error) => {
+              this.flash = `continue failed: ${error.message}`;
+              this.tui.requestRender();
+            });
+        }
         }
       } else if (data === "\x7f" || data === "\b") {
         this.inputMode = this.inputMode.slice(0, -1);
@@ -1065,6 +1082,12 @@ class SubagentViewer {
       // ctrl+c must never be swallowed by the viewer
       this.stopTimer();
       this.done();
+      return true;
+    }
+    if (data === "n") {
+      this.notifyNext = !this.notifyNext;
+      this.flash = null;
+      this.tui.requestRender();
       return true;
     }
     if (data === "s") {
@@ -1122,11 +1145,12 @@ class SubagentViewer {
     const visible = this.lines.slice(this.scrollTop, this.scrollTop + VIEWER_ROWS);
     const padded = [...visible];
     while (padded.length < VIEWER_ROWS) padded.push("");
+    const notifyTag = this.notifyNext ? "\x1b[1;33mnotify:on\x1b[0m" : "\x1b[2mnotify:off\x1b[0m";
     const footer = this.inputMode !== null
       ? `\x1b[1;36msteer:\x1b[0m ${this.inputMode}\x1b[2m▏ · enter send · esc cancel\x1b[0m`
       : this.flash
         ? `\x1b[1;33m${this.flash}\x1b[0m`
-        : "\x1b[2m↑↓/jk scroll · g/G top/end · s steer · D stop · esc/q back\x1b[0m";
+        : `\x1b[2m↑↓/jk scroll · g/G ends · s talk · D stop · n ${notifyTag} · esc back\x1b[0m`;
     return [header, ...padded, footer].map((line) => truncateToWidth(line, width));
   }
 }
@@ -1361,7 +1385,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
         // No call signal: background runs outlive this tool call and are
         // stopped via /subagents kill, not by parent-turn aborts.
         let started: RunMeta | undefined;
-        const running = runAgent(agent, String(params.task).trim(), cwd, { model: inheritedModel, thinking: ctx?.thinkingLevel }, ownerSession, undefined, undefined, undefined, (meta) => { started = meta; });
+        const running = runAgent(agent, String(params.task).trim(), cwd, { model: inheritedModel, thinking: ctx?.thinkingLevel }, ownerSession, undefined, undefined, undefined, { notifyOnDone: true }, (meta) => { started = meta; });
         const id = started?.id;
         if (!id) return textResult("error: background run failed to initialize");
         launchBackground(running, id, runsIo);

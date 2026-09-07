@@ -586,6 +586,7 @@ mod.default({
   registerCommand: (n, c) => (commands[n] = c),
   on: (name, handler) => { (hooks[name] ??= []).push(handler); },
   registerShortcut: (shortcut, opts) => { (shortcuts ??= []).push({ shortcut, opts }); },
+  sendMessage: (message, opts) => bgNotices.push({ message, opts }),
   events: { emit: (name, data) => lifecycleEvents.push({ name, data }) },
 });
 writeFileSync(captureFile, "");
@@ -733,6 +734,7 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
   viewer.handleInput("D");
   assert(viewer.render(100).some((line) => line.includes("already finished")), "D on a finished run must hint instead of killing");
   // s on a finished run: compose → sends a background continue on the same run id
+  const metaBefore = JSON.parse(readFileSync(path.join(stateDir, liveRun.id, "meta.json"), "utf8"));
   viewer.handleInput("s");
   assert(viewer.render(100).some((line) => line.includes("steer:")), "s on a finished run must open compose for a continue");
   viewer.handleInput("t");
@@ -748,6 +750,32 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
   const contSpawn = readFileSync(captureFile, "utf8").trim().split("\n").map(JSON.parse).filter((event) => event.event === "start").at(-1);
   assert.equal(contSpawn.args.at(-1), "Task: talk", "continue must carry the composed message");
   await waitFor(() => JSON.parse(readFileSync(path.join(stateDir, liveRun.id, "meta.json"), "utf8")).state === "done", 8000);
+  // default viewer send is QUIET: no chat push, but notifiedAt must move
+  // forward (a stale delivered marker from the previous round is a bug —
+  // it would silence future completions too)
+  const metaAfter = JSON.parse(readFileSync(path.join(stateDir, liveRun.id, "meta.json"), "utf8"));
+  assert(metaAfter.notifiedAt > metaBefore.notifiedAt, "quiet continue must refresh notifiedAt");
+  // n toggles notify-on-done for the next viewer send → push + turn
+  viewer.handleInput("n");
+  assert(viewer.render(100).some((line) => line.includes("notify:on")), "footer must show notify state");
+  mod.default({
+    cwd: pkgRoot,
+    registerTool: (t) => (registered.subagent = t),
+    registerCommand: (n, c) => (commands[n] = c),
+    on: (name, handler) => { (hooks[name] ??= []).push(handler); },
+    sendMessage: (message, opts) => bgNotices.push({ message, opts }),
+  });
+  fire("session_start", { sessionManager: { getSessionFile: () => path.join(root, "parent-session.jsonl") } });
+  viewer.handleInput("s");
+  viewer.handleInput("p");
+  viewer.handleInput("i");
+  viewer.handleInput("n");
+  viewer.handleInput("g");
+  viewer.handleInput("\r");
+  const noticesBeforeNotify = bgNotices.length;
+  await waitFor(() => JSON.parse(readFileSync(path.join(stateDir, liveRun.id, "meta.json"), "utf8")).state === "done", 8000);
+  await waitFor(() => bgNotices.length > noticesBeforeNotify, 3000);
+  assert(bgNotices.slice(noticesBeforeNotify).some((notice) => String(notice.message?.content ?? "").includes("ping")), "notify:on continue must push a completion notice");
   viewer.handleInput("\x1b"); // esc closes viewer
 }
 
