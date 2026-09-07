@@ -1,0 +1,159 @@
+#!/bin/bash
+# thaifont — manage Thai fonts for Ghostty (list / check / search / download / apply / preview / config / version)
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+MEASURE="$SKILL_DIR/scripts/measure.swift"
+FONTS_DIR="$HOME/Library/Fonts"
+GF_META="/tmp/.gfonts-metadata.json"
+
+# ---- config path detection ----
+find_config() {
+  for c in "$HOME/.config/ghostty/config" "$HOME/.config/ghostty/config.ghostty" \
+           "$HOME/Library/Application Support/com.mitchellh.ghostty/config"; do
+    if [ -f "$c" ]; then echo "$c"; return; fi
+  done
+  echo ""; return 1
+}
+
+primary_font() {
+  local cfg; cfg="$(find_config)" || { echo "AnnotationM NFM"; return; }
+  local f
+  f="$(grep -E '^\s*font-family\s*=' "$cfg" | head -1 | sed -E 's/^[^=]*=\s*//; s/"//g; s/^[[:space:]]*//; s/[[:space:]]*$//')"
+  echo "${f:-AnnotationM NFM}"
+}
+
+cmd_list() {
+  swift "$MEASURE" list
+}
+
+cmd_check() {
+  [ $# -ge 1 ] || { echo "usage: thaifont check <font...>"; exit 1; }
+  swift "$MEASURE" check "$(primary_font)" "$@"
+}
+
+cmd_search() {
+  local q="${1:-}"
+  if [ ! -s "$GF_META" ]; then
+    curl -sL "https://fonts.google.com/metadata/fonts" -o "$GF_META"
+  fi
+  python3 - "$GF_META" "$q" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+q = sys.argv[2].lower()
+for fam in data["familyMetadataList"]:
+    if "thai" not in fam.get("subsets", []): continue
+    if q and q not in fam["family"].lower(): continue
+    print(f'{fam["family"]:36s} {fam.get("category","")}')
+PY
+}
+
+cmd_download() {
+  [ $# -ge 1 ] || { echo "usage: thaifont download <Family>"; exit 1; }
+  local family="$1" dir
+  dir="$(echo "$family" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+  local ok=0
+  for base in ofl apache2; do
+    if curl -sf "https://api.github.com/repos/google/fonts/contents/$base/$dir" -o /tmp/.gfdir.json 2>/dev/null; then
+      ok=1; break
+    fi
+  done
+  if [ "$ok" = "0" ] || ! grep -q '"name"' /tmp/.gfdir.json 2>/dev/null; then
+    echo "error: '$family' not found in the google/fonts repo"; exit 1
+  fi
+  python3 -c "
+import json
+for f in json.load(open('/tmp/.gfdir.json')):
+    if f['name'].endswith('.ttf'): print(f['name'], f['download_url'])
+" | while read -r name url; do
+    curl -sL -o "$FONTS_DIR/$name" "$url"
+    echo "installed: $name"
+  done
+  echo "done. wait ~2s for macOS to register, then run: thaifont check \"$family\""
+}
+
+cmd_apply() {
+  [ $# -ge 1 ] || { echo "usage: thaifont apply <Family> [adjust%|none]"; exit 1; }
+  local family="$1" adjust="${2:-none}" cfg
+  cfg="$(find_config)" || { echo "error: Ghostty config not found"; exit 1; }
+  if grep -qE '^[[:space:]]*font-codepoint-map[[:space:]]*=' "$cfg"; then
+    sed -i '' -E "s|^[[:space:]]*font-codepoint-map[[:space:]]*=.*|font-codepoint-map = U+0E00-U+0E7F=$family|" "$cfg"
+  else
+    printf 'font-codepoint-map = U+0E00-U+0E7F=%s\n' "$family" >> "$cfg"
+  fi
+  if [ "$adjust" = "none" ]; then
+    sed -i '' -E '/^adjust-cell-width/d' "$cfg"
+  else
+    if grep -qE '^[[:space:]]*adjust-cell-width' "$cfg"; then
+      sed -i '' -E "s|^adjust-cell-width.*|adjust-cell-width = $adjust|" "$cfg"
+    else
+      printf 'adjust-cell-width = %s\n' "$adjust" >> "$cfg"
+    fi
+  fi
+  echo "applied -> $cfg"
+  cat "$cfg"
+  echo ""
+  echo ">> press Cmd+Shift+, in Ghostty to reload (full restart if replacing font files)"
+}
+
+cmd_preview() {
+  local out="/tmp/thai_font_preview.png"
+  swift "$MEASURE" preview "$out" "$(primary_font)"
+  open "$out"
+}
+
+cmd_config() {
+  local cfg; cfg="$(find_config)" || { echo "error: Ghostty config not found"; exit 1; }
+  echo "config: $cfg"
+  echo "primary font: $(primary_font)"
+  grep -E 'font-codepoint-map|adjust-cell-width' "$cfg" || echo "(no codepoint map yet)"
+}
+
+cmd_version() {
+  [ $# -ge 1 ] || { echo "usage: thaifont version <Family>"; exit 1; }
+  swift "$SKILL_DIR/scripts/font-version.swift" "$1" 2>/dev/null
+  python3 - "$1" <<'PY'
+import sys, glob, os
+from fontTools.ttLib import TTFont
+fam = sys.argv[1]
+found = False
+for p in glob.glob(os.path.expanduser("~/Library/Fonts/*.ttf")):
+    try:
+        f = TTFont(p, lazy=True, fontNumber=0)
+        names = {x.toUnicode() for x in f["name"].names if x.nameID in (1, 16)}
+        if fam in names:
+            ver = next((x.toUnicode() for x in f["name"].names if x.nameID == 5), "(no version)")
+            print(f"disk:       {ver}  ({os.path.basename(p)})")
+            found = True
+        f.close()
+    except Exception:
+        pass
+if not found:
+    print("disk:       error: no matching file found")
+PY
+}
+
+case "${1:-help}" in
+  list)    shift; cmd_list "$@" ;;
+  check)   shift; cmd_check "$@" ;;
+  search)  shift; cmd_search "$@" ;;
+  download) shift; cmd_download "$@" ;;
+  apply)   shift; cmd_apply "$@" ;;
+  preview) shift; cmd_preview "$@" ;;
+  config)  shift; cmd_config "$@" ;;
+  version) shift; cmd_version "$@" ;;
+  *) cat <<'EOF'
+thaifont — manage Thai fonts for Ghostty
+
+  thaifont list                    list all Thai fonts installed on the system
+  thaifont check <font...>         measure glyph widths vs the primary font cell (overlap?)
+  thaifont search [query]          search Thai fonts on Google Fonts
+  thaifont download <Family>       download+install from the google/fonts repo
+  thaifont apply <Family> [%|none] set the Thai font in the Ghostty config (+adjust-cell-width)
+  thaifont preview                 render+open a comparison image of all installed Thai fonts
+  thaifont config                  show current config
+  thaifont version <Family>        show registered vs on-disk font version (cache debugging)
+EOF
+  ;;
+esac
