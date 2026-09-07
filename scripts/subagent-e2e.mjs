@@ -38,6 +38,10 @@ writeFileSync(
   `---\nname: researcher\ndescription: Research with one skill and one MCP server.\ntools: read\nskills: [review-marker]\nmcp: [context7]\n---\n\nResearch carefully.\n`,
 );
 writeFileSync(path.join(agentDir, "skills", "review-marker", "SKILL.md"), `---\nname: review-marker\ndescription: Test review skill.\n---\n\nReview.\n`);
+writeFileSync(
+  path.join(agentDir, "agents", "disabled.md"),
+  "---\nname: disabled\ndescription: Disabled test agent.\nenabled: false\ntools: [read]\n---\n\nShould never run.\n",
+);
 writeFileSync(path.join(agentDir, "npm", "node_modules", "pi-mcp-adapter", "index.ts"), "export default function () {}\n");
 writeFileSync(path.join(agentDir, "mcp.json"), JSON.stringify({
   settings: { mcpFooterStatus: "off" },
@@ -74,6 +78,7 @@ const registered = {};
 const commands = {};
 const shortcuts = [];
 const hooks = {};
+const autocompleteProviders = [];
 const mod = await import(path.join(pkgRoot, "extensions", "subagent.ts"));
 mod.default({
   cwd: pkgRoot,
@@ -785,7 +790,10 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
   const widgetStart = widgetCalls.length;
   fire("session_start", {
     sessionManager: { getSessionFile: () => path.join(root, "parent-session.jsonl") },
-    ui: { setWidget: (key, lines) => widgetCalls.push({ key, lines }) },
+    ui: {
+      setWidget: (key, lines) => widgetCalls.push({ key, lines }),
+      addAutocompleteProvider: (provider) => autocompleteProviders.push(provider),
+    },
   });
   process.env.FAKE_SUBAGENT_DELAY_MS = "1200";
   const wPromise = tool.execute("widget-live", { agent: "scout", task: "fleet widget run", run_in_background: true }, undefined, undefined, ctx);
@@ -799,6 +807,53 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
   delete process.env.FAKE_SUBAGENT_DELAY_MS;
   await waitFor(() => widgetCalls.length > 0 && widgetCalls[widgetCalls.length - 1].lines === undefined, 5000);
   assert(widgetCalls[widgetCalls.length - 1].lines === undefined, "widget must clear when no runs are active");
+}
+
+// ─── roster: enabled flag, /subagents agents, @mention autocomplete ─────────
+{
+  // disabled agent: hidden from catalog, loud error on invoke
+  assert(!tool.description.includes("disabled:"), "disabled agent must not appear in the catalog");
+  const denied = await tool.execute("roster-deny", { agent: "disabled", task: "x" }, undefined, undefined, ctx);
+  assert.match(denied.content?.[0]?.text ?? "", /is disabled/, "invoking a disabled agent must fail loudly");
+  assert.match(tool.description, /@/, "tool description must explain @name mentions");
+
+  // roster command + session toggle
+  notices.length = 0;
+  await commands.subagents.handler("agents", ctx);
+  const roster = notices.map((notice) => notice.message).join("\n");
+  assert.match(roster, /scout/, "roster must list scout");
+  assert.match(roster, /disabled/, "roster must include the disabled agent");
+  notices.length = 0;
+  await commands.subagents.handler("agents off scout", ctx);
+  const offRun = await tool.execute("roster-off", { agent: "scout", task: "x" }, undefined, undefined, ctx);
+  assert.match(offRun.content?.[0]?.text ?? "", /disabled/, "session-off agent must refuse to run");
+  notices.length = 0;
+  await commands.subagents.handler("agents on scout", ctx);
+  const onRun = await tool.execute("roster-on", { agent: "scout", task: "back on" }, undefined, undefined, ctx);
+  assert.equal(onRun.details?.run?.state, "done", "re-enabled agent must run again");
+  const agentsCompletions = commands.subagents.getArgumentCompletions("agents off sc");
+  assert(agentsCompletions?.some((item) => item.value === "agents off scout"), "agents completions must offer names");
+}
+
+// @mention autocomplete
+{
+  fire("session_start", {
+    sessionManager: { getSessionFile: () => path.join(root, "parent-session.jsonl") },
+    ui: { addAutocompleteProvider: (provider) => autocompleteProviders.push(provider) },
+  });
+  assert(autocompleteProviders.length > 0, "session_start must register the @ provider");
+  const provider = autocompleteProviders.at(-1);
+  const current = {
+    getSuggestions: async () => ({ prefix: "", items: [] }),
+    applyCompletion: (lines, line, col, item, prefix) => {},
+    shouldTriggerFileCompletion: () => true,
+  };
+  const wrapped = provider(current);
+  const result = await wrapped.getSuggestions(["@sc"], 0, 3, {});
+  assert(result.prefix === "@sc", "provider must expose the typed prefix");
+  assert(result.items.some((item) => item.value === "@scout"), "@sc must complete to @scout");
+  const idle = await wrapped.getSuggestions(["hello world"], 0, 11, {});
+  assert.deepEqual(idle, { prefix: "", items: [] }, "non-@ text must fall through to the built-in provider");
 }
 
 console.log("ALL SUBAGENT E2E TESTS PASSED");

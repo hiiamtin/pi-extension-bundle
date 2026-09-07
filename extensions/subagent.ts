@@ -74,6 +74,7 @@ const CLEAN_ROOM_FLAGS = [
 interface AgentConfig {
   name: string;
   description: string;
+  enabled: boolean;
   model?: string;
   tools?: string[];
   extensions: string[];
@@ -162,6 +163,7 @@ interface RunDetails {
 type Frontmatter = {
   name?: unknown;
   description?: unknown;
+  enabled?: unknown;
   model?: unknown;
   tools?: unknown;
   extensions?: unknown;
@@ -237,9 +239,12 @@ function loadAgentsFromDir(dir: string, source: AgentConfig["source"]): AgentCon
       const { frontmatter, body } = parseAgentMarkdown(readFileSync(filePath, "utf8"));
       if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string") continue;
       const parsedTimeout = Number(frontmatter.timeout);
+      const enabledRaw = frontmatter.enabled;
+      const enabled = enabledRaw === undefined ? true : enabledRaw !== false && String(enabledRaw).toLowerCase() !== "false";
       agents.push({
         name: frontmatter.name.trim(),
         description: frontmatter.description.trim(),
+        enabled,
         model: typeof frontmatter.model === "string" && frontmatter.model !== "inherit" ? frontmatter.model.trim() : undefined,
         tools: parseList(frontmatter.tools).length ? parseList(frontmatter.tools) : undefined,
         extensions: parseList(frontmatter.extensions),
@@ -273,14 +278,25 @@ function nearestProjectAgentsDir(cwd: string): string | null {
   }
 }
 
+// per-session agent toggles (/subagents agents off|on) — in-memory, resets on reload
+const sessionDisabled = new Set<string>();
+
 function discoverAgents(cwd: string, projectTrusted: boolean): AgentConfig[] {
   const byName = new Map<string, AgentConfig>();
-  for (const agent of loadAgentsFromDir(path.join(AGENT_DIR, "agents"), "user")) byName.set(agent.name, agent);
+  for (const agent of loadAgentsFromDir(path.join(AGENT_DIR, "agents"), "user")) {
+    byName.set(agent.name, { ...agent, enabled: agent.enabled && !sessionDisabled.has(agent.name) });
+  }
   const projectDir = nearestProjectAgentsDir(cwd);
   if (projectTrusted && projectDir) {
-    for (const agent of loadAgentsFromDir(projectDir, "project")) byName.set(agent.name, agent);
+    for (const agent of loadAgentsFromDir(projectDir, "project")) {
+      byName.set(agent.name, { ...agent, enabled: agent.enabled && !sessionDisabled.has(agent.name) });
+    }
   }
   return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function enabledAgents(agents: AgentConfig[]): AgentConfig[] {
+  return agents.filter((agent) => agent.enabled);
 }
 
 function projectAgentsAllowed(targetCwd: string, ctx: ToolCtx | undefined): boolean {
@@ -570,7 +586,12 @@ async function continueRun(
   if (existing.state === "queued") return `error: run '${id}' is still queued — not yet steerable`;
   const cwd = existing.cwd || ctx?.cwd || process.cwd();
   const agent = discoverAgents(cwd, projectAgentsAllowed(cwd, ctx)).find((candidate) => candidate.name === existing.agent);
-  if (!agent) return `error: agent '${existing.agent}' for run '${id}' is no longer available`;
+  if (!agent) {
+    const anyAgent = discoverAgents(cwd, false).some((candidate) => candidate.name === existing.agent);
+    return anyAgent
+      ? `error: agent '${existing.agent}' for run '${id}' is disabled — /subagents agents on ${existing.agent} to enable`
+      : `error: agent '${existing.agent}' for run '${id}' is no longer available`;
+  }
   const inherited = { model: existing.model, thinking: ctx?.thinkingLevel };
   if (bg && runsIo) {
     const running = runAgent(agent, task, cwd, inherited, existing.ownerSession, undefined, undefined, existing, { notifyOnDone });
@@ -1250,6 +1271,11 @@ function armViewerShortcut(pi: ExtensionAPI): void {
   } catch { /* shortcuts must never break startup */ }
 }
 
+function enabledFallbackList(): string[] {
+  const names = loadAgentsFromDir(path.join(AGENT_DIR, "agents"), "user").map((agent) => agent.name);
+  return names.sort((a, b) => a.localeCompare(b));
+}
+
 function collectDoctorReport(cwd: string, ctx: ToolCtx | undefined): string[] {
   const lines: string[] = ["subagents doctor"];
   const invocation = getPiInvocation(["--mode", "rpc"]);
@@ -1337,6 +1363,39 @@ export default function subagentExtension(pi: ExtensionAPI): void {
   const fleetTicker = setInterval(updateFleetWidget, 2_000);
   fleetTicker.unref?.();
 
+  // @mention autocomplete: typing "@sc" offers discovered agents; the mention
+  // itself is plain text — the model reads it and delegates via the tool.
+  pi.on("session_start" as never, (_event: unknown, ctx: unknown) => {
+    try {
+      const ui = (ctx as { ui?: { addAutocompleteProvider?: (provider: unknown) => void } } | undefined)?.ui;
+      if (!ui?.addAutocompleteProvider) return;
+      const cwd = (ctx as { cwd?: string; sessionManager?: { getSessionFile?: () => string } } | undefined)?.cwd;
+      ui.addAutocompleteProvider(((current: {
+        getSuggestions: (lines: string[], line: number, col: number, options: unknown) => Promise<{ prefix: string; items: Array<{ value: string; label: string }> }>;
+        applyCompletion: (lines: string[], line: number, col: number, item: { value: string }, prefix: string) => void;
+        shouldTriggerFileCompletion?: (lines: string[], line: number, col: number) => boolean;
+      }) => ({
+        triggerCharacters: ["@"],
+        async getSuggestions(lines: string[], line: number, col: number, options: unknown) {
+          const before = (lines[line] ?? "").slice(0, col);
+          const match = before.match(/(?:^|[ \t])@([a-zA-Z0-9_-]*)$/);
+          if (!match) return current.getSuggestions(lines, line, col, options);
+          const agents = enabledAgents(discoverAgents(cwd || process.cwd(), false));
+          return {
+            prefix: `@${match[1]}`,
+            items: agents.map((agent) => ({ value: `@${agent.name}`, label: `${agent.name} — ${agent.description}` })),
+          };
+        },
+        applyCompletion(lines: string[], line: number, col: number, item: { value: string }, prefix: string) {
+          return current.applyCompletion(lines, line, col, item, prefix);
+        },
+        shouldTriggerFileCompletion(lines: string[], line: number, col: number) {
+          return current.shouldTriggerFileCompletion?.(lines, line, col) ?? true;
+        },
+      })) as never);
+    } catch { /* autocomplete must never break startup */ }
+  });
+
   const onActivity = (_event: unknown, eventCtx: unknown) => {
     try {
       trackSession(eventCtx);
@@ -1355,7 +1414,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
   pi.on("context" as never, (event: unknown, eventCtx: unknown) =>
     pumpContext(runsIo, event as { messages?: Array<Record<string, unknown>> }, eventCtx));
 
-  const initialAgents = discoverAgents(pi.cwd || process.cwd(), false);
+  const initialAgents = enabledAgents(discoverAgents(pi.cwd || process.cwd(), false));
   const catalog = initialAgents.slice(0, 8).map((agent) => `${agent.name}: ${agent.description}`).join("; ") || "none configured";
 
   pi.registerTool({
@@ -1365,6 +1424,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       "Delegate one task to an isolated specialist child. Blocking by default; pass run_in_background: true to return immediately and be notified on completion.",
       "For parallel work, emit every independent subagent call as sibling tool calls in the SAME assistant response; pi executes those calls concurrently.",
       "Do not call one subagent and wait before issuing another independent call. Wait only when the later task depends on an earlier result.",
+      "Users may mention agents as @name in their message (e.g. '@scout find the auth flow') — treat that as a request to delegate that task to that agent via this tool.",
       `Available user agents: ${catalog}.`,
     ].join(" "),
     parameters: Type.Object({
@@ -1393,6 +1453,9 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       const cwd = typeof params.cwd === "string" && params.cwd.trim() ? path.resolve(params.cwd) : ctx?.cwd || pi.cwd || process.cwd();
       const agents = discoverAgents(cwd, projectAgentsAllowed(cwd, ctx));
       let agent = agents.find((candidate) => candidate.name === String(params.agent).trim());
+      if (agent && !agent.enabled) {
+        return textResult(`error: agent '${agent.name}' is disabled — /subagents agents on ${agent.name} to enable`);
+      }
       if (!agent) {
         // Fallback deferred from P1: untrusted-but-promptable sessions may opt
         // in to project agents for this single run via an explicit confirm.
@@ -1461,10 +1524,22 @@ export default function subagentExtension(pi: ExtensionAPI): void {
     getArgumentCompletions: (prefix: string) => {
       const normalized = prefix.trimStart();
       if (!normalized.includes(" ")) {
-        const commands = ["list", "cont", "kill", "steer", "inspect", "chat", "doctor"]
+          const commands = ["list", "agents", "cont", "kill", "steer", "inspect", "chat", "doctor"]
           .filter((value) => value.startsWith(normalized))
-          .map((value) => ({ value, label: `${value} — ${{ list: "List runs", cont: "Continue a finished run", kill: "Stop a run", steer: "Redirect a running run", inspect: "View a run report", chat: "Open a run's chat viewer", doctor: "Check environment health" }[value]}` }));
+          .map((value) => ({ value, label: `${value} — ${{ list: "List runs", agents: "Browse agents + on/off", cont: "Continue a finished run", kill: "Stop a run", steer: "Redirect a running run", inspect: "View a run report", chat: "Open a run's chat viewer", doctor: "Check environment health" }[value]}` }));
         return commands.length ? commands : null;
+      }
+      const agentsSub = normalized.match(/^agents\s+(off|on)?\s*(\S*)$/);
+      if (agentsSub && normalized.startsWith("agents")) {
+        const [, action, namePrefix] = agentsSub;
+        const names = enabledFallbackList();
+        if (!action) {
+          return names.slice(0, 8).map((name) => ({ value: `agents ${name}`, label: `${name} — enable/disable for this session` }));
+        }
+        return names
+          .filter((name) => name.startsWith(namePrefix))
+          .slice(0, 8)
+          .map((name) => ({ value: `agents ${action} ${name}`, label: `${action} ${name}` }));
       }
       const match = normalized.match(/^(cont|kill|steer)\s+(\S*)$/);
       if (!match) return null;
@@ -1536,6 +1611,41 @@ export default function subagentExtension(pi: ExtensionAPI): void {
           return;
         }
         ctx.ui?.notify?.(inspectFinishedSummary(meta), "info");
+        return;
+      }
+      const rosterMatch = input.match(/^agents(?:\s+(off|on)\s+(\S+))?$/);
+      if (rosterMatch) {
+        const [, action, name] = rosterMatch;
+        const agents = discoverAgents(ctx?.cwd || pi.cwd || process.cwd(), projectAgentsAllowed(ctx?.cwd || pi.cwd || process.cwd(), ctx));
+        if (!action) {
+          const lines = agents.map((agent) => {
+            const state = agent.enabled ? "on" : sessionDisabled.has(agent.name) ? "off (session)" : "off (frontmatter)";
+            const tools = agent.tools ? `${agent.tools.length} tools` : "all tools";
+            return `${agent.enabled ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${agent.name} · ${agent.model ?? "inherit"} · ${tools} · ${agent.timeoutMin}min · ${state}\n    ${agent.description}`;
+          });
+          ctx.ui?.notify?.([`subagent agents (${agents.length}):`, ...lines, "toggle: /subagents agents off|on <name> (session only)"].join("\n"), "info");
+          return;
+        }
+        const target = agents.find((agent) => agent.name === name);
+        if (!target) {
+          ctx.ui?.notify?.(`agent '${name}' not found`, "warning");
+          return;
+        }
+        if (action === "off") {
+          sessionDisabled.add(name);
+          ctx.ui?.notify?.(`agent '${name}' disabled for this session (resets on reload)`, "info");
+        } else {
+          if (target.enabled && !sessionDisabled.has(name)) {
+            ctx.ui?.notify?.(`agent '${name}' is already enabled (frontmatter)`, "info");
+            return;
+          }
+          if (!target.enabled && !sessionDisabled.has(name)) {
+            ctx.ui?.notify?.(`agent '${name}' is disabled in frontmatter (enabled: false) — edit the .md to enable`, "warning");
+            return;
+          }
+          sessionDisabled.delete(name);
+          ctx.ui?.notify?.(`agent '${name}' enabled for this session`, "info");
+        }
         return;
       }
       const chat = input.match(/^chat(?:\s+(\S+))?$/);
