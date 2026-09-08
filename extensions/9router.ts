@@ -365,14 +365,30 @@ function resolveBaseUrl(): string {
   return clean.endsWith("/v1") ? clean : `${clean}/v1`;
 }
 
-function resolveApiKey(): { keyForFetch: string; keyForConfig: string } {
-  const envKey = process.env.NINEROUTER_KEY || process.env.ROUTER9_ENDPOINT_KEY;
-  const fallbackKey = "sk-2382b76fd1954cb1-7pnyw8-5e4b191a";
-  if (process.env.NINEROUTER_KEY) {
-    return { keyForFetch: process.env.NINEROUTER_KEY, keyForConfig: "$NINEROUTER_KEY" };
+// Strip surrounding quotes/whitespace that may leak into env values
+// (e.g. a Keychain secret stored as 'sk-...' with literal quotes would make
+// the Authorization header "Bearer 'sk-...'" and fail with 401).
+export function sanitizeKey(raw: string | undefined): string {
+  if (!raw) return "";
+  let key = raw.trim();
+  while (
+    (key.startsWith("'") && key.endsWith("'")) ||
+    (key.startsWith('"') && key.endsWith('"'))
+  ) {
+    key = key.slice(1, -1).trim();
   }
-  if (process.env.ROUTER9_ENDPOINT_KEY) {
-    return { keyForFetch: process.env.ROUTER9_ENDPOINT_KEY, keyForConfig: "$ROUTER9_ENDPOINT_KEY" };
+  return key;
+}
+
+function resolveApiKey(): { keyForFetch: string; keyForConfig: string } {
+  const ninerouterKey = sanitizeKey(process.env.NINEROUTER_KEY);
+  const router9Key = sanitizeKey(process.env.ROUTER9_ENDPOINT_KEY);
+  const fallbackKey = "sk-2382b76fd1954cb1-7pnyw8-5e4b191a";
+  if (ninerouterKey) {
+    return { keyForFetch: ninerouterKey, keyForConfig: "$NINEROUTER_KEY" };
+  }
+  if (router9Key) {
+    return { keyForFetch: router9Key, keyForConfig: "$ROUTER9_ENDPOINT_KEY" };
   }
   return { keyForFetch: fallbackKey, keyForConfig: fallbackKey };
 }
@@ -419,6 +435,8 @@ export async function fetchAndBuildModels(baseUrl: string, apiKey: string): Prom
     urlsToTry.push(baseUrl.replace(/^http:\/\//, "https://"));
   }
 
+  let lastFailure = "";
+
   for (const url of urlsToTry) {
     try {
       const controller = new AbortController();
@@ -439,13 +457,20 @@ export async function fetchAndBuildModels(baseUrl: string, apiKey: string): Prom
           return built;
         }
       }
-    } catch {}
+      lastFailure = `HTTP ${res.status}`;
+    } catch (e: any) {
+      lastFailure = `${e?.name ?? "Error"}: ${e?.message ?? e}`;
+    }
   }
 
   const cached = readCachedModels();
   if (cached && cached.length > 0) {
     return cached;
   }
+  // Surface why live discovery failed instead of failing silently.
+  console.error(
+    `[9router] live model discovery failed (${lastFailure || "unknown"}) — using fallback presets`,
+  );
   return FALLBACK_PRESET_MODELS;
 }
 
