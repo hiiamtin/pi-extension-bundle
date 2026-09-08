@@ -13,11 +13,11 @@
 //   plugin log ($TMPDIR/hindsight-coding-agent/plugin.log) → started work:
 //       "reflect goal" INFO lines mark a reflect still in flight
 //
-//   loading line        - "✦ reflecting…" in the working row while a reflect
-//                         runs (replacing pi's "Working" spinner), cleared the
-//                         moment it finishes. Position via PI_HINDSIGHT_LOADING:
-//                         row (default) / top (widget above editor) / bottom
-//                         (widget below) / footer.
+//   loading line        - "✦ reflecting… (sonic)" in the working row while a
+//                         reflect runs (replacing pi's "Working" spinner),
+//                         cleared the moment it finishes. Position via
+//                         PI_HINDSIGHT_LOADING: row (default) / top (widget
+//                         above editor) / bottom (widget below) / footer.
 //   /hindsight          - panel: resolved bank, api url, sync stats (via the
 //                         runtime's dist/status.js) + recent activity
 //   /hindsight tail     - recent memory activity only
@@ -264,8 +264,25 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
   let ui: MemUi | null = null;
   let timer: NodeJS.Timeout | null = null;
   let loading = false;
+  let bankName: string | null = null;
+  let bankPromise: Promise<void> | null = null;
   const diagTail = createTailer(DIAG_FILE);
   const logTail = createTailer(PLUGIN_LOG);
+
+  // bank id for the loading line, resolved exactly like the runtime resolves
+  // it (dist/status.js — honors mapPathToBank/banks redirects), fetched once
+  // per session in the background; diag events carrying a bank field keep it
+  // fresh for free
+  const ensureBank = (cwd: string): void => {
+    if (bankPromise) return;
+    bankPromise = runSyncStatus(cwd)
+      .then((s) => {
+        if (s?.bank) bankName = s.bank;
+      })
+      .catch(() => {
+        /* bank stays unknown — the line just omits it */
+      });
+  };
 
   // Default spot is the working row (pi's built-in "Working" spinner line):
   // the row is already visible while a reflect blocks the prompt, so our text
@@ -274,7 +291,7 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
   // is not rendered in that window.
   const showLoading = (label: string, kind: EventKind): void => {
     loading = true;
-    const text = `${ICON} ${label}`;
+    const text = bankName ? `${ICON} ${label} (${bankName})` : `${ICON} ${label}`;
     const colored = ui?.theme ? ui.theme.fg(kind === "fail" ? "error" : "accent", text) : text;
     try {
       if (SPOT === "footer") ui?.setStatus?.("hindsight", colored);
@@ -308,6 +325,12 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
 
   const poll = (): void => {
     for (const line of diagTail.poll()) {
+      try {
+        const b = (JSON.parse(line) as DiagLine & { bank?: string }).bank;
+        if (typeof b === "string" && b) bankName = b;
+      } catch {
+        /* non-JSON line */
+      }
       const ev = diagLabel(line);
       if (ev) observe(ev);
     }
@@ -322,6 +345,9 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
     if (!ctx?.ui) return;
     ui = ctx.ui;
     if ((process.env.PI_HINDSIGHT_STATUS || "").toLowerCase() === "off") return;
+    bankName = null;
+    bankPromise = null;
+    ensureBank(ctx.cwd ?? process.cwd());
     if (!timer) {
       timer = setInterval(poll, POLL_MS);
       if (typeof timer.unref === "function") timer.unref();
