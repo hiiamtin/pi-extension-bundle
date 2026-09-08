@@ -13,10 +13,11 @@
 //   plugin log ($TMPDIR/hindsight-coding-agent/plugin.log) → started work:
 //       "reflect goal" INFO lines mark a reflect still in flight
 //
-//   loading line        - "✦ refl…" while a reflect runs, cleared the moment
-//                         it finishes. Position via PI_HINDSIGHT_LOADING:
-//                         top (widget above editor, default) / bottom (widget
-//                         below) / row (tok-rate's working row) / footer.
+//   loading line        - "✦ refl…" in the working row while a reflect runs
+//                         (replacing pi's "Working" spinner), cleared the
+//                         moment it finishes. Position via PI_HINDSIGHT_LOADING:
+//                         row (default) / top (widget above editor) / bottom
+//                         (widget below) / footer.
 //   /hindsight          - panel: resolved bank, api url, sync stats (via the
 //                         runtime's dist/status.js) + recent activity
 //   /hindsight tail     - recent memory activity only
@@ -41,13 +42,14 @@ const CONFIG_JSON = join(homedir(), ".hindsight", "coding-agent.json");
 const POLL_MS = 1000;
 const ICON = "✦"; // loading-line prefix — swap freely (emoji renders inconsistently across terminals)
 
-// where the loading line lives: "top" (widget above the editor, default),
-// "bottom" (widget below), "row" (tok-rate's working row — may not render in
-// the pre-agent hang window), "footer" (status area)
+// where the loading line lives: "row" (tok-rate's working row — the default;
+// the row demonstrably renders in the pre-agent hang window, replacing pi's
+// built-in "Working" spinner until streaming starts), "top" (widget above
+// the editor), "bottom" (widget below), "footer" (status area)
 type LoadingSpot = "top" | "bottom" | "row" | "footer";
 const SPOT: LoadingSpot = ((): LoadingSpot => {
-  const v = (process.env.PI_HINDSIGHT_LOADING || "top").trim().toLowerCase();
-  return v === "bottom" || v === "row" || v === "footer" ? v : "top";
+  const v = (process.env.PI_HINDSIGHT_LOADING || "row").trim().toLowerCase();
+  return v === "top" || v === "bottom" || v === "footer" ? v : "row";
 })();
 
 type EventKind = "info" | "run" | "fail";
@@ -265,11 +267,11 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
   const diagTail = createTailer(DIAG_FILE);
   const logTail = createTailer(PLUGIN_LOG);
 
-  // Default spot is a widget above the editor, not the working row on
-  // purpose: the reflect blocks BEFORE pi's agent loop starts, so the working
-  // row may not exist in that window — widgets render regardless of turn
-  // state. "row" exists for users who prefer the tok-rate line and accept
-  // that risk.
+  // Default spot is the working row (pi's built-in "Working" spinner line):
+  // the row is already visible while a reflect blocks the prompt, so our text
+  // simply replaces the spinner label — one line, same place tok-rate paints
+  // once streaming starts. Widget/footer spots exist for hosts where the row
+  // is not rendered in that window.
   const showLoading = (label: string, kind: EventKind): void => {
     loading = true;
     const text = `${ICON} ${label}`;

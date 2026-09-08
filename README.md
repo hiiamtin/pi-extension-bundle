@@ -324,11 +324,11 @@ reads as a hang. This extension makes it visible by tailing the two log
 streams hindsight already writes (read-only; it never touches the bank, the
 config, or the logs):
 
-- **Loading line**: `✦ refl…` while the first-prompt reflect runs, cleared
-  the moment it finishes. Position via `PI_HINDSIGHT_LOADING`:
-  `top` (widget above the editor, default) / `bottom` (widget below) /
-  `row` (tok-rate's working row — may not render in the pre-agent hang
-  window) / `footer` (status area).
+- **Loading line**: `✦ refl…` in the working row (replacing pi's "Working"
+  spinner) while the first-prompt reflect runs, cleared the moment it
+  finishes. Position via `PI_HINDSIGHT_LOADING`:
+  `row` (default) / `top` (widget above the editor) / `bottom` (widget below)
+  / `footer` (status area).
 - **/hindsight**: panel with the resolved bank, api url and sync stats (docs,
   pages, git, active ops, synced) via the runtime's `dist/status.js`, plus
   recent activity.
