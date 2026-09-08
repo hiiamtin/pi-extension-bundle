@@ -86,7 +86,8 @@ Tavily (if key) → Exa (if key) → DuckDuckGo (keyless, always available)
 ```
 
 - Missing keys skip their provider — DuckDuckGo works with zero config.
-- Keys: `~/.pi/agent/web-search-config.json`:
+- Keys (env vars take priority, then the shared config file):
+  `TAVILY_API_KEY`, `EXA_API_KEY`, or `~/.pi/agent/web-search-config.json`:
   ```json
   { "tavilyApiKey": "tvly-...", "exaApiKey": "..." }
   ```

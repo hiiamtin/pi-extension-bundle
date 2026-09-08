@@ -48,3 +48,22 @@ export function requireString(
 export function textResult(text: string): { content: Array<{ type: "text"; text: string }>; details: Record<string, never> } {
   return { content: [{ type: "text" as const, text }], details: {} };
 }
+
+/**
+ * Read an API key from an environment variable, stripping surrounding
+ * whitespace and quotes. Guards against secrets stored with literal quotes
+ * (e.g. `security add-generic-password -w "'sk-...'"` leaks the quotes into
+ * the value, turning the Authorization header into "Bearer 'sk-...'" and
+ * failing with 401 — seen in practice with NINEROUTER_KEY).
+ */
+export function readEnvKey(name: string): string | undefined {
+  let key = process.env[name]?.trim();
+  if (!key) return undefined;
+  while (
+    (key.startsWith("'") && key.endsWith("'")) ||
+    (key.startsWith('"') && key.endsWith('"'))
+  ) {
+    key = key.slice(1, -1).trim();
+  }
+  return key || undefined;
+}

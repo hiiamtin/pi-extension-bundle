@@ -17,7 +17,7 @@
 // Scrapling tier requires: pip install scrapling[fetchers] && scrapling install
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { extractToolArgs, requireString, textResult } from "../lib/tool-compat.ts";
+import { extractToolArgs, readEnvKey, requireString, textResult } from "../lib/tool-compat.ts";
 import { Type } from "typebox";
 import { execFile } from "node:child_process";
 import { readFileSync, appendFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
@@ -68,9 +68,9 @@ function dbg(msg: string): void {
 
 function loadConfig(): FetchConfig {
   const out: FetchConfig = {
-    jinaApiKey: process.env.JINA_API_KEY || undefined,
-    exaApiKey: process.env.EXA_API_KEY || undefined,
-    tavilyApiKey: process.env.TAVILY_API_KEY || undefined,
+    jinaApiKey: readEnvKey("JINA_API_KEY"),
+    exaApiKey: readEnvKey("EXA_API_KEY"),
+    tavilyApiKey: readEnvKey("TAVILY_API_KEY"),
   };
   try {
     const file = JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as FetchConfig;

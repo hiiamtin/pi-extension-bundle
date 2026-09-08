@@ -7,11 +7,13 @@
 //   tries Tavily (needs key) → Exa (needs key) → DuckDuckGo (keyless, always available)
 //   missing keys skip their provider; all failures fall through to the next.
 //
-// Keys: ~/.pi/agent/web-search-config.json { "tavilyApiKey": "...", "exaApiKey": "..." }
-// (synced from Infisical by `task pi-web-search-keys`; hand-edit works too)
+// Keys (env vars take priority, then config file):
+//   TAVILY_API_KEY, EXA_API_KEY
+//   ~/.pi/agent/web-search-config.json { "tavilyApiKey": "...", "exaApiKey": "..." }
+//   (file synced from Infisical by `task pi-web-search-keys`; hand-edit works too)
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { extractToolArgs, requireString, textResult } from "../lib/tool-compat.ts";
+import { extractToolArgs, readEnvKey, requireString, textResult } from "../lib/tool-compat.ts";
 import { Type } from "typebox";
 import { readFileSync, appendFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import * as os from "node:os";
@@ -60,11 +62,17 @@ function dbg(msg: string): void {
 }
 
 function loadConfig(): SearchConfig {
+  // Env vars win; the config file fills any gaps (same semantics as web-fetch.ts).
+  const out: SearchConfig = {
+    tavilyApiKey: readEnvKey("TAVILY_API_KEY"),
+    exaApiKey: readEnvKey("EXA_API_KEY"),
+  };
   try {
-    return JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as SearchConfig;
-  } catch {
-    return {};
-  }
+    const file = JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as SearchConfig;
+    if (!out.tavilyApiKey) out.tavilyApiKey = file.tavilyApiKey;
+    if (!out.exaApiKey) out.exaApiKey = file.exaApiKey;
+  } catch { /* no config file */ }
+  return out;
 }
 
 function clip(s: string, max = SNIPPET_MAX): string {
