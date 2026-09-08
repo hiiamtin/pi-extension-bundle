@@ -347,8 +347,21 @@ export function transformToPiModel(item: RemoteModelItem): PiModelDef {
 
 function resolveBaseUrl(): string {
   const raw = process.env.NINEROUTER_URL?.trim();
-  if (!raw) return "http://9router.tintindev.com/v1";
-  const clean = raw.replace(/\/+$/, "");
+  if (!raw) return "https://9router.tintindev.com/v1";
+  let clean = raw.replace(/\/+$/, "");
+  // Upgrade http:// to https:// for remote domains.
+  // Cloudflare drops the Authorization header when redirecting 301 http -> https,
+  // causing 401 Unauthorized unless https is used directly.
+  if (
+    clean.startsWith("http://") &&
+    !clean.includes("localhost") &&
+    !clean.includes("127.0.0.1") &&
+    !clean.includes("100.") &&
+    !clean.includes("192.168.") &&
+    !clean.includes("10.")
+  ) {
+    clean = "https://" + clean.slice(7);
+  }
   return clean.endsWith("/v1") ? clean : `${clean}/v1`;
 }
 
@@ -401,26 +414,33 @@ const FALLBACK_PRESET_MODELS: PiModelDef[] = [
 ];
 
 export async function fetchAndBuildModels(baseUrl: string, apiKey: string): Promise<PiModelDef[]> {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4000);
+  const urlsToTry = [baseUrl];
+  if (baseUrl.startsWith("http://")) {
+    urlsToTry.push(baseUrl.replace(/^http:\/\//, "https://"));
+  }
 
-    const res = await fetch(`${baseUrl}/models`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
+  for (const url of urlsToTry) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4000);
 
-    if (res.ok) {
-      const payload = (await res.json()) as { data?: RemoteModelItem[] };
-      const remoteItems = payload.data ?? [];
-      if (remoteItems.length > 0) {
-        const built = remoteItems.map(transformToPiModel);
-        writeCachedModels(built);
-        return built;
+      const res = await fetch(`${url}/models`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (res.ok) {
+        const payload = (await res.json()) as { data?: RemoteModelItem[] };
+        const remoteItems = payload.data ?? [];
+        if (remoteItems.length > 0) {
+          const built = remoteItems.map(transformToPiModel);
+          writeCachedModels(built);
+          return built;
+        }
       }
-    }
-  } catch {}
+    } catch {}
+  }
 
   const cached = readCachedModels();
   if (cached && cached.length > 0) {
