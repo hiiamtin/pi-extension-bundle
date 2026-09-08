@@ -39,6 +39,10 @@ import { join } from "node:path";
 
 const DIAG_FILE = process.env.HINDSIGHT_DIAG_FILE || "/tmp/hindsight-plugin.log";
 const RUNTIME_STATUS_JS = join(homedir(), ".hindsight", "coding-agents", "dist", "status.js");
+// The install command's fixed staging dir — its presence is what "hindsight
+// installed" means here: everything this extension does reads files under it
+// or the logs it writes.
+const runtimeInstalled = (): boolean => existsSync(RUNTIME_STATUS_JS);
 const CONFIG_JSON = join(homedir(), ".hindsight", "coding-agent.json");
 const POLL_MS = 400;
 const LOADING_MAX_MS = 30_000; // safety: never hold the loading line longer than this
@@ -343,6 +347,7 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
     if (ctx?.hasUI === false) return;
     if (!ctx?.ui) return;
     ui = ctx.ui;
+    if (!runtimeInstalled()) return; // no hindsight — stay completely quiet
     if ((process.env.PI_HINDSIGHT_STATUS || "").toLowerCase() === "off") return;
     bankName = null;
     bankPromise = null;
@@ -360,7 +365,7 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
   // (recall → reflect → inject) inside this same phase.
   pi.on("before_agent_start", async (_event: unknown, ctx: { hasUI?: boolean; ui?: MemUi } | undefined) => {
     if (ctx?.ui) ui = ctx.ui;
-    if (!firstTurn) return;
+    if (!firstTurn || !runtimeInstalled()) return;
     showLoading("memory…", "run");
     firstTurn = false;
   });
