@@ -10,14 +10,16 @@
 //   diag file (JSON lines; /tmp/hindsight-plugin.log)  → completed events:
 //       retain_ok / inject_ok / inject_empty / session_start / reflect_ok /
 //       reflect_failed / pages_failed / seed_started / deepen_started
-//   plugin log ($TMPDIR/hindsight-coding-agent/plugin.log) → started work:
-//       "reflect goal" INFO lines mark a reflect still in flight
 //
-//   loading line        - "✦ reflecting… (sonic)" in the working row while a
-//                         reflect runs (replacing pi's "Working" spinner),
-//                         cleared the moment it finishes. Position via
-//                         PI_HINDSIGHT_LOADING: row (default) / top (widget
-//                         above editor) / bottom (widget below) / footer.
+//   loading line        - "✦ reflecting… (sonic)" in the working row while
+//                         prompt-time memory work runs (replacing pi's
+//                         "Working" spinner). Painted from before_agent_start
+//                         (the auto-reflect logs nothing when it starts) and
+//                         cleared when inject lands / streaming starts / turn
+//                         ends / 30s elapse, whichever comes first. Position
+//                         via PI_HINDSIGHT_LOADING: row (default) / top
+//                         (widget above editor) / bottom (widget below) /
+//                         footer.
 //   /hindsight          - panel: resolved bank, api url, sync stats (via the
 //                         runtime's dist/status.js) + recent activity
 //   /hindsight tail     - recent memory activity only
@@ -36,10 +38,10 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 const DIAG_FILE = process.env.HINDSIGHT_DIAG_FILE || "/tmp/hindsight-plugin.log";
-const PLUGIN_LOG = process.env.HINDSIGHT_LOG_FILE || join(tmpdir(), "hindsight-coding-agent", "plugin.log");
 const RUNTIME_STATUS_JS = join(homedir(), ".hindsight", "coding-agents", "dist", "status.js");
 const CONFIG_JSON = join(homedir(), ".hindsight", "coding-agent.json");
 const POLL_MS = 400;
+const LOADING_MAX_MS = 30_000; // safety: never hold the loading line longer than this
 const ICON = "✦"; // loading-line prefix — swap freely (emoji renders inconsistently across terminals)
 
 // where the loading line lives: "row" (tok-rate's working row — the default;
@@ -118,15 +120,6 @@ function diagLabel(line: string): MemEvent | null {
     default:
       return { at, label: ev.event, kind: "info" };
   }
-}
-
-// plugin.log line → "work started" events (only reflect starts are logged
-// there and nowhere in the diag file; everything else comes from the diag)
-function pluginLogLabel(line: string): MemEvent | null {
-  const m = line.match(/^(\S+)\s+\w+\s+\[\S+\]\s+(.*)$/);
-  if (!m) return null;
-  if (!m[2].startsWith("reflect goal")) return null;
-  return { at: Date.parse(m[1]) || Date.now(), label: "reflecting…", kind: "run" };
 }
 
 // incremental file tailer: returns only NEW complete lines between polls;
@@ -268,8 +261,8 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
   let bankPromise: Promise<void> | null = null;
   let firstTurn = true;
   let widgetShown = false;
+  let safetyTimer: NodeJS.Timeout | null = null;
   const diagTail = createTailer(DIAG_FILE);
-  const logTail = createTailer(PLUGIN_LOG);
 
   // bank id for the loading line, resolved exactly like the runtime resolves
   // it (dist/status.js — honors mapPathToBank/banks redirects), fetched once
@@ -305,6 +298,9 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
     loading = true;
     const text = bankName ? `${ICON} ${label} (${bankName})` : `${ICON} ${label}`;
     const colored = ui?.theme ? ui.theme.fg(kind === "fail" ? "error" : "accent", text) : text;
+    if (safetyTimer) clearTimeout(safetyTimer);
+    safetyTimer = setTimeout(() => clearLoading(), LOADING_MAX_MS);
+    if (typeof safetyTimer.unref === "function") safetyTimer.unref();
     try {
       if (SPOT === "footer") ui?.setStatus?.("hindsight", colored);
       else if (SPOT === "row") ui?.setWorkingMessage?.(colored);
@@ -322,6 +318,10 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
   };
 
   const clearLoading = (): void => {
+    if (safetyTimer) {
+      clearTimeout(safetyTimer);
+      safetyTimer = null;
+    }
     if (!loading) return;
     loading = false;
     dropWidget();
@@ -354,10 +354,6 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
         /* non-JSON line */
       }
       const ev = diagLabel(line);
-      if (ev) observe(ev);
-    }
-    for (const line of logTail.poll()) {
-      const ev = pluginLogLabel(line);
       if (ev) observe(ev);
     }
   };
@@ -433,4 +429,4 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
   });
 }
 
-export { diagLabel, fmtDur, fmtRel, formatPanel, formatRecent, pluginLogLabel, readRecentDiag };
+export { diagLabel, fmtDur, fmtRel, formatPanel, formatRecent, readRecentDiag };
