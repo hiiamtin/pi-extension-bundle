@@ -260,7 +260,6 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
   let bankName: string | null = null;
   let bankPromise: Promise<void> | null = null;
   let firstTurn = true;
-  let widgetShown = false;
   let safetyTimer: NodeJS.Timeout | null = null;
   const diagTail = createTailer(DIAG_FILE);
 
@@ -280,20 +279,10 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
   };
 
   // Default spot is the working row (pi's built-in "Working" spinner line):
-  // the row is already visible while a reflect blocks the prompt, so our text
-  // simply replaces the spinner label — one line, same place tok-rate paints
-  // once streaming starts. Widget/footer spots exist for hosts where the row
-  // is not rendered in that window.
-  const dropWidget = (): void => {
-    if (!widgetShown) return;
-    widgetShown = false;
-    try {
-      ui?.setWidget?.("hindsight", undefined);
-    } catch {
-      /* stale ui */
-    }
-  };
-
+  // the row is already visible while memory work blocks the prompt, so our
+  // text simply replaces the spinner label — one line, same place tok-rate
+  // paints once streaming starts. Widget/footer spots exist for hosts where
+  // the row is not rendered in that window.
   const showLoading = (label: string, kind: EventKind): void => {
     loading = true;
     const text = bankName ? `${ICON} ${label} (${bankName})` : `${ICON} ${label}`;
@@ -305,13 +294,6 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
       if (SPOT === "footer") ui?.setStatus?.("hindsight", colored);
       else if (SPOT === "row") ui?.setWorkingMessage?.(colored);
       else ui?.setWidget?.("hindsight", [colored], { placement: SPOT === "bottom" ? "belowEditor" : "aboveEditor" });
-      // first turn only: the auto-reflect can block BEFORE the working row
-      // exists, so the widget (renders regardless of turn state) guarantees
-      // something is on screen — dropped once streaming starts
-      if (SPOT !== "top" && firstTurn) {
-        ui?.setWidget?.("hindsight", [colored], { placement: "aboveEditor" });
-        widgetShown = true;
-      }
     } catch {
       /* stale ui after reload — drop this paint */
     }
@@ -324,7 +306,6 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
     }
     if (!loading) return;
     loading = false;
-    dropWidget();
     try {
       if (SPOT === "footer") ui?.setStatus?.("hindsight", undefined);
       else if (SPOT === "row") ui?.setWorkingMessage?.();
@@ -382,11 +363,6 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
     if (!firstTurn) return;
     showLoading("memory…", "run");
     firstTurn = false;
-  });
-
-  // streaming started — tok-rate owns the working row now; drop our widget
-  pi.on("message_start", async (event: { message?: { role?: string } }) => {
-    if (event.message?.role === "assistant") dropWidget();
   });
 
   // belt+braces: an aborted/errored turn must never leave the line behind
