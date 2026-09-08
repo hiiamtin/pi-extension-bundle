@@ -13,8 +13,8 @@
 //   plugin log ($TMPDIR/hindsight-coding-agent/plugin.log) → started work:
 //       "reflect goal" INFO lines mark a reflect still in flight
 //
-//   loading line        - "✦ refl…" in the working row while a reflect runs
-//                         (replacing pi's "Working" spinner), cleared the
+//   loading line        - "✦ reflecting…" in the working row while a reflect
+//                         runs (replacing pi's "Working" spinner), cleared the
 //                         moment it finishes. Position via PI_HINDSIGHT_LOADING:
 //                         row (default) / top (widget above editor) / bottom
 //                         (widget below) / footer.
@@ -126,7 +126,7 @@ function pluginLogLabel(line: string): MemEvent | null {
   const m = line.match(/^(\S+)\s+\w+\s+\[\S+\]\s+(.*)$/);
   if (!m) return null;
   if (!m[2].startsWith("reflect goal")) return null;
-  return { at: Date.parse(m[1]) || Date.now(), label: "refl…", kind: "run" };
+  return { at: Date.parse(m[1]) || Date.now(), label: "reflecting…", kind: "run" };
 }
 
 // incremental file tailer: returns only NEW complete lines between polls;
