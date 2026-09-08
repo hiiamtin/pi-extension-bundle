@@ -39,7 +39,7 @@ const DIAG_FILE = process.env.HINDSIGHT_DIAG_FILE || "/tmp/hindsight-plugin.log"
 const PLUGIN_LOG = process.env.HINDSIGHT_LOG_FILE || join(tmpdir(), "hindsight-coding-agent", "plugin.log");
 const RUNTIME_STATUS_JS = join(homedir(), ".hindsight", "coding-agents", "dist", "status.js");
 const CONFIG_JSON = join(homedir(), ".hindsight", "coding-agent.json");
-const POLL_MS = 1000;
+const POLL_MS = 400;
 const ICON = "✦"; // loading-line prefix — swap freely (emoji renders inconsistently across terminals)
 
 // where the loading line lives: "row" (tok-rate's working row — the default;
@@ -266,6 +266,8 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
   let loading = false;
   let bankName: string | null = null;
   let bankPromise: Promise<void> | null = null;
+  let firstTurn = true;
+  let widgetShown = false;
   const diagTail = createTailer(DIAG_FILE);
   const logTail = createTailer(PLUGIN_LOG);
 
@@ -289,6 +291,16 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
   // simply replaces the spinner label — one line, same place tok-rate paints
   // once streaming starts. Widget/footer spots exist for hosts where the row
   // is not rendered in that window.
+  const dropWidget = (): void => {
+    if (!widgetShown) return;
+    widgetShown = false;
+    try {
+      ui?.setWidget?.("hindsight", undefined);
+    } catch {
+      /* stale ui */
+    }
+  };
+
   const showLoading = (label: string, kind: EventKind): void => {
     loading = true;
     const text = bankName ? `${ICON} ${label} (${bankName})` : `${ICON} ${label}`;
@@ -297,6 +309,13 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
       if (SPOT === "footer") ui?.setStatus?.("hindsight", colored);
       else if (SPOT === "row") ui?.setWorkingMessage?.(colored);
       else ui?.setWidget?.("hindsight", [colored], { placement: SPOT === "bottom" ? "belowEditor" : "aboveEditor" });
+      // first turn only: the auto-reflect can block BEFORE the working row
+      // exists, so the widget (renders regardless of turn state) guarantees
+      // something is on screen — dropped once streaming starts
+      if (SPOT !== "top" && firstTurn) {
+        ui?.setWidget?.("hindsight", [colored], { placement: "aboveEditor" });
+        widgetShown = true;
+      }
     } catch {
       /* stale ui after reload — drop this paint */
     }
@@ -305,6 +324,7 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
   const clearLoading = (): void => {
     if (!loading) return;
     loading = false;
+    dropWidget();
     try {
       if (SPOT === "footer") ui?.setStatus?.("hindsight", undefined);
       else if (SPOT === "row") ui?.setWorkingMessage?.();
@@ -315,11 +335,13 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
   };
 
   const observe = (ev: MemEvent): void => {
-    // only reflects block the prompt visibly — mirror exactly those; every
-    // other event stays inspectable via /hindsight tail
+    // reflects are the long pole — mirror them; inject landing means the
+    // prompt-time memory work is over (the wait is over even mid-reflect)
     if (ev.label.startsWith("refl")) {
       if (ev.kind === "run") showLoading(ev.label, ev.kind);
-      else clearLoading(); // done (or failed) — the wait is over
+      else clearLoading();
+    } else if (ev.label.startsWith("inj")) {
+      clearLoading();
     }
   };
 
@@ -347,11 +369,28 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
     if ((process.env.PI_HINDSIGHT_STATUS || "").toLowerCase() === "off") return;
     bankName = null;
     bankPromise = null;
+    firstTurn = true;
     ensureBank(ctx.cwd ?? process.cwd());
     if (!timer) {
       timer = setInterval(poll, POLL_MS);
       if (typeof timer.unref === "function") timer.unref();
     }
+  });
+
+  // The auto-reflect logs NOTHING when it starts (only when it ends), so log
+  // tailing alone paints late. On the session's first turn, paint immediately
+  // from this event instead — hindsight runs its prompt-time memory work
+  // (recall → reflect → inject) inside this same phase.
+  pi.on("before_agent_start", async (_event: unknown, ctx: { hasUI?: boolean; ui?: MemUi } | undefined) => {
+    if (ctx?.ui) ui = ctx.ui;
+    if (!firstTurn) return;
+    showLoading("memory…", "run");
+    firstTurn = false;
+  });
+
+  // streaming started — tok-rate owns the working row now; drop our widget
+  pi.on("message_start", async (event: { message?: { role?: string } }) => {
+    if (event.message?.role === "assistant") dropWidget();
   });
 
   // belt+braces: an aborted/errored turn must never leave the line behind
