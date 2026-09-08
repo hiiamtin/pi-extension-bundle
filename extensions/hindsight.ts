@@ -34,7 +34,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 const DIAG_FILE = process.env.HINDSIGHT_DIAG_FILE || "/tmp/hindsight-plugin.log";

@@ -326,7 +326,8 @@ config, or the logs):
 
 - **Loading line**: `✦ reflecting… (sonic)` in the working row (replacing
   pi's "Working" spinner) while the first-prompt reflect runs, cleared the
-  moment it finishes. Position via `PI_HINDSIGHT_LOADING`:
+  moment it finishes (30s max — the safety net against sticky states).
+  Position via `PI_HINDSIGHT_LOADING`:
   `row` (default) / `top` (widget above the editor) / `bottom` (widget below)
   / `footer` (status area).
 - **/hindsight**: panel with the resolved bank, api url and sync stats (docs,
