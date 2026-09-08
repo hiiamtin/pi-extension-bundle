@@ -1,10 +1,11 @@
-// pi extension: Hindsight memory status — footer activity line + /hindsight panel.
+// pi extension: Hindsight memory loading indicator + /hindsight panel.
 //
-// WHY: the hindsight-coding-agents plugin (per-repo memory bank, recall inject,
-// retain, reflect) runs invisibly alongside pi, and its first-prompt reflect
-// can block for seconds — which reads as "hung". This extension surfaces what
-// memory is doing by tailing the two log streams hindsight already writes
-// (purely read-only — it never touches the bank, the config, or the logs):
+// WHY: the hindsight-coding-agents plugin reflects on the session's first
+// prompt BEFORE the model starts — the user hits enter and nothing moves for
+// seconds (up to the reflect timeout), which reads as "hung". This extension
+// mirrors that window as a visible loading line, tok-rate style, by tailing
+// the two log streams hindsight already writes (purely read-only — it never
+// touches the bank, the config, or the logs):
 //
 //   diag file (JSON lines; /tmp/hindsight-plugin.log)  → completed events:
 //       retain_ok / inject_ok / inject_empty / session_start / reflect_ok /
@@ -12,16 +13,20 @@
 //   plugin log ($TMPDIR/hindsight-coding-agent/plugin.log) → started work:
 //       "reflect goal" INFO lines mark a reflect still in flight
 //
-//   footer status line  - "✦ ret 338ms" — last memory event; accent while a
-//                         reflect runs, red on failures, dim after 2 quiet min
+//   loading line        - "✦ refl…" while a reflect runs, cleared the moment
+//                         it finishes. Position via PI_HINDSIGHT_LOADING:
+//                         top (widget above editor, default) / bottom (widget
+//                         below) / row (tok-rate's working row) / footer.
 //   /hindsight          - panel: resolved bank, api url, sync stats (via the
 //                         runtime's dist/status.js) + recent activity
 //   /hindsight tail     - recent memory activity only
-//   /hindsight clear    - hide the footer status line
 //
-// PI_HINDSIGHT_STATUS=off disables the live watcher (the /hindsight command
-// stays available). Machines without the hindsight runtime stay quiet: no
-// watcher, and the panel reports "runtime not found".
+// Only reflects drive the loading line — inject/retain are sub-second and
+// happen at points where pi already shows its own activity. Retained events
+// remain inspectable via /hindsight tail.
+//
+// PI_HINDSIGHT_STATUS=off disables the log watcher (the /hindsight command
+// stays available). Machines without the hindsight runtime stay quiet.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
@@ -34,8 +39,16 @@ const PLUGIN_LOG = process.env.HINDSIGHT_LOG_FILE || join(tmpdir(), "hindsight-c
 const RUNTIME_STATUS_JS = join(homedir(), ".hindsight", "coding-agents", "dist", "status.js");
 const CONFIG_JSON = join(homedir(), ".hindsight", "coding-agent.json");
 const POLL_MS = 1000;
-const STALE_MS = 120_000; // dim the status line after 2 min without events
-const ICON = "✦"; // footer/panel prefix — swap freely (emoji renders inconsistently across terminals)
+const ICON = "✦"; // loading-line prefix — swap freely (emoji renders inconsistently across terminals)
+
+// where the loading line lives: "top" (widget above the editor, default),
+// "bottom" (widget below), "row" (tok-rate's working row — may not render in
+// the pre-agent hang window), "footer" (status area)
+type LoadingSpot = "top" | "bottom" | "row" | "footer";
+const SPOT: LoadingSpot = ((): LoadingSpot => {
+  const v = (process.env.PI_HINDSIGHT_LOADING || "top").trim().toLowerCase();
+  return v === "bottom" || v === "row" || v === "footer" ? v : "top";
+})();
 
 type EventKind = "info" | "run" | "fail";
 interface MemEvent { at: number; label: string; kind: EventKind }
@@ -50,6 +63,8 @@ interface SyncStatus {
 }
 interface MemUi {
   setStatus?: (key: string, text: string | undefined) => void;
+  setWidget?: (key: string, lines: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }) => void;
+  setWorkingMessage?: (msg?: string) => void;
   notify: (msg: string, level?: string) => void;
   theme?: { fg(color: string, text: string): string };
 }
@@ -191,6 +206,8 @@ function formatRecent(events: MemEvent[]): string {
   ].join("\n");
 }
 
+interface HindsightConfig { apiUrl?: string; disabled?: boolean }
+
 // resolve bank + sync stats via the hindsight runtime's own status script
 // (its git probes print "fatal:" noise to stderr — stdout only holds the JSON)
 function runSyncStatus(cwd: string): Promise<SyncStatus | null> {
@@ -244,27 +261,47 @@ function formatPanel(sync: SyncStatus | null, apiUrl: string, events: MemEvent[]
 export default function hindsightExtension(pi: ExtensionAPI): void {
   let ui: MemUi | null = null;
   let timer: NodeJS.Timeout | null = null;
-  let lastPainted = "";
-  let last: MemEvent | null = null;
+  let loading = false;
   const diagTail = createTailer(DIAG_FILE);
   const logTail = createTailer(PLUGIN_LOG);
 
-  const paint = (text: string, kind: EventKind, stale: boolean): void => {
-    if (!ui?.setStatus) return;
-    const role = kind === "fail" ? "error" : stale ? "dim" : kind === "run" ? "accent" : "success";
-    const colored = ui.theme ? ui.theme.fg(role, text) : text;
-    if (colored === lastPainted) return; // no repaint storms from the poller
-    lastPainted = colored;
+  // Default spot is a widget above the editor, not the working row on
+  // purpose: the reflect blocks BEFORE pi's agent loop starts, so the working
+  // row may not exist in that window — widgets render regardless of turn
+  // state. "row" exists for users who prefer the tok-rate line and accept
+  // that risk.
+  const showLoading = (label: string, kind: EventKind): void => {
+    loading = true;
+    const text = `${ICON} ${label}`;
+    const colored = ui?.theme ? ui.theme.fg(kind === "fail" ? "error" : "accent", text) : text;
     try {
-      ui.setStatus("hindsight", colored);
+      if (SPOT === "footer") ui?.setStatus?.("hindsight", colored);
+      else if (SPOT === "row") ui?.setWorkingMessage?.(colored);
+      else ui?.setWidget?.("hindsight", [colored], { placement: SPOT === "bottom" ? "belowEditor" : "aboveEditor" });
     } catch {
       /* stale ui after reload — drop this paint */
     }
   };
 
+  const clearLoading = (): void => {
+    if (!loading) return;
+    loading = false;
+    try {
+      if (SPOT === "footer") ui?.setStatus?.("hindsight", undefined);
+      else if (SPOT === "row") ui?.setWorkingMessage?.();
+      else ui?.setWidget?.("hindsight", undefined);
+    } catch {
+      /* stale ui after reload */
+    }
+  };
+
   const observe = (ev: MemEvent): void => {
-    last = ev;
-    paint(`${ICON} ${ev.label}`, ev.kind, false);
+    // only reflects block the prompt visibly — mirror exactly those; every
+    // other event stays inspectable via /hindsight tail
+    if (ev.label.startsWith("refl")) {
+      if (ev.kind === "run") showLoading(ev.label, ev.kind);
+      else clearLoading(); // done (or failed) — the wait is over
+    }
   };
 
   const poll = (): void => {
@@ -276,15 +313,11 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
       const ev = pluginLogLabel(line);
       if (ev) observe(ev);
     }
-    // staleness transition only — the poller must not repaint every tick
-    if (last && last.kind === "info") {
-      paint(`${ICON} ${last.label}`, last.kind, Date.now() - last.at > STALE_MS);
-    }
   };
 
   pi.on("session_start", async (_event: unknown, ctx: { hasUI?: boolean; ui?: MemUi } | undefined) => {
     if (ctx?.hasUI === false) return;
-    if (!ctx?.ui?.setStatus) return; // no footer in this host — command still works
+    if (!ctx?.ui) return;
     ui = ctx.ui;
     if ((process.env.PI_HINDSIGHT_STATUS || "").toLowerCase() === "off") return;
     if (!timer) {
@@ -293,42 +326,29 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
     }
   });
 
+  // belt+braces: an aborted/errored turn must never leave the line behind
+  pi.on("turn_end", async () => clearLoading());
+
   pi.on("session_shutdown", async () => {
     if (timer) {
       clearInterval(timer);
       timer = null;
     }
-    try {
-      ui?.setStatus?.("hindsight", undefined);
-    } catch {
-      /* stale ui after reload */
-    }
+    clearLoading();
   });
 
   pi.registerCommand("hindsight", {
-    description: "Hindsight memory status. /hindsight [tail|clear]",
+    description: "Hindsight memory status. /hindsight [tail]",
     getArgumentCompletions: (prefix: string) => {
       const p = prefix.trim();
-      const subs = [
-        { value: "tail", label: "tail — Recent memory activity only" },
-        { value: "clear", label: "clear — Hide the footer status line" },
-      ].filter((s) => s.value.startsWith(p));
+      const subs = [{ value: "tail", label: "tail — Recent memory activity only" }].filter((s) =>
+        s.value.startsWith(p),
+      );
       return subs.length > 0 ? subs : null;
     },
     handler: async (args: string, ctx: { ui: MemUi; cwd?: string }) => {
       ui = ctx.ui;
       const [sub] = args.trim().split(/\s+/).filter(Boolean);
-      if (sub === "clear") {
-        lastPainted = "";
-        last = null;
-        try {
-          ctx.ui.setStatus?.("hindsight", undefined);
-        } catch {
-          /* stale ui */
-        }
-        ctx.ui.notify("hindsight status line hidden", "info");
-        return;
-      }
       if (sub === "tail") {
         const recent = formatRecent(readRecentDiag(10));
         ctx.ui.notify(recent || "no hindsight activity recorded yet", "info");
@@ -345,7 +365,5 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
     },
   });
 }
-
-interface HindsightConfig { apiUrl?: string; disabled?: boolean }
 
 export { diagLabel, fmtDur, fmtRel, formatPanel, formatRecent, pluginLogLabel, readRecentDiag };

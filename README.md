@@ -324,17 +324,16 @@ reads as a hang. This extension makes it visible by tailing the two log
 streams hindsight already writes (read-only; it never touches the bank, the
 config, or the logs):
 
-- **Footer status line**: `✦ ret 338ms` — the last memory event; accent while
-  a reflect is in flight ("🧠 refl…"), red on failures, dim after 2 quiet min.
-  Completed events come from the diag JSON lines
-  (`/tmp/hindsight-plugin.log`, override `HINDSIGHT_DIAG_FILE`); reflect
-  starts come from the plugin log's "reflect goal" lines.
+- **Loading line**: `✦ refl…` while the first-prompt reflect runs, cleared
+  the moment it finishes. Position via `PI_HINDSIGHT_LOADING`:
+  `top` (widget above the editor, default) / `bottom` (widget below) /
+  `row` (tok-rate's working row — may not render in the pre-agent hang
+  window) / `footer` (status area).
 - **/hindsight**: panel with the resolved bank, api url and sync stats (docs,
   pages, git, active ops, synced) via the runtime's `dist/status.js`, plus
   recent activity.
-- **/hindsight tail** — recent memory activity only; **/hindsight clear** —
-  hide the footer line.
-- **`PI_HINDSIGHT_STATUS=off`** disables the live watcher (the command stays).
+- **/hindsight tail** — recent memory activity only.
+- **`PI_HINDSIGHT_STATUS=off`** disables the log watcher (the command stays).
   Machines without `~/.hindsight/coding-agents` stay quiet: no watcher, and
   the panel reports "runtime not found".
 
