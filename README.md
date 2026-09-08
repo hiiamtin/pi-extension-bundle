@@ -319,9 +319,9 @@ Registers the `9router` OpenAI-compatible model provider dynamically on startup 
 ### hindsight.ts — Hindsight memory status (hindsight-coding-agents)
 
 The hindsight memory plugin (per-repo bank, recall inject, retain, reflect)
-runs invisibly, and its first-prompt reflect can block for seconds — which
-reads as a hang. This extension makes it visible by tailing the two log
-streams hindsight already writes (read-only; it never touches the bank, the
+runs invisibly, and its prompt-time memory work can block the turn for a
+while — which reads as a hang. This extension makes it visible by tailing
+hindsight's structured diag log (read-only; it never touches the bank, the
 config, or the logs):
 
 - **Loading line**: `✦ reflecting… (sonic)` in the working row (replacing
@@ -335,8 +335,71 @@ config, or the logs):
   recent activity.
 - **/hindsight tail** — recent memory activity only.
 - **`PI_HINDSIGHT_STATUS=off`** disables the log watcher (the command stays).
-  Machines without `~/.hindsight/coding-agents` stay quiet: no watcher, and
-  the panel reports "runtime not found".
+  Machines without `~/.hindsight/coding-agents` stay quiet: no watcher, no
+  loading line, and the panel reports "runtime not found".
+
+#### Setup — `npx @vectorize-io/hindsight-coding-agents install pi`
+
+This extension is a *viewer* — it needs the hindsight runtime installed
+first. The install command wires the plugin into `~/.pi/agent/settings.json`
+(extension entry + companion skill) and stages the runtime at
+`~/.hindsight/coding-agents`. All plugin configuration lives in ONE JSON
+file: `~/.hindsight/coding-agent.json` (full reference:
+hindsight.vectorize.io/sdks/integrations/coding-agents). Settings that
+matter in practice:
+
+- `apiUrl` + `apiToken` — self-hosted endpoint and bearer token; the token
+  may instead come from `HINDSIGHT_API_TOKEN`, but then EVERY shell that
+  launches pi must have it exported — sessions started without it fail with
+  401 on every recall/retain, and apiToken in the file is the only value
+  picked up live (no restart needed).
+- `autoReflect: false` — recommended once a bank grows: the automatic
+  first-prompt reflect is hard-capped at 25s in the runtime
+  (`HOOK_REFLECT_CAP_MS`, `min(reflectTimeoutMs, 25s)`) and silently aborts
+  on big banks — a pure 25s hang with no result. With it off the agent
+  reflects on demand via the `hindsight_reflect` tool (full 330s budget,
+  visible as a tool call). Knowledge-page injection, recall and retain are
+  unaffected; page refresh cadence is `pageRefreshEveryTurns` (default 10),
+  a separate cheap mechanism.
+- `retainTags: ["project:{gitProject}"]` — stamp provenance on documents;
+  essential on shared banks (see below), where recalls would otherwise be
+  indistinguishable per repo.
+
+#### Bank routing — converge repos on one shared bank
+
+Default: every repo gets its own dynamic bank `coding-agent::{gitProject}`
+(outside a git repo it falls back to the session directory's basename).
+Redirect resolved ids to one shared bank via the `banks` section — keys are
+**resolved ids, exact case-sensitive strings**; the mapping is applied after
+resolution and survives moving folders. Real-world example (a workspace
+folder containing 8 service repos, none at the root):
+
+```jsonc
+{
+  "serverMode": "self-hosted",
+  "apiUrl": "https://hindsight.tintindev.com",
+  "autoReflect": false,
+  "retainTags": ["project:{gitProject}"],
+  "retainMetadata": { "repo": "{gitProject}" },
+  "banks": {
+    // the workspace root is NOT a git repo: no history exists and git probes
+    // would spam `fatal:` — route it and switch git ingest off
+    "coding-agent::Sonic": { "bank": "sonic", "gitIngest": "none" },
+    // each service repo (real .git) keeps git ingest and feeds the same bank
+    "coding-agent::user-management-service": { "bank": "sonic" },
+    "coding-agent::api-interface": { "bank": "sonic" },
+    "coding-agent::web-portal": { "bank": "sonic" }
+    // …one entry per repo
+  }
+}
+```
+
+Gotchas: redirects change where NEW documents go — nothing is migrated from
+the old bank; `mapPathToBank` can cover a whole folder with one entry, but
+then root and repos must share a single `gitIngest`, which is exactly wrong
+for this layout (root needs `none`, repos want `message`). Config edits take
+effect after restarting pi (persistent plugins read the file once on load);
+`apiToken` is the only exception.
 
 ## Conventions for new extensions
 
