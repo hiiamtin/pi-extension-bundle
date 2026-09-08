@@ -339,7 +339,7 @@ Registers the `9router` OpenAI-compatible model provider dynamically on startup 
 ```
 extensions/
   subagent.ts      subagent tool + /subagents (isolated child sessions)
-  ext.ts           /ext — manage extensions, packages & skills from within pi
+  ext.ts           /ext — manage extensions, packages, skills, MCP servers & tools from within pi
   code-search.ts   code_search / code_find_related tools (semble CLI bridge)
   quota.ts         AI provider quota status + quota_check tool
   web-search.ts    web_search tool (Tavily/Exa/DuckDuckGo fallback)
