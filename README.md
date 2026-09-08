@@ -324,7 +324,7 @@ reads as a hang. This extension makes it visible by tailing the two log
 streams hindsight already writes (read-only; it never touches the bank, the
 config, or the logs):
 
-- **Footer status line**: `🧠 ret 338ms` — the last memory event; accent while
+- **Footer status line**: `✦ ret 338ms` — the last memory event; accent while
   a reflect is in flight ("🧠 refl…"), red on failures, dim after 2 quiet min.
   Completed events come from the diag JSON lines
   (`/tmp/hindsight-plugin.log`, override `HINDSIGHT_DIAG_FILE`); reflect

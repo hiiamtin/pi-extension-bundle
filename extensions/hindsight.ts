@@ -12,7 +12,7 @@
 //   plugin log ($TMPDIR/hindsight-coding-agent/plugin.log) → started work:
 //       "reflect goal" INFO lines mark a reflect still in flight
 //
-//   footer status line  - "🧠 ret 338ms" — last memory event; accent while a
+//   footer status line  - "✦ ret 338ms" — last memory event; accent while a
 //                         reflect runs, red on failures, dim after 2 quiet min
 //   /hindsight          - panel: resolved bank, api url, sync stats (via the
 //                         runtime's dist/status.js) + recent activity
@@ -35,6 +35,7 @@ const RUNTIME_STATUS_JS = join(homedir(), ".hindsight", "coding-agents", "dist",
 const CONFIG_JSON = join(homedir(), ".hindsight", "coding-agent.json");
 const POLL_MS = 1000;
 const STALE_MS = 120_000; // dim the status line after 2 min without events
+const ICON = "✦"; // footer/panel prefix — swap freely (emoji renders inconsistently across terminals)
 
 type EventKind = "info" | "run" | "fail";
 interface MemEvent { at: number; label: string; kind: EventKind }
@@ -219,7 +220,7 @@ function runSyncStatus(cwd: string): Promise<SyncStatus | null> {
 function formatPanel(sync: SyncStatus | null, apiUrl: string, events: MemEvent[]): string {
   const now = Date.now();
   const lines: string[] = [];
-  lines.push(`🧠 Hindsight — bank: ${sync?.bank ?? "?"}${apiUrl ? `\napi: ${apiUrl}` : ""}`);
+  lines.push(`${ICON} Hindsight — bank: ${sync?.bank ?? "?"}${apiUrl ? `\napi: ${apiUrl}` : ""}`);
   if (sync) {
     const parts = [
       sync.chatDocs !== undefined ? `${sync.chatDocs} docs` : null,
@@ -263,7 +264,7 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
 
   const observe = (ev: MemEvent): void => {
     last = ev;
-    paint(`🧠 ${ev.label}`, ev.kind, false);
+    paint(`${ICON} ${ev.label}`, ev.kind, false);
   };
 
   const poll = (): void => {
@@ -277,7 +278,7 @@ export default function hindsightExtension(pi: ExtensionAPI): void {
     }
     // staleness transition only — the poller must not repaint every tick
     if (last && last.kind === "info") {
-      paint(`🧠 ${last.label}`, last.kind, Date.now() - last.at > STALE_MS);
+      paint(`${ICON} ${last.label}`, last.kind, Date.now() - last.at > STALE_MS);
     }
   };
 
