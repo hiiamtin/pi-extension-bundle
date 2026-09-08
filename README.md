@@ -316,6 +316,28 @@ Registers the `9router` OpenAI-compatible model provider dynamically on startup 
   - `NINEROUTER_URL`: endpoint (default: `http://9router.tintindev.com/v1`).
   - `NINEROUTER_KEY` (or `ROUTER9_ENDPOINT_KEY`): API key. Recommended to inject via `infisical run -- pi` (zero disk footprint) or macOS Keychain to avoid plaintext secrets on disk.
 
+### hindsight.ts — Hindsight memory status (hindsight-coding-agents)
+
+The hindsight memory plugin (per-repo bank, recall inject, retain, reflect)
+runs invisibly, and its first-prompt reflect can block for seconds — which
+reads as a hang. This extension makes it visible by tailing the two log
+streams hindsight already writes (read-only; it never touches the bank, the
+config, or the logs):
+
+- **Footer status line**: `🧠 ret 338ms` — the last memory event; accent while
+  a reflect is in flight ("🧠 refl…"), red on failures, dim after 2 quiet min.
+  Completed events come from the diag JSON lines
+  (`/tmp/hindsight-plugin.log`, override `HINDSIGHT_DIAG_FILE`); reflect
+  starts come from the plugin log's "reflect goal" lines.
+- **/hindsight**: panel with the resolved bank, api url and sync stats (docs,
+  pages, git, active ops, synced) via the runtime's `dist/status.js`, plus
+  recent activity.
+- **/hindsight tail** — recent memory activity only; **/hindsight clear** —
+  hide the footer line.
+- **`PI_HINDSIGHT_STATUS=off`** disables the live watcher (the command stays).
+  Machines without `~/.hindsight/coding-agents` stay quiet: no watcher, and
+  the panel reports "runtime not found".
+
 ## Conventions for new extensions
 
 - **Every command must be autocomplete-ready.** Any `pi.registerCommand()`
@@ -349,6 +371,7 @@ extensions/
   btw.ts           /btw — side-question command (real-fork, cache-friendly;
                    design: docs/btw.md)
   9router.ts       dynamic 9Router provider & model discovery + /9router-sync
+  hindsight.ts     hindsight memory status line + /hindsight (tails memory logs)
 Mention agents while typing: `#scout` autocompletes and asks the model to
 delegate to that agent (`@` stays reserved for pi file mentions).
 
