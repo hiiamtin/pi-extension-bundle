@@ -1,7 +1,7 @@
 ---
 name: scout
 description: Fast read-only codebase reconnaissance. Use to locate relevant code, trace behavior, and return compressed findings with file:line references.
-model: opencode-go/gpt-5.6-luna
+model: 9router/cx/gpt-5.6-luna
 tools:
   - read
   - grep
