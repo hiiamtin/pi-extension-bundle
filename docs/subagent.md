@@ -191,7 +191,7 @@ the opt-in mechanism trivial:
 | `tools` | names as-is (pi filters built-in + extension + custom) | `--tools <csv>` |
 | `extensions: [code-search]` | **bundle-relative**: sibling of `subagent.ts` → `/opt/tintin/pi-extensions/extensions/<name>.ts` (resolve via the extension file's own dir at runtime) | `-e <path>` per item |
 | `skills: [code-review]` | **name → path**: search pi's documented skill locations (`~/.agents/skills/<n>/SKILL.md`, `~/.pi/agent/skills/`, project dirs, first hit wins) | `--skill <path>` per item |
-| `mcp: [context7]` | read `~/.pi/agent/mcp.json` → keep only named servers → write temp config → load the adapter itself via `-e ~/.pi/agent/npm/node_modules/pi-mcp-adapter/<entry>` + `--mcp-config <tmp>` (tmp deleted in `finally`) | as stated |
+| `mcp: [context7]` | read `~/.pi/agent/subagent_mcp.json` (legacy `mcp.json` still accepted; doctor warns) → keep only named servers → write temp config → load the adapter itself via `-e ~/.pi/agent/npm/node_modules/pi-mcp-adapter/<entry>` + `--mcp-config <tmp>` (tmp deleted in `finally`). This file is subagent-only by construction — the main session's adapter reads `.mcp.json` / `~/.config/mcp/mcp.json`, never this file | as stated |
 
 System prompt: `--append-system-prompt <text>` accepts text directly
 (`--help`: "Append text or file contents"); **verified on 0.85.0 (W4)** — the

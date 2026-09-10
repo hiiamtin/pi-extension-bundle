@@ -43,7 +43,7 @@ writeFileSync(
   "---\nname: disabled\ndescription: Disabled test agent.\nenabled: false\ntools: [read]\n---\n\nShould never run.\n",
 );
 writeFileSync(path.join(agentDir, "npm", "node_modules", "pi-mcp-adapter", "index.ts"), "export default function () {}\n");
-writeFileSync(path.join(agentDir, "mcp.json"), JSON.stringify({
+writeFileSync(path.join(agentDir, "subagent_mcp.json"), JSON.stringify({
   settings: { mcpFooterStatus: "off" },
   mcpServers: {
     context7: { url: "https://context7.invalid/mcp" },
@@ -403,7 +403,7 @@ const bgStart = await tool.execute("bg-start", { agent: "scout", task: "backgrou
 const bgLag = Date.now() - bgT0;
 delete process.env.FAKE_SUBAGENT_DELAY_MS;
 assert(bgLag < 400, `background call must return immediately (took ${bgLag}ms)`);
-assert.match(bgStart.content?.[0]?.text ?? "", /Background subagent started: s-[a-z0-9]+ \(scout\)/);
+assert.match(bgStart.content?.[0]?.text ?? "", /Background subagent started: s-[a-z0-9]+ \(scout( · [^)]+)?\)/);
 assert.match(bgStart.content?.[0]?.text ?? "", /\/subagents kill /, "start text must expose the kill command");
 const bgId = (bgStart.content[0].text.match(/s-[a-z0-9]+/) || [])[0];
 assert(bgId, "start text must expose the run id");

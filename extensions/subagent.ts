@@ -381,9 +381,24 @@ function findSkill(name: string, cwd: string): string {
   return found;
 }
 
+// Children resolve mcp: names against this user-level file. It is deliberately
+// NOT the main session's MCP config — the pi-mcp-adapter in normal sessions
+// reads .mcp.json / ~/.config/mcp/mcp.json, so this file is subagent-only by
+// construction (the main agent stays MCP-free while children opt in).
+const MCP_CONFIG_FILE = "subagent_mcp.json";
+const LEGACY_MCP_CONFIG_FILE = "mcp.json";
+
+function mcpConfigSource(): { path: string; legacy: boolean } {
+  const preferred = path.join(AGENT_DIR, MCP_CONFIG_FILE);
+  if (existsSync(preferred)) return { path: preferred, legacy: false };
+  const legacy = path.join(AGENT_DIR, LEGACY_MCP_CONFIG_FILE);
+  if (existsSync(legacy)) return { path: legacy, legacy: true };
+  return { path: preferred, legacy: false }; // missing → caller surfaces ENOENT
+}
+
 function prepareMcp(agent: AgentConfig, dir: string): { adapter: string; config: string } | null {
   if (!agent.mcp.length) return null;
-  const source = path.join(AGENT_DIR, "mcp.json");
+  const source = mcpConfigSource().path;
   const parsed = JSON.parse(readFileSync(source, "utf8")) as {
     settings?: Record<string, unknown>;
     mcpServers?: Record<string, unknown>;
@@ -469,9 +484,10 @@ function markInlineDelivered(id: string): void {
   updateFleetWidget();
 }
 
-function bgStartText(id: string, agentName: string): string {
+function bgStartText(id: string, agentName: string, model?: string): string {
+  const modelTag = model ? ` · ${model}` : "";
   return [
-    `Background subagent started: ${id} (${agentName}).`,
+    `Background subagent started: ${id} (${agentName}${modelTag}).`,
     "You will be notified here when it finishes; keep working meanwhile.",
     `Progress: /subagents list · Stop: /subagents kill ${id}`,
   ].join("\n");
@@ -598,7 +614,7 @@ async function continueRun(
   if (bg && runsIo) {
     const running = runAgent(agent, task, cwd, inherited, existing.ownerSession, undefined, undefined, existing, { notifyOnDone });
     launchBackground(running, existing.id, runsIo);
-    return bgStartText(existing.id, agent.name);
+    return bgStartText(existing.id, agent.name, inherited.model);
   }
   return runAgent(agent, task, cwd, inherited, existing.ownerSession, signal, onUpdate, existing).then((result) => {
     markInlineDelivered(existing.id);
@@ -917,7 +933,7 @@ function listText(): string {
     const start = run.startedAt ?? run.createdAt;
     const tokens = run.usage.totalTokens || run.usage.input + run.usage.cacheRead + run.usage.output;
     const usage = `${run.usage.turns}t ${tokens}tok $${run.usage.cost.toFixed(4)}`;
-    return `${run.id} · ${run.agent} · ${run.state} · ${fmtDur(end - start)} · ${usage} · ${run.task.slice(0, 40)}`;
+    return `${run.id} · ${run.agent} · ${run.model ?? "inherit"} · ${run.state} · ${fmtDur(end - start)} · ${usage} · ${run.task.slice(0, 32)}`;
   }).join("\n");
 }
 
@@ -1189,7 +1205,7 @@ class SubagentViewer {
     if (this.follow) this.scrollTop = max;
     this.scrollTop = Math.min(this.scrollTop, max);
     const live = this.meta.state === "running" || this.meta.state === "queued" ? " · \x1b[1;33mLIVE\x1b[0m" : "";
-    const header = `\x1b[1msubagent viewer\x1b[0m ${this.meta.id} · ${this.meta.agent} · ${this.meta.state}${live}`;
+    const header = `\x1b[1msubagent viewer\x1b[0m ${this.meta.id} · ${this.meta.agent} · ${this.meta.model ?? "inherit"} · ${this.meta.state}${live}`;
     const visible = this.lines.slice(this.scrollTop, this.scrollTop + VIEWER_ROWS);
     const padded = [...visible];
     while (padded.length < VIEWER_ROWS) padded.push("");
@@ -1318,12 +1334,16 @@ function collectDoctorReport(cwd: string, ctx: ToolCtx | undefined): string[] {
       }
     }
     if (agent.mcp.length) {
+      const src = mcpConfigSource();
+      if (src.legacy && !lines.some((line) => line.includes("deprecated"))) {
+        lines.push(`WARN ${LEGACY_MCP_CONFIG_FILE} deprecated: rename it to ${MCP_CONFIG_FILE}`);
+      }
       try {
-        const source = JSON.parse(readFileSync(path.join(AGENT_DIR, "mcp.json"), "utf8")) as { mcpServers?: Record<string, unknown> };
+        const source = JSON.parse(readFileSync(src.path, "utf8")) as { mcpServers?: Record<string, unknown> };
         const missing = agent.mcp.filter((name) => !(name in (source.mcpServers ?? {})));
-        if (missing.length) lines.push(`FAIL agent '${agent.name}' mcp servers not in mcp.json: ${missing.join(", ")}`);
+        if (missing.length) lines.push(`FAIL agent '${agent.name}' mcp servers not in ${MCP_CONFIG_FILE}: ${missing.join(", ")}`);
       } catch (error) {
-        lines.push(`FAIL agent '${agent.name}' mcp.json unreadable: ${(error as Error).message}`);
+        lines.push(`FAIL agent '${agent.name}' ${MCP_CONFIG_FILE} unreadable: ${(error as Error).message}`);
       }
     }
   }
@@ -1485,7 +1505,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
         const id = started?.id;
         if (!id) return textResult("error: background run failed to initialize");
         launchBackground(running, id, runsIo);
-        return textResult(bgStartText(id, agent.name));
+        return textResult(bgStartText(id, agent.name, inheritedModel));
       }
       return runAgent(
         agent,
@@ -1510,7 +1530,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       if (!details?.run) return new Text(result.content?.[0]?.text ?? "(no output)", 0, 0);
       const run = details.run;
       const icon = run.state === "done" ? theme.fg("success", "✓") : theme.fg("error", "✗");
-      const usage = `${run.usage.input + run.usage.cacheRead} in · ${run.usage.output} out · $${run.usage.cost.toFixed(4)}`;
+      const usage = `${run.model ?? "inherit"} · ${run.usage.input + run.usage.cacheRead} in · ${run.usage.output} out · $${run.usage.cost.toFixed(4)}`;
       const output = result.content?.[0]?.text ?? "(no output)";
       const body = options.expanded ? output : output.split("\n").slice(-8).join("\n");
       // OSC 8: terminals that support it make the run id clickable — it opens

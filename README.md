@@ -33,7 +33,7 @@ or themes. Agent frontmatter opts in exact resources:
 tools: [read, grep, code_search]
 extensions: [code-search]       # files shipped by this bundle
 skills: [some-bundled-skill]    # bundle, global, or trusted project skill
-mcp: [context7]                 # named servers from ~/.pi/agent/mcp.json
+mcp: [context7]                 # named servers from ~/.pi/agent/subagent_mcp.json
 ```
 
 P1 is blocking foreground execution and continuation. Background notification
