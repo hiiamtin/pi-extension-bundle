@@ -10,6 +10,7 @@ tools:
   - code_find_related
 extensions:
   - code-search
+  - 9router
 skills: []
 mcp: []
 thinking: high

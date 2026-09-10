@@ -9,6 +9,7 @@ tools:
 extensions:
   - web-search
   - web-fetch
+  - 9router
 skills: []
 mcp: []
 thinking: low
