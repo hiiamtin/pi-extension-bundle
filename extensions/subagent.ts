@@ -62,6 +62,22 @@ const WRAPUP_MS = envInt("PI_SUBAGENT_WRAPUP_SEC", 45, 0, 600) * 1000;
 // after turn_end, wait this long for a steered turn to begin before declaring idle
 const STEER_QUIET_MS = 700;
 
+type FleetRuntime = {
+  generation: number;
+  ticker?: ReturnType<typeof setInterval>;
+  housekeeper?: ReturnType<typeof setInterval>;
+};
+
+// Extension reloads re-evaluate this module in the same Node process. Keep the
+// fleet timers on globalThis so the new module can stop the old timers instead
+// of accumulating one 2s ticker per /reload.
+const fleetGlobal = globalThis as typeof globalThis & { __subagentFleetRuntime?: FleetRuntime };
+const previousFleetRuntime = fleetGlobal.__subagentFleetRuntime;
+if (previousFleetRuntime?.ticker) clearInterval(previousFleetRuntime.ticker);
+if (previousFleetRuntime?.housekeeper) clearInterval(previousFleetRuntime.housekeeper);
+const fleetInstanceGeneration = (previousFleetRuntime?.generation ?? 0) + 1;
+fleetGlobal.__subagentFleetRuntime = { generation: fleetInstanceGeneration };
+
 // live rpc children of in-flight runs (this process only) — steer targets
 const liveRuns = new Map<string, { child: RpcChild }>();
 // lifecycle bus set by the factory from pi.events (guarded — hosts may omit it)
@@ -500,6 +516,11 @@ function bgStartText(id: string, agentName: string, model?: string): string {
 // brightness. String arrays only — RPC/pi-web ignores factory content.
 let fleetSetWidget: ((key: string, lines?: string[]) => void) | null = null;
 let fleetTheme: { fg?: (token: string, text: string) => string } | null = null;
+let fleetWidgetKey: string | null = null;
+
+function isCurrentFleetInstance(): boolean {
+  return fleetGlobal.__subagentFleetRuntime?.generation === fleetInstanceGeneration;
+}
 
 // Widget scope — owner: only runs spawned by THIS session (default); all:
 // every active run on the machine; off: hide the widget. Persisted in the
@@ -521,13 +542,16 @@ function setFleetMode(mode: FleetMode, ui?: ToolCtx["ui"]): void {
 }
 
 function updateFleetWidget(): void {
-  if (!fleetSetWidget) return;
+  if (!isCurrentFleetInstance() || !fleetSetWidget) return;
   const me = currentSessionFilePath();
   const active = listMetas()
     .filter((run) => run.state === "running" || run.state === "queued")
     .filter((run) => fleetMode === "all" || (fleetMode === "owner" && !!me && run.ownerSession === me));
   if (!active.length) {
-    fleetSetWidget("subagents", undefined);
+    if (fleetWidgetKey !== null) {
+      fleetSetWidget("subagents", undefined);
+      fleetWidgetKey = null;
+    }
     return;
   }
   const themed = !process.env.NO_COLOR && fleetTheme?.fg ? fleetTheme.fg.bind(fleetTheme) : null;
@@ -535,10 +559,19 @@ function updateFleetWidget(): void {
   const accent = (text: string) => (themed ? themed("accent", text) : text);
   const now = Date.now();
   const lines = [dim(`${active.length} subagent run(s) active (${fleetMode}) · ctrl+alt+s viewer`)];
+  const keyParts = [`mode=${fleetMode}`];
   for (const run of active.slice(0, 5)) {
-    const elapsed = fmtDur(now - (run.startedAt ?? run.createdAt));
+    const elapsedMs = now - (run.startedAt ?? run.createdAt);
+    const elapsed = fmtDur(elapsedMs);
+    // Rebuilding a pi widget removes and recreates the panel. Keep the live
+    // display useful without doing that on every 2s ticker (10s precision is
+    // sufficient for a secondary status panel).
+    keyParts.push(`${run.id}:${run.state}:${Math.floor(elapsedMs / 10_000)}:${run.task}`);
     lines.push(dim(`  ${run.id} · ${run.agent} · ${accent(run.state)} · ${elapsed} · ${run.task.slice(0, 40)}`));
   }
+  const key = keyParts.join("\n");
+  if (key === fleetWidgetKey) return;
+  fleetWidgetKey = key;
   fleetSetWidget("subagents", lines);
 }
 
@@ -1448,6 +1481,9 @@ export default function subagentExtension(pi: ExtensionAPI): void {
   housekeeper.unref?.();
   const fleetTicker = setInterval(updateFleetWidget, 2_000);
   fleetTicker.unref?.();
+  const fleetRuntime = fleetGlobal.__subagentFleetRuntime;
+  if (fleetRuntime?.generation === fleetInstanceGeneration) fleetRuntime.ticker = fleetTicker;
+  if (fleetRuntime?.generation === fleetInstanceGeneration) fleetRuntime.housekeeper = housekeeper;
 
   // @mention autocomplete: typing "@sc" offers discovered agents; the mention
   // itself is plain text — the model reads it and delegates via the tool.
@@ -1487,8 +1523,11 @@ export default function subagentExtension(pi: ExtensionAPI): void {
     try {
       trackSession(eventCtx);
       const eventUi = (eventCtx as { ui?: { setWidget?: (key: string, lines?: string[], opts?: unknown) => void; theme?: { fg?: (token: string, text: string) => string } } } | undefined)?.ui;
-      if (eventUi?.setWidget) fleetSetWidget = (key, lines) => eventUi.setWidget(key, lines, { placement: "belowEditor" });
-      if (eventUi?.theme?.fg) fleetTheme = eventUi.theme;
+      if (eventUi?.setWidget && !fleetSetWidget) fleetSetWidget = (key, lines) => eventUi.setWidget(key, lines, { placement: "belowEditor" });
+      if (eventUi?.theme?.fg && fleetTheme !== eventUi.theme) {
+        fleetTheme = eventUi.theme;
+        fleetWidgetKey = null;
+      }
       updateFleetWidget();
       housekeep();
       sweepFinishedRuns(runsIo);
