@@ -50,7 +50,7 @@ const assistantMessage = (text, stopReason = "stop") => ({
     { type: "toolCall", id: "fake-tool-1", name: "read", arguments: { path: "README.md" } },
     { type: "text", text },
   ],
-  provider: "fake", model: "fake-model", usage, stopReason, timestamp: Date.now(),
+  provider: "fake", model: "fake-model", responseModel: "gpt-5.6-luna", usage, stopReason, timestamp: Date.now(),
 });
 
 const emitTurn = (text) => {

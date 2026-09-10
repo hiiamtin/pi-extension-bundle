@@ -210,7 +210,10 @@ putting required conventions into the task/prompt.
   (raw event stream copy), `result.md` (full final text).
 - Meta: `{ id, agent, task, state, model, ownerSession, pid/pgid, createdAt,
   startedAt, finishedAt, timeoutMin, usage{input,output,cacheRead,cacheWrite,
-  cost,totalTokens,turns}, error, resultPath }`.
+  cost,totalTokens,turns}, context{tokens,window,percent,model}, error,
+  resultPath }`. `context` is the latest prompt measurement (input + cacheRead
+  + cacheWrite), not the run-aggregate usage total; it is omitted until a
+  model response reports usable token counts and a known context window.
 - State machine: `queued → running → done | failed | timeout | killed`.
 - Usage aggregated from `message_end` assistant messages (exact JSON shape
   recorded in §12). Final output = last assistant text part. Tool activity
@@ -446,7 +449,10 @@ Live-verified in the real TUI and in pi-web/ttyd (browser terminal).
   with tool calls interleaved in place, fixed-height scrolling
   (arrows/jk/PgUp/PgDn/g/G/space), running runs re-read state every second
   (LIVE marker). `esc`/`q`/`ctrl+c` exit; pi hands focused components RAW
-  terminal data, so keys are matched as bytes, not parsed names.
+  terminal data, so keys are matched as bytes, not parsed names. The header
+  shows the latest context percentage and token/window values, with a themed
+  border and background; the fleet widget is hidden while the viewer (and
+  its picker) is open, then restored on close.
 - **Two-way actions**: `s` composes a message — live run ⇒ steer, finished
   run ⇒ background continue on the SAME run id (viewer follows, LIVE again).
   `D` twice stops the run (explicit two-press confirmation).
@@ -462,7 +468,8 @@ Live-verified in the real TUI and in pi-web/ttyd (browser terminal).
   when idle; refreshed on start/settle/inline-delivery, session activity,
   and a 2s ticker. Setter + live theme captured from the first TUI context
   carrying `ui.setWidget`; rows render dim (thinking-style) via `theme.fg`,
-  state token in accent. String arrays only — RPC/pi-web ignores factories.
+  state token in accent, and show the latest context percentage (`ctx xx%`).
+  String arrays only — RPC/pi-web ignores factories.
 - **Widget scope** (`/subagents widget [owner|all|off]`, bare = cycle,
   default `owner`): owner filters to runs whose `ownerSession` equals the
   current session file; all shows every active run on the machine; off hides

@@ -140,6 +140,7 @@ assert.equal(result.isError, undefined);
 assert(result.details?.run?.id, "result must expose a run id");
 assert.equal(result.details.run.agent, "scout");
 assert.equal(result.details.run.state, "done");
+assert.deepEqual(result.details.run.context, { tokens: 115, window: 400000, percent: 115 / 400000 * 100, model: "gpt-5.6-luna" }, "run must expose latest prompt context usage");
 assert.equal(result.details.run.usage.input, 101);
 assert.equal(result.details.run.usage.cost, 0.033);
 assert.equal(result.usage.input, 101);

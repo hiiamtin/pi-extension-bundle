@@ -5,7 +5,7 @@
 // skills, and MCP servers back in. See docs/subagent.md.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { hyperlink, matchesKey, Key, Text, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { hyperlink, matchesKey, Key, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { parse as parseYaml } from "yaml";
 import { spawn } from "node:child_process";
@@ -26,6 +26,7 @@ import { fileURLToPath } from "node:url";
 import { extractToolArgs, requireString, textResult } from "../lib/tool-compat.ts";
 import { startRpcChild, type RpcChild } from "../lib/rpc-child.ts";
 import { lowPrio } from "../lib/low-prio.ts";
+import { KNOWN_COMBOS, resolveCapabilities } from "./9router.ts";
 import {
   captureExtensionApi,
   deliverRunNotice,
@@ -123,6 +124,14 @@ interface UsageTotals {
   costCacheWrite: number;
 }
 
+interface ContextStats {
+  /** Prompt tokens in the latest assistant request, excluding output/reasoning. */
+  tokens: number;
+  window: number;
+  percent: number;
+  model?: string;
+}
+
 interface RunMeta {
   id: string;
   agent: string;
@@ -146,6 +155,8 @@ interface RunMeta {
   transcriptPath: string;
   resultPath: string;
   usage: UsageTotals;
+  /** Latest prompt-context measurement; usage above remains run-aggregate. */
+  context?: ContextStats;
 }
 
 interface ToolActivity {
@@ -467,6 +478,50 @@ function applyUsage(total: UsageTotals, message: unknown): void {
   total.costCacheWrite += Number(usage.cost?.cacheWrite) || 0;
 }
 
+function contextWindowForModel(model?: string): number | undefined {
+  if (!model) return undefined;
+  const normalized = model.replace(/^9router\//, "");
+  const combo = KNOWN_COMBOS[normalized];
+  if (combo) return combo.contextWindow;
+
+  // resolveCapabilities covers the provider's known exact/pattern metadata.
+  // Its 200k floor is intentionally not treated as verified for an unknown
+  // model, so the UI does not print a made-up percentage.
+  const window = resolveCapabilities(model).contextWindow;
+  return window !== 200_000 ? window : undefined;
+}
+
+function updateContext(meta: RunMeta, event: Record<string, any>): void {
+  const usage = event.message?.usage as Record<string, any> | undefined;
+  if (!usage) return;
+  const tokens = (Number(usage.input) || 0)
+    + (Number(usage.cacheRead) || 0)
+    + (Number(usage.cacheWrite) || 0);
+  if (tokens <= 0) return;
+  const responseModel = typeof event.message?.responseModel === "string"
+    ? event.message.responseModel
+    : typeof event.responseModel === "string"
+      ? event.responseModel
+      : typeof event.message?.model === "string" ? event.message.model : undefined;
+  const model = responseModel || meta.model;
+  const window = contextWindowForModel(model) ?? contextWindowForModel(meta.model);
+  if (!window) return;
+  meta.context = { tokens, window, percent: (tokens / window) * 100, model };
+}
+
+function formatContext(stats?: ContextStats, detailed = false): string {
+  if (!stats) return "ctx --";
+  const percent = stats.percent < 10 ? stats.percent.toFixed(1) : Math.round(stats.percent).toString();
+  if (!detailed) return `ctx ${percent}%`;
+  return `ctx ${percent}% (${formatTokens(stats.tokens)}/${formatTokens(stats.window)})`;
+}
+
+function formatTokens(tokens: number): string {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(tokens >= 10_000_000 ? 0 : 1).replace(/\.0$/, "")}M`;
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(tokens >= 10_000 ? 0 : 1).replace(/\.0$/, "")}k`;
+  return String(Math.round(tokens));
+}
+
 function truncateOutput(text: string): { text: string; truncated: boolean } {
   const lines = text.split("\n");
   if (text.length <= MAX_OUTPUT_CHARS && lines.length <= MAX_OUTPUT_LINES) return { text, truncated: false };
@@ -517,6 +572,7 @@ function bgStartText(id: string, agentName: string, model?: string): string {
 let fleetSetWidget: ((key: string, lines?: string[]) => void) | null = null;
 let fleetTheme: { fg?: (token: string, text: string) => string } | null = null;
 let fleetWidgetKey: string | null = null;
+let fleetWidgetSuppressed = false;
 
 function isCurrentFleetInstance(): boolean {
   return fleetGlobal.__subagentFleetRuntime?.generation === fleetInstanceGeneration;
@@ -541,8 +597,21 @@ function setFleetMode(mode: FleetMode, ui?: ToolCtx["ui"]): void {
   updateFleetWidget();
 }
 
+function hideFleetWidgetForViewer(): void {
+  if (fleetWidgetSuppressed) return;
+  fleetWidgetSuppressed = true;
+  if (fleetSetWidget) fleetSetWidget("subagents", undefined);
+  fleetWidgetKey = null;
+}
+
+function restoreFleetWidgetAfterViewer(): void {
+  if (!fleetWidgetSuppressed) return;
+  fleetWidgetSuppressed = false;
+  updateFleetWidget();
+}
+
 function updateFleetWidget(): void {
-  if (!isCurrentFleetInstance() || !fleetSetWidget) return;
+  if (!isCurrentFleetInstance() || !fleetSetWidget || fleetWidgetSuppressed) return;
   const me = currentSessionFilePath();
   const active = listMetas()
     .filter((run) => run.state === "running" || run.state === "queued")
@@ -566,8 +635,9 @@ function updateFleetWidget(): void {
     // Rebuilding a pi widget removes and recreates the panel. Keep the live
     // display useful without doing that on every 2s ticker (10s precision is
     // sufficient for a secondary status panel).
-    keyParts.push(`${run.id}:${run.state}:${Math.floor(elapsedMs / 10_000)}:${run.task}`);
-    lines.push(dim(`  ${run.id} · ${run.agent} · ${accent(run.state)} · ${elapsed} · ${run.task.slice(0, 40)}`));
+    const contextKey = run.context ? `${run.context.tokens}:${run.context.window}` : "-";
+    keyParts.push(`${run.id}:${run.state}:${Math.floor(elapsedMs / 10_000)}:${contextKey}:${run.task}`);
+    lines.push(dim(`  ${run.id} · ${run.agent} · ${accent(run.state)} · ${elapsed} · ${formatContext(run.context)} · ${run.task.slice(0, 40)}`));
   }
   const key = keyParts.join("\n");
   if (key === fleetWidgetKey) return;
@@ -846,6 +916,7 @@ async function runAgent(
         if (event.type === "turn_end") markTurnEnd();
         if (event.type === "message_end" && event.message?.role === "assistant") {
           applyUsage(meta.usage, event.message);
+          updateContext(meta, event);
           const text = assistantText(event.message);
           if (text) finalOutput = text;
           if (!meta.model && event.message.model) meta.model = String(event.message.model);
@@ -1058,12 +1129,22 @@ type UiStyle = {
   muted: (text: string) => string;
   dim: (text: string) => string;
   bold: (text: string) => string;
+  border: (text: string) => string;
+  bg: (text: string) => string;
 };
 
 function viewerStyle(theme?: any): UiStyle {
   const passthrough = (text: string) => text;
   if (process.env.NO_COLOR) {
-    return { warn: passthrough, accent: passthrough, muted: passthrough, dim: passthrough, bold: passthrough };
+    return {
+      warn: passthrough,
+      accent: passthrough,
+      muted: passthrough,
+      dim: passthrough,
+      bold: passthrough,
+      border: passthrough,
+      bg: passthrough,
+    };
   }
   const fg = (token: string) => (text: string) => (theme?.fg ? theme.fg(token, text) : text);
   return {
@@ -1072,6 +1153,8 @@ function viewerStyle(theme?: any): UiStyle {
     muted: fg("muted"),
     dim: fg("dim"),
     bold: (text: string) => (theme?.bold ? theme.bold(text) : text),
+    border: fg("borderAccent"),
+    bg: (text: string) => (theme?.bg ? theme.bg("customMessageBg", text) : text),
   };
 }
 
@@ -1302,7 +1385,7 @@ class SubagentViewer {
     if (this.follow) this.scrollTop = max;
     this.scrollTop = Math.min(this.scrollTop, max);
     const live = this.meta.state === "running" || this.meta.state === "queued" ? ` · ${this.s.warn("LIVE")}` : "";
-    const header = `${this.s.bold("subagent viewer")} ${this.meta.id} · ${this.meta.agent} · ${this.meta.model ?? "inherit"} · ${this.meta.state}${live}`;
+    const header = `${this.s.bold("subagent viewer")} ${this.meta.id} · ${this.meta.agent} · ${this.meta.model ?? "inherit"} · ${this.meta.state} · ${this.s.dim(formatContext(this.meta.context, true))}${live}`;
     const visible = this.lines.slice(this.scrollTop, this.scrollTop + VIEWER_ROWS);
     const padded = [...visible];
     while (padded.length < VIEWER_ROWS) padded.push("");
@@ -1312,7 +1395,17 @@ class SubagentViewer {
       : this.flash
         ? this.s.warn(this.flash)
         : this.s.dim(`↑↓/jk scroll · g/G ends · s talk · D stop · n ${notifyTag} · esc back`);
-    return [header, ...padded, footer].map((line) => truncateToWidth(line, width));
+    const content = [header, ...padded, footer];
+    if (width < 3) return content.map((line) => truncateToWidth(line, width));
+    const innerWidth = width - 2;
+    const fill = (line: string) => {
+      const clipped = truncateToWidth(line, innerWidth, "");
+      return this.s.bg(clipped + " ".repeat(Math.max(0, innerWidth - visibleWidth(clipped))));
+    };
+    const top = this.s.border(`╭${"─".repeat(innerWidth)}╮`);
+    const bottom = this.s.border(`╰${"─".repeat(innerWidth)}╯`);
+    const body = content.map((line) => `${this.s.border("│")}${fill(line)}${this.s.border("│")}`);
+    return [top, ...body, bottom];
   }
 }
 
@@ -1347,29 +1440,34 @@ function buildViewerBody(meta: RunMeta, s: UiStyle): string[] {
 let shortcutArmed = false;
 
 async function openChatViewer(ctx: ToolCtx, id?: string, runsIo?: RunsIo): Promise<void> {
-  let targetId = id;
-  if (!targetId) {
-    const sessionFile = ctx?.sessionManager?.getSessionFile?.();
-    const metas = listMetas();
-    const owned = sessionFile ? metas.filter((run) => run.ownerSession === sessionFile) : [];
-    const pool = (owned.length ? owned : metas).slice(0, 20);
-    if (!pool.length) {
-      ctx.ui?.notify?.("no subagent runs yet", "warning");
+  hideFleetWidgetForViewer();
+  try {
+    let targetId = id;
+    if (!targetId) {
+      const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+      const metas = listMetas();
+      const owned = sessionFile ? metas.filter((run) => run.ownerSession === sessionFile) : [];
+      const pool = (owned.length ? owned : metas).slice(0, 20);
+      if (!pool.length) {
+        ctx.ui?.notify?.("no subagent runs yet", "warning");
+        return;
+      }
+      const labels = pool.map((run) => `${run.id} · ${run.agent} · ${run.state} · ${run.task.slice(0, 44)}`);
+      const picked = await ctx.ui?.select?.("Subagent runs — pick one to view:", labels);
+      const chosen = pool[labels.indexOf(picked ?? "")];
+      if (!chosen) return;
+      targetId = chosen.id;
+    }
+    const target = readMeta(targetId);
+    if (!target) {
+      ctx.ui?.notify?.(`run '${targetId}' not found`, "warning");
       return;
     }
-    const labels = pool.map((run) => `${run.id} · ${run.agent} · ${run.state} · ${run.task.slice(0, 44)}`);
-    const picked = await ctx.ui?.select?.("Subagent runs — pick one to view:", labels);
-    const chosen = pool[labels.indexOf(picked ?? "")];
-    if (!chosen) return;
-    targetId = chosen.id;
+    await ctx.ui?.custom?.((tui, theme, _keybindings, done) =>
+      new SubagentViewer(target, tui as { requestRender: () => void }, done as () => void, runsIo, theme));
+  } finally {
+    restoreFleetWidgetAfterViewer();
   }
-  const target = readMeta(targetId);
-  if (!target) {
-    ctx.ui?.notify?.(`run '${targetId}' not found`, "warning");
-    return;
-  }
-  await ctx.ui?.custom?.((tui, theme, _keybindings, done) =>
-    new SubagentViewer(target, tui as { requestRender: () => void }, done as () => void, runsIo, theme));
 }
 
 // arm ctrl+alt+s once: opens the chat viewer picker even while a turn runs
