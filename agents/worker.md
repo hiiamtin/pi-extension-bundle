@@ -5,7 +5,8 @@ model: 9router/snowy
 extensions:
   - 9router
 skills: []
-mcp: []
+mcp:
+  - cbmem
 thinking: inherit
 timeout: 60
 ---

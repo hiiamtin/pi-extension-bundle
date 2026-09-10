@@ -12,7 +12,8 @@ extensions:
   - code-search
   - 9router
 skills: []
-mcp: []
+mcp:
+  - cbmem
 thinking: low
 timeout: 10
 ---
