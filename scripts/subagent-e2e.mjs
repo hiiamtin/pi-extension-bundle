@@ -187,6 +187,7 @@ assert.match(continued.content?.[0]?.text ?? "", /result for Task: address the r
 assert.match(continued.content?.[0]?.text ?? "", new RegExp(`\\[subagent run: ${result.details.run.id} · scout · done\\]`));
 assert.equal(continued.details?.run?.id, result.details.run.id, "continue must keep the run id");
 assert.equal(continued.details.run.state, "done");
+assert.equal(continued.details.run.startedAt, result.details.run.startedAt, "continue must preserve the original run start (elapsed = whole run life)");
 assert.equal(continued.details.run.usage.input, 202, "run metadata aggregates usage across continuations");
 const spawns = readFileSync(captureFile, "utf8").trim().split("\n").map(JSON.parse).filter((event) => event.event === "start");
 assert.equal(spawns.length, 2);

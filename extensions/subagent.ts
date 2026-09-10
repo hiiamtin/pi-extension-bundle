@@ -657,7 +657,10 @@ async function runAgent(
         model: existing.model ?? inherited.model ?? agent.model,
         pid: 0,
         pgid: 0,
-        startedAt: Date.now(),
+        // a continued round is the SAME run — keep the original start so
+        // elapsed reflects the run's whole life, not just the last round
+        // (clobbering this made a 41-min review report "started" 40 min in)
+        startedAt: existing.startedAt ?? Date.now(),
         finishedAt: undefined,
         exitCode: undefined,
         signal: undefined,
@@ -706,7 +709,9 @@ async function runAgent(
     };
   }
   meta.state = "running";
-  meta.startedAt = Date.now();
+  // fresh runs re-stamp startedAt when the slot is granted (queue time is
+  // excluded from elapsed); continued runs keep the original start
+  if (queuedState === "queued") meta.startedAt = Date.now();
   writeMeta(meta);
 
   const activities: ToolActivity[] = [];
