@@ -167,7 +167,7 @@ reachable from a tool call; opening one arrives with P2).
 |---|---|---|---|---|
 | `scout` | `9router/cx/gpt-5.6-luna` · thinking low | read, grep, find, ls + `code_search` (via bundle ext) | 10 min | read-only recon; cheap/fast reasoning tier |
 | `worker` | `9router/snowy` | full | 60 min | real implementation work |
-| `reviewer` | `9router/cx/gpt-5.6-luna` · thinking max | read, grep, bash + `code_search`/`code_find_related` | 20 min | review/audit; fast model at max reasoning — snowy stalled 8-16 min/request on big reviews |
+| `reviewer` | `9router/flash-research` (chain: gemini-3.8-flash-high → luna → deepseek-v4-flash) · thinking high | read, grep, bash + `code_search`/`code_find_related` | 20 min | review/audit; primary gemini-3.8-flash-high = #1 agentic/code benchmarks + ~305 tok/s, all fallbacks fast — chosen over bare luna pin for the 1M-recall cliff (MRCR 41.3%) and over snowy/smartmode for the sol-TTFT stall tail |
 | `research` | `9router/flash-research` · thinking low | web_search, web_fetch, read (via bundle exts) | 15 min | web research with cited sources; keeps heavy browsing out of the parent context |
 | `oracle` | `9router/smartmode` · thinking high | read, grep, bash + `code_search`/`code_find_related` | 20 min | independent second opinion on hard calls; verdict-first answers |
 
