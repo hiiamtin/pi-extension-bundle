@@ -609,7 +609,10 @@ assert(lifecycleEvents.some((entry) => entry.name === "subagent:finished" && ent
 const rootCompletions = commands.subagents.getArgumentCompletions("");
 assert(rootCompletions?.some((item) => item.value === "inspect"), "inspect must be a root command");
 assert(rootCompletions?.some((item) => item.value === "doctor"), "doctor must be a root command");
+assert(rootCompletions.some((item) => item.value === "widget"), "widget must be a root command");
 assert(rootCompletions.length <= 8);
+const widgetCompletions = commands.subagents.getArgumentCompletions("widget ");
+assert(widgetCompletions?.map((item) => item.value).join(" ") === "widget owner widget all widget off", "widget completions must offer owner/all/off");
 
 // renderResult: click-to-inspect — run id is an OSC 8 link to result.md, hint line present
 {

@@ -460,8 +460,14 @@ Live-verified in the real TUI and in pi-web/ttyd (browser terminal).
 - **FleetView widget** (key `subagents`, placement belowEditor): run count +
   per-run id/agent/state/elapsed/task lines while anything is active, clears
   when idle; refreshed on start/settle/inline-delivery, session activity,
-  and a 2s ticker. Setter captured from the first TUI context carrying
-  `ui.setWidget`.
+  and a 2s ticker. Setter + live theme captured from the first TUI context
+  carrying `ui.setWidget`; rows render dim (thinking-style) via `theme.fg`,
+  state token in accent. String arrays only — RPC/pi-web ignores factories.
+- **Widget scope** (`/subagents widget [owner|all|off]`, bare = cycle,
+  default `owner`): owner filters to runs whose `ownerSession` equals the
+  current session file; all shows every active run on the machine; off hides
+  the widget. Persisted in `<state-dir>/widget-mode.json` — shared by every
+  session's ticker, so one switch updates all TUIs within 2s.
 - **Agent mentions**: `#name` (editor autocomplete provider, trigger `#`,
   prefix-filtered) — plain text; the tool description teaches the model that
   `#name` = delegate. `@path` stays pi's file mention.

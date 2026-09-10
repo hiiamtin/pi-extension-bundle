@@ -121,6 +121,12 @@ export function trackSession(ctx: unknown): string | undefined {
   return sessionFile;
 }
 
+// Session file of the most recently active local session (ownership checks,
+// fleet-widget owner filter). Undefined until the first tracked event.
+export function currentSessionFilePath(): string | undefined {
+  return currentSessionFile;
+}
+
 // --- ownership ---------------------------------------------------------------
 
 // Whose notice is this? Sessions are separated by their session FILE. Strict

@@ -35,6 +35,7 @@ import {
   pumpContext,
   sweepFinishedRuns,
   trackSession,
+  currentSessionFilePath,
   type RunNoticeMeta,
 } from "../lib/agent-runs.ts";
 
@@ -494,21 +495,49 @@ function bgStartText(id: string, agentName: string, model?: string): string {
 }
 
 // FleetView widget (below editor): compact live summary of active runs.
-// The setter is captured from the first TUI context that provides it.
+// The setter is captured from the first TUI context that provides it; the
+// theme comes along so rows render dim (thinking-style) instead of full
+// brightness. String arrays only — RPC/pi-web ignores factory content.
 let fleetSetWidget: ((key: string, lines?: string[]) => void) | null = null;
+let fleetTheme: { fg?: (token: string, text: string) => string } | null = null;
+
+// Widget scope — owner: only runs spawned by THIS session (default); all:
+// every active run on the machine; off: hide the widget. Persisted in the
+// shared state dir so every session's 2s ticker agrees on the preference.
+type FleetMode = "owner" | "all" | "off";
+let fleetMode: FleetMode = "owner";
+try {
+  const saved = JSON.parse(readFileSync(path.join(STATE_DIR, "widget-mode.json"), "utf8")) as { mode?: string };
+  if (saved?.mode === "all" || saved?.mode === "off" || saved?.mode === "owner") fleetMode = saved.mode;
+} catch { /* first run or unreadable — keep default */ }
+
+function setFleetMode(mode: FleetMode, ui?: ToolCtx["ui"]): void {
+  fleetMode = mode;
+  try {
+    writeFileSync(path.join(STATE_DIR, "widget-mode.json"), JSON.stringify({ mode }, null, 2) + "\n");
+  } catch { /* best effort */ }
+  ui?.notify?.(`fleet widget: ${mode}`, "info");
+  updateFleetWidget();
+}
 
 function updateFleetWidget(): void {
   if (!fleetSetWidget) return;
-  const active = listMetas().filter((run) => run.state === "running" || run.state === "queued");
+  const me = currentSessionFilePath();
+  const active = listMetas()
+    .filter((run) => run.state === "running" || run.state === "queued")
+    .filter((run) => fleetMode === "all" || (fleetMode === "owner" && !!me && run.ownerSession === me));
   if (!active.length) {
     fleetSetWidget("subagents", undefined);
     return;
   }
+  const themed = !process.env.NO_COLOR && fleetTheme?.fg ? fleetTheme.fg.bind(fleetTheme) : null;
+  const dim = (text: string) => (themed ? themed("dim", text) : text);
+  const accent = (text: string) => (themed ? themed("accent", text) : text);
   const now = Date.now();
-  const lines = [`${active.length} subagent run(s) active · ctrl+alt+s viewer`];
+  const lines = [dim(`${active.length} subagent run(s) active (${fleetMode}) · ctrl+alt+s viewer`)];
   for (const run of active.slice(0, 5)) {
     const elapsed = fmtDur(now - (run.startedAt ?? run.createdAt));
-    lines.push(`  ${run.id} · ${run.agent} · ${run.state} · ${elapsed} · ${run.task.slice(0, 40)}`);
+    lines.push(dim(`  ${run.id} · ${run.agent} · ${accent(run.state)} · ${elapsed} · ${run.task.slice(0, 40)}`));
   }
   fleetSetWidget("subagents", lines);
 }
@@ -1457,8 +1486,9 @@ export default function subagentExtension(pi: ExtensionAPI): void {
   const onActivity = (_event: unknown, eventCtx: unknown) => {
     try {
       trackSession(eventCtx);
-      const eventUi = (eventCtx as { ui?: { setWidget?: (key: string, lines?: string[], opts?: unknown) => void } } | undefined)?.ui;
+      const eventUi = (eventCtx as { ui?: { setWidget?: (key: string, lines?: string[], opts?: unknown) => void; theme?: { fg?: (token: string, text: string) => string } } } | undefined)?.ui;
       if (eventUi?.setWidget) fleetSetWidget = (key, lines) => eventUi.setWidget(key, lines, { placement: "belowEditor" });
+      if (eventUi?.theme?.fg) fleetTheme = eventUi.theme;
       updateFleetWidget();
       housekeep();
       sweepFinishedRuns(runsIo);
@@ -1582,9 +1612,9 @@ export default function subagentExtension(pi: ExtensionAPI): void {
     getArgumentCompletions: (prefix: string) => {
       const normalized = prefix.trimStart();
       if (!normalized.includes(" ")) {
-          const commands = ["list", "agents", "cont", "kill", "steer", "inspect", "chat", "doctor"]
+          const commands = ["agents", "widget", "cont", "kill", "steer", "inspect", "chat", "doctor"]
           .filter((value) => value.startsWith(normalized))
-          .map((value) => ({ value, label: `${value} — ${{ list: "List runs", agents: "Browse agents + on/off", cont: "Continue a finished run", kill: "Stop a run", steer: "Redirect a running run", inspect: "View a run report", chat: "Open a run's chat viewer", doctor: "Check environment health" }[value]}` }));
+          .map((value) => ({ value, label: `${value} — ${{ agents: "Browse agents + on/off", widget: "Fleet widget scope", cont: "Continue a finished run", kill: "Stop a run", steer: "Redirect a running run", inspect: "View a run report", chat: "Open a run's chat viewer", doctor: "Check environment health" }[value]}` }));
         return commands.length ? commands : null;
       }
       const agentsSub = normalized.match(/^agents\s+(off|on)?\s*(\S*)$/);
@@ -1601,6 +1631,14 @@ export default function subagentExtension(pi: ExtensionAPI): void {
           .filter((name) => name.startsWith(namePrefix))
           .slice(0, 8)
           .map((name) => ({ value: `agents ${action} ${name}`, label: `${action} ${name}` }));
+      }
+      const widgetSub = normalized.match(/^widget\s+(\S*)$/);
+      if (widgetSub) {
+        const [, modePrefix] = widgetSub;
+        const modes = (["owner", "all", "off"] as const).filter((m) => m.startsWith(modePrefix));
+        return modes.length
+          ? modes.map((m) => ({ value: `widget ${m}`, label: `${m} — ${{ owner: "only this session's runs (default)", all: "every active run on the machine", off: "hide the widget" }[m]}` }))
+          : null;
       }
       const match = normalized.match(/^(cont|kill|steer)\s+(\S*)$/);
       if (!match) return null;
@@ -1717,6 +1755,22 @@ export default function subagentExtension(pi: ExtensionAPI): void {
         }
         return;
       }
+      const widgetMatch = input.match(/^widget(?:\s+(\S+))?$/);
+      if (widgetMatch) {
+        const [, arg] = widgetMatch;
+        if (arg === "owner" || arg === "all" || arg === "off") {
+          setFleetMode(arg, ctx.ui);
+          return;
+        }
+        if (!arg) {
+          // bare /subagents widget cycles owner -> all -> off -> owner
+          const next: FleetMode = fleetMode === "owner" ? "all" : fleetMode === "all" ? "off" : "owner";
+          setFleetMode(next, ctx.ui);
+          return;
+        }
+        ctx.ui?.notify?.(`usage: /subagents widget [owner|all|off] — current: ${fleetMode}`, "warning");
+        return;
+      }
       const chat = input.match(/^chat(?:\s+(\S+))?$/);
       if (chat) {
           if (ctx.hasUI && ctx.ui?.custom) {
@@ -1743,7 +1797,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
         else ctx.ui?.notify?.(result.content[0].text, result.details.run.state === "done" ? "info" : "error");
         return;
       }
-      ctx.ui?.notify?.(`usage: /subagents list | cont <id> <message> | kill <id> | steer <id> <message> | inspect <id> | doctor`, "info");
+      ctx.ui?.notify?.(`usage: /subagents list | widget [owner|all|off] | cont <id> <message> | kill <id> | steer <id> <message> | inspect <id> | doctor`, "info");
     },
   });
 }
