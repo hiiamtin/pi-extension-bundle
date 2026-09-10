@@ -975,10 +975,38 @@ function messageText(message: Record<string, any> | undefined): string {
 
 // speaker colors for chat rendering — the notify channel wraps the whole
 // message in theme dim, so embedded SGR codes make labels pop and bodies fall
-// back to normal weight. Honors NO_COLOR.
+// back to normal weight. Honors NO_COLOR. (Notice strings are built without
+// UI context, so they cannot read the live theme — the INTERACTIVE viewer
+// can, and does via viewerStyle/theme.fg below.)
 const CHAT_STYLE = process.env.NO_COLOR
   ? { user: "", agent: "", dim: "", reset: "" }
   : { user: "\x1b[1;36m", agent: "\x1b[1;35m", dim: "\x1b[2m", reset: "\x1b[0m" };
+
+// Theme-aware styles for the INTERACTIVE viewer: pi hands the live theme to
+// ui.custom, so semantic tokens (warning/dim/accent/muted) adapt to light and
+// dark automatically — hardcoded SGR yellows were unreadable on light themes.
+type UiStyle = {
+  warn: (text: string) => string;
+  accent: (text: string) => string;
+  muted: (text: string) => string;
+  dim: (text: string) => string;
+  bold: (text: string) => string;
+};
+
+function viewerStyle(theme?: any): UiStyle {
+  const passthrough = (text: string) => text;
+  if (process.env.NO_COLOR) {
+    return { warn: passthrough, accent: passthrough, muted: passthrough, dim: passthrough, bold: passthrough };
+  }
+  const fg = (token: string) => (text: string) => (theme?.fg ? theme.fg(token, text) : text);
+  return {
+    warn: fg("warning"),
+    accent: fg("accent"),
+    muted: fg("muted"),
+    dim: fg("dim"),
+    bold: (text: string) => (theme?.bold ? theme.bold(text) : text),
+  };
+}
 
 function chatTranscript(meta: RunMeta, perMessageCap = 500, totalCap = 4_000): string {
   const turns: string[] = [];
@@ -1055,12 +1083,14 @@ class SubagentViewer {
   private flash: string | null = null;
   private runsIo: RunsIo;
   private notifyNext = false; // viewer sends default quiet; n toggles
+  private s: UiStyle;
 
-  constructor(meta: RunMeta, tui: { requestRender: () => void }, done: () => void, runsIo: RunsIo) {
+  constructor(meta: RunMeta, tui: { requestRender: () => void }, done: () => void, runsIo: RunsIo, theme?: any) {
     this.meta = meta;
     this.tui = tui;
     this.done = done;
     this.runsIo = runsIo;
+    this.s = viewerStyle(theme);
     this.refresh();
     if (meta.state === "running" || meta.state === "queued") {
       this.timer = setInterval(() => {
@@ -1086,7 +1116,7 @@ class SubagentViewer {
   private refresh(): void {
     const fresh = readMeta(this.meta.id);
     if (fresh) this.meta = fresh;
-    this.lines = buildViewerBody(this.meta);
+    this.lines = buildViewerBody(this.meta, this.s);
     const max = Math.max(0, this.lines.length - VIEWER_ROWS);
     if (this.follow) this.scrollTop = max;
     this.scrollTop = Math.min(this.scrollTop, max);
@@ -1204,22 +1234,22 @@ class SubagentViewer {
     const max = Math.max(0, this.lines.length - VIEWER_ROWS);
     if (this.follow) this.scrollTop = max;
     this.scrollTop = Math.min(this.scrollTop, max);
-    const live = this.meta.state === "running" || this.meta.state === "queued" ? " · \x1b[1;33mLIVE\x1b[0m" : "";
-    const header = `\x1b[1msubagent viewer\x1b[0m ${this.meta.id} · ${this.meta.agent} · ${this.meta.model ?? "inherit"} · ${this.meta.state}${live}`;
+    const live = this.meta.state === "running" || this.meta.state === "queued" ? ` · ${this.s.warn("LIVE")}` : "";
+    const header = `${this.s.bold("subagent viewer")} ${this.meta.id} · ${this.meta.agent} · ${this.meta.model ?? "inherit"} · ${this.meta.state}${live}`;
     const visible = this.lines.slice(this.scrollTop, this.scrollTop + VIEWER_ROWS);
     const padded = [...visible];
     while (padded.length < VIEWER_ROWS) padded.push("");
-    const notifyTag = this.notifyNext ? "\x1b[1;33mnotify:on\x1b[0m" : "\x1b[2mnotify:off\x1b[0m";
+    const notifyTag = this.notifyNext ? this.s.warn("notify:on") : this.s.dim("notify:off");
     const footer = this.inputMode !== null
-      ? `\x1b[1;36msteer:\x1b[0m ${this.inputMode}\x1b[2m▏ · enter send · esc cancel\x1b[0m`
+      ? `${this.s.accent("steer:")} ${this.inputMode}${this.s.dim("▏ · enter send · esc cancel")}`
       : this.flash
-        ? `\x1b[1;33m${this.flash}\x1b[0m`
-        : `\x1b[2m↑↓/jk scroll · g/G ends · s talk · D stop · n ${notifyTag} · esc back\x1b[0m`;
+        ? this.s.warn(this.flash)
+        : this.s.dim(`↑↓/jk scroll · g/G ends · s talk · D stop · n ${notifyTag} · esc back`);
     return [header, ...padded, footer].map((line) => truncateToWidth(line, width));
   }
 }
 
-function buildViewerBody(meta: RunMeta): string[] {
+function buildViewerBody(meta: RunMeta, s: UiStyle): string[] {
   const lines: string[] = [];
   try {
     for (const line of readFileSync(meta.transcriptPath, "utf8").split("\n")) {
@@ -1231,15 +1261,13 @@ function buildViewerBody(meta: RunMeta): string[] {
         continue;
       }
       if (event.type === "tool_execution_start") {
-        lines.push(`${CHAT_STYLE.dim}  · ${String(event.toolName ?? "tool")} ${JSON.stringify(event.args ?? {}).slice(0, 90)}${CHAT_STYLE.reset}`);
+        lines.push(s.dim(`  · ${String(event.toolName ?? "tool")} ${JSON.stringify(event.args ?? {}).slice(0, 90)}`));
       } else if (event.type === "message_end") {
         const role = event.message?.role;
         if (role !== "user" && role !== "assistant") continue;
         const text = messageText(event.message);
         if (!text) continue;
-        const label = role === "user"
-          ? `${CHAT_STYLE.user}you:${CHAT_STYLE.reset}`
-          : `${CHAT_STYLE.agent}${meta.agent}:${CHAT_STYLE.reset}`;
+        const label = role === "user" ? s.accent("you:") : s.muted(`${meta.agent}:`);
         const textLines = text.split("\n");
         textLines.forEach((chunk, index) => lines.push(index === 0 ? `${label} ${chunk}` : `  ${chunk}`));
       }
@@ -1273,8 +1301,8 @@ async function openChatViewer(ctx: ToolCtx, id?: string, runsIo?: RunsIo): Promi
     ctx.ui?.notify?.(`run '${targetId}' not found`, "warning");
     return;
   }
-  await ctx.ui?.custom?.((tui, _theme, _keybindings, done) =>
-    new SubagentViewer(target, tui as { requestRender: () => void }, done as () => void, runsIo));
+  await ctx.ui?.custom?.((tui, theme, _keybindings, done) =>
+    new SubagentViewer(target, tui as { requestRender: () => void }, done as () => void, runsIo, theme));
 }
 
 // arm ctrl+alt+s once: opens the chat viewer picker even while a turn runs
@@ -1710,7 +1738,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
         else ctx.ui?.notify?.(result.content[0].text, result.details.run.state === "done" ? "info" : "error");
         return;
       }
-      ctx.ui?.notify?.(`usage: /subagents list | cont <id> <message> | kill <id> | steer <id> <message> | inspect <id> | doctor`, "warning");
+      ctx.ui?.notify?.(`usage: /subagents list | cont <id> <message> | kill <id> | steer <id> <message> | inspect <id> | doctor`, "info");
     },
   });
 }
