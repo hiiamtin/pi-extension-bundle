@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: Read-only code reviewer. Use after implementation to find correctness, regression, security, and spec-compliance problems before accepting changes.
-model: 9router/snowy
+model: 9router/cx/gpt-5.6-luna
 tools:
   - read
   - grep
@@ -14,7 +14,7 @@ extensions:
 skills: []
 mcp:
   - cbmem
-thinking: high
+thinking: max
 timeout: 20
 ---
 
