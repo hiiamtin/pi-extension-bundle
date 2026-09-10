@@ -800,12 +800,18 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
   fire("session_start", {
     sessionManager: { getSessionFile: () => path.join(root, "parent-session.jsonl") },
     ui: {
-      setWidget: (key, lines) => widgetCalls.push({ key, lines }),
+      setWidget: (key, content) => {
+        const lines = typeof content === "function"
+          ? content({}, { fg: (_token, text) => text }).render(500)
+          : content;
+        widgetCalls.push({ key, lines });
+      },
+      theme: { fg: (_token, text) => text },
       addAutocompleteProvider: (provider) => autocompleteProviders.push(provider),
     },
   });
   process.env.FAKE_SUBAGENT_DELAY_MS = "1200";
-  const longWidgetTask = "fleet widget run with a deliberately long task description beyond forty characters";
+  const longWidgetTask = "fleet widget run with a deliberately long task description beyond forty characters and continuing far enough to verify the one-hundred-twenty-character display cap with an ellipsis at the end";
   const wPromise = tool.execute("widget-live", { agent: "scout", task: longWidgetTask, run_in_background: true }, undefined, undefined, ctx);
   const wRun = await waitFor(() => readdirSync(stateDir)
     .map((entry) => JSON.parse(readFileSync(path.join(stateDir, entry, "meta.json"), "utf8")))
@@ -814,7 +820,11 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
   assert.equal(wCall.key, "subagents", "widget key must be subagents");
   assert.match(wCall.lines[0], /^─+$/, "widget must have a full-width top border");
   assert.match(wCall.lines[1], /1 subagent run\(s\) active/, "widget header must count active runs");
-  assert(wCall.lines.some((line) => line.includes("beyond forty characters")), "widget must show the long task until viewport truncation");
+  const widgetTaskLine = wCall.lines.find((line) => line.includes("beyond forty characters"));
+  assert(widgetTaskLine, "widget must show the long task");
+  const displayedTask = widgetTaskLine.slice(widgetTaskLine.indexOf("fleet widget run"));
+  assert.equal(displayedTask.length, 120, "widget task must be capped at 120 characters including the ellipsis");
+  assert(displayedTask.endsWith("…"), "widget must add an ellipsis when the task exceeds 120 characters");
   assert(!wCall.lines[1].startsWith("│") && !wCall.lines[1].endsWith("│"), "widget must not have side borders");
   assert.match(wCall.lines.at(-1), /^─+$/, "widget must have a full-width bottom border");
   await wPromise;

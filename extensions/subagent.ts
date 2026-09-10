@@ -522,6 +522,14 @@ function formatTokens(tokens: number): string {
   return String(Math.round(tokens));
 }
 
+const WIDGET_TASK_CHARS = 120;
+
+function formatWidgetTask(task: string): string {
+  const normalized = task.replace(/\s+/g, " ").trim();
+  if (normalized.length <= WIDGET_TASK_CHARS) return normalized;
+  return `${normalized.slice(0, WIDGET_TASK_CHARS - 1)}…`;
+}
+
 function truncateOutput(text: string): { text: string; truncated: boolean } {
   const lines = text.split("\n");
   if (text.length <= MAX_OUTPUT_CHARS && lines.length <= MAX_OUTPUT_LINES) return { text, truncated: false };
@@ -640,7 +648,7 @@ function updateFleetWidget(): void {
     // sufficient for a secondary status panel).
     const contextKey = run.context ? `${run.context.tokens}:${run.context.window}` : "-";
     keyParts.push(`${run.id}:${run.state}:${Math.floor(elapsedMs / 10_000)}:${contextKey}:${run.task}`);
-    const task = run.task.replace(/\s+/g, " ").trim();
+    const task = formatWidgetTask(run.task);
     contentLines.push(dim(`  ${run.id} · ${run.agent} · ${accent(run.state)} · ${elapsed} · ${formatContext(run.context)} · ${task}`));
   }
   const key = keyParts.join("\n");
