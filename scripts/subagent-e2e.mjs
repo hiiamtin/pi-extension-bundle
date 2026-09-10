@@ -811,9 +811,10 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
     .find((meta) => meta.task === "fleet widget run" && meta.state === "running"));
   const wCall = await waitFor(() => widgetCalls.slice(widgetStart).reverse().find((call) => call.lines?.some((line) => line.includes(wRun.id) && line.includes("running"))), 4000);
   assert.equal(wCall.key, "subagents", "widget key must be subagents");
-  assert.match(wCall.lines[0], /^╭─+╮$/, "widget must have a top border");
+  assert.match(wCall.lines[0], /^─+$/, "widget must have a full-width top border");
   assert.match(wCall.lines[1], /1 subagent run\(s\) active/, "widget header must count active runs");
-  assert.match(wCall.lines.at(-1), /^╰─+╯$/, "widget must have a bottom border");
+  assert(!wCall.lines[1].startsWith("│") && !wCall.lines[1].endsWith("│"), "widget must not have side borders");
+  assert.match(wCall.lines.at(-1), /^─+$/, "widget must have a full-width bottom border");
   await wPromise;
   delete process.env.FAKE_SUBAGENT_DELAY_MS;
   await waitFor(() => widgetCalls.length > 0 && widgetCalls[widgetCalls.length - 1].lines === undefined, 5000);

@@ -566,10 +566,12 @@ function bgStartText(id: string, agentName: string, model?: string): string {
 }
 
 // FleetView widget (below editor): compact live summary of active runs.
-// The setter is captured from the first TUI context that provides it; the
-// theme comes along so rows render dim (thinking-style) instead of full
-// brightness. String arrays only — RPC/pi-web ignores factory content.
-let fleetSetWidget: ((key: string, lines?: string[]) => void) | null = null;
+// The setter is captured from the first TUI context that provides it. The
+// interactive TUI also accepts a component factory (used for full-width
+// borders); RPC/pi-web only accepts string arrays, so it keeps the fallback.
+type FleetWidgetContent = string[] | ((ui: unknown, theme: unknown) => unknown);
+let fleetSetWidget: ((key: string, content?: FleetWidgetContent) => void) | null = null;
+let fleetInteractive = false;
 let fleetTheme: { fg?: (token: string, text: string) => string } | null = null;
 let fleetWidgetKey: string | null = null;
 let fleetWidgetSuppressed = false;
@@ -644,18 +646,39 @@ function updateFleetWidget(): void {
   if (key === fleetWidgetKey) return;
   fleetWidgetKey = key;
 
-  // ui.setWidget accepts string arrays in both interactive and RPC modes.
-  // Frame the compact panel without assuming the terminal width: derive a
-  // bounded inner width from the current content and truncate ANSI-safely.
+  if (fleetInteractive) {
+    // Interactive setWidget factories receive the actual viewport width, so
+    // the top/bottom rules span the whole terminal instead of stopping at a
+    // content-derived width. No side rules: this stays visually lightweight.
+    fleetSetWidget("subagents", (_ui: unknown, theme: unknown) => {
+      const t = theme as { fg?: (token: string, text: string) => string } | undefined;
+      const line = (text: string) => (t?.fg ? t.fg("borderAccent", text) : text);
+      return {
+        render(width: number): string[] {
+          const fullWidth = Math.max(1, Math.floor(width));
+          return [
+            line("─".repeat(fullWidth)),
+            ...contentLines.map((content) => truncateToWidth(content, fullWidth, "")),
+            line("─".repeat(fullWidth)),
+          ];
+        },
+        invalidate(): void {},
+      };
+    });
+    return;
+  }
+
+  // RPC/pi-web only accepts string arrays. Frame the fallback using a
+  // bounded content width and truncate ANSI-styled lines safely.
   const innerWidth = Math.min(76, Math.max(36, Math.max(...contentLines.map(visibleWidth))));
   const frame = (line: string) => {
     const clipped = truncateToWidth(line, innerWidth, "");
-    return `${border("│")}${clipped}${" ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)))}${border("│")}`;
+    return `${clipped}${" ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)))}`;
   };
   const lines = [
-    border(`╭${"─".repeat(innerWidth)}╮`),
+    border("─".repeat(innerWidth)),
     ...contentLines.map(frame),
-    border(`╰${"─".repeat(innerWidth)}╯`),
+    border("─".repeat(innerWidth)),
   ];
   fleetSetWidget("subagents", lines);
 }
@@ -1169,7 +1192,7 @@ function viewerStyle(theme?: any): UiStyle {
     dim: fg("dim"),
     bold: (text: string) => (theme?.bold ? theme.bold(text) : text),
     border: fg("borderAccent"),
-    bg: (text: string) => (theme?.bg ? theme.bg("customMessageBg", text) : text),
+    bg: (text: string) => (theme?.bg ? theme.bg("toolPendingBg", text) : text),
   };
 }
 
@@ -1635,8 +1658,11 @@ export default function subagentExtension(pi: ExtensionAPI): void {
   const onActivity = (_event: unknown, eventCtx: unknown) => {
     try {
       trackSession(eventCtx);
-      const eventUi = (eventCtx as { ui?: { setWidget?: (key: string, lines?: string[], opts?: unknown) => void; theme?: { fg?: (token: string, text: string) => string } } } | undefined)?.ui;
-      if (eventUi?.setWidget && !fleetSetWidget) fleetSetWidget = (key, lines) => eventUi.setWidget(key, lines, { placement: "belowEditor" });
+      const eventUi = (eventCtx as { ui?: { setWidget?: (key: string, content?: FleetWidgetContent, opts?: unknown) => void; theme?: { fg?: (token: string, text: string) => string } } } | undefined)?.ui;
+      if (eventUi?.setWidget && !fleetSetWidget) {
+        fleetInteractive = !!eventUi.theme?.fg;
+        fleetSetWidget = (key, content) => eventUi.setWidget!(key, content, { placement: "belowEditor" });
+      }
       if (eventUi?.theme?.fg && fleetTheme !== eventUi.theme) {
         fleetTheme = eventUi.theme;
         fleetWidgetKey = null;
