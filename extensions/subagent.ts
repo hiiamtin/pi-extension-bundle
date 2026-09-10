@@ -25,6 +25,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { extractToolArgs, requireString, textResult } from "../lib/tool-compat.ts";
 import { startRpcChild, type RpcChild } from "../lib/rpc-child.ts";
+import { lowPrio } from "../lib/low-prio.ts";
 import {
   captureExtensionApi,
   deliverRunNotice,
@@ -733,7 +734,8 @@ async function runAgent(
       const invocation = getPiInvocation(args);
       // the rpc child gets the task via a prompt request, not argv
       const prompt = args.pop() as string;
-      rpcChild = startRpcChild("nice", ["-n", "15", "ionice", "-c3", invocation.command, ...invocation.args], { cwd });
+      const [prioCmd, ...prioArgs] = lowPrio([invocation.command, ...invocation.args]);
+      rpcChild = startRpcChild(prioCmd, prioArgs, { cwd });
       liveRuns.set(meta.id, { child: rpcChild });
       meta.pid = rpcChild.pid;
       meta.pgid = rpcChild.pid;

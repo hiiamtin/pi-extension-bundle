@@ -53,8 +53,9 @@ delegation-oriented (Claude Code lesson).
 - **Subprocess always.** Spawn the same pi binary that hosts us:
   `process.execPath + process.argv[1]` (fnm/bun-safe; fall back to `pi` on
   PATH) — the official example's `getPiInvocation` trick.
-- **Never starve the TinTin VM** (ARM 4-core sharing the docker stack): wrap
-  every child in `nice -n 15 ionice -c3`, `detached: true` process group.
+- **Never starve the host machine** (works on the Linux VM and macOS alike):
+  wrap every child in `nice -n 15`, plus `ionice -c3` where the binary exists
+  (Linux only — see `lib/low-prio.ts`), `detached: true` process group.
 - **P1: `--mode json -p`** — fire, stream-parse JSONL events from stdout,
   collect. Simple lifecycle: child exits when done.
 - **P3 (committed, must-not-forget): switch spawn to `--mode rpc`** — the

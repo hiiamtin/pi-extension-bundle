@@ -30,8 +30,10 @@
 //   off     — no interception.
 //
 // Design notes (TinTin VM, 4 cores / 24GB ARM):
-//   - Every task runs `nice -n 15 ionice -c3` so background jobs can never
-//     starve the docker stack (traefik/9router/litellm/pi-web).
+//   - Every task runs at lowest priority (`nice -n 15`, plus `ionice -c3` where
+//     the binary exists — Linux; macOS gets nice only, see lib/low-prio.ts) so
+//     background jobs can never starve the docker stack
+//     (traefik/9router/litellm/pi-web).
 //   - Shared state dir ~/.pi/agent/bg-tasks/<id>/ (meta.json + out.log).
 //     All sessions see all tasks; each session's instance heartbeats its own.
 //     Stale heartbeat (>15s) + running process → marked "orphan" (still
@@ -66,6 +68,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { extractToolArgs, requireString, textResult } from "../lib/tool-compat.ts";
+import { lowPrio } from "../lib/low-prio.ts";
 import { Type } from "typebox";
 import { spawn, type ChildProcess } from "node:child_process";
 import {
@@ -618,12 +621,12 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
   //     can finalize the task's true state. No live rotation (prune covers disk).
   let child: ChildProcess;
   try {
-    const bashArgs = ["-n", "15", "ionice", "-c3", "bash", "-c"];
     if (meta.detach) {
       const fd = openSync(path.join(dirOf(id), "out.log"), "a");
       // subshell group (not braces): valid for any command body incl. trailing
       // `&`, and $? is always the group's exit code
-      child = spawn("nice", [...bashArgs, `(\n${opts.command}\n) ; echo $? > '${exitPath(id)}'`], {
+      const [prioCmd, ...prioArgs] = lowPrio(["bash", "-c", `(\n${opts.command}\n) ; echo $? > '${exitPath(id)}'`]);
+      child = spawn(prioCmd, prioArgs, {
         detached: true,
         stdio: ["ignore", fd, fd],
       });
@@ -633,7 +636,8 @@ function spawnTask(opts: SpawnOpts): { ok: true; meta: Meta } | { ok: false; err
         /* ignore */
       }
     } else {
-      child = spawn("nice", [...bashArgs, opts.command], {
+      const [prioCmd, ...prioArgs] = lowPrio(["bash", "-c", opts.command]);
+      child = spawn(prioCmd, prioArgs, {
         detached: true,
         stdio: ["ignore", "pipe", "pipe"],
       });

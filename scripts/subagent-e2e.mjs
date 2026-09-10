@@ -55,6 +55,9 @@ process.env.PI_CODING_AGENT_DIR = agentDir;
 process.env.PI_SUBAGENT_STATE_DIR = stateDir;
 process.env.PI_SUBAGENT_PI_SCRIPT = fakePi;
 process.env.PI_SUBAGENT_MAX_CONCURRENT = "2";
+// small cap so the truncation test's 2,408-char fixture actually truncates;
+// otherwise the suite silently depends on the ambient env (default is 200,000)
+process.env.PI_SUBAGENT_OUT_CHARS = "1000";
 process.env.FAKE_SUBAGENT_CAPTURE = captureFile;
 process.env.PI_SUBAGENT_DEBUG_LOG = path.join(root, "debug.log");
 process.env.PI_SUBAGENT_WRAPUP_SEC = "1"; // short grace so timeout tests stay fast
