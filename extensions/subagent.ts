@@ -5,7 +5,7 @@
 // skills, and MCP servers back in. See docs/subagent.md.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { hyperlink, Text, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { hyperlink, matchesKey, Key, Text, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { parse as parseYaml } from "yaml";
 import { spawn } from "node:child_process";
@@ -1076,9 +1076,11 @@ class SubagentViewer {
     this.scrollTop = Math.min(this.scrollTop, max);
   }
 
-  // pi hands focused components RAW terminal data here (e.g. "q" is literally
-  // "q", escape is a bare "\x1b" byte, arrows are "\x1b[A"…). Parsed-key
-  // matching happens only via keybindings, which custom viewers don't get.
+  // pi hands focused components the raw input string ("q" is literally "q",
+  // legacy arrows are "\x1b[A"…). Key identity must go through matchesKey():
+  // under the Kitty keyboard protocol Escape arrives as a CSI-u sequence
+  // ("\x1b[27u"), NOT a bare byte — raw "=== "\x1b"" matching missed it and
+  // left the viewer stuck (q still worked, which is how the bug surfaced).
   handleInput = (raw: unknown): boolean => {
     const data = typeof raw === "string"
       ? raw
@@ -1087,9 +1089,9 @@ class SubagentViewer {
     this.refresh(); // actions must see the run's current state, not a stale snapshot
     // composing a steering message captures printable input; esc cancels
     if (this.inputMode !== null) {
-      if (data === "\x1b") {
+      if (matchesKey(data, Key.escape)) {
         this.inputMode = null;
-      } else if (data === "\r" || data === "\n") {
+      } else if (matchesKey(data, Key.enter) || data === "\r" || data === "\n") {
         const message = this.inputMode.trim();
         this.inputMode = null;
         if (message) {
@@ -1110,7 +1112,7 @@ class SubagentViewer {
             });
         }
         }
-      } else if (data === "\x7f" || data === "\b") {
+      } else if (matchesKey(data, Key.backspace) || data === "\x7f" || data === "\b") {
         this.inputMode = this.inputMode.slice(0, -1);
       } else if (data && !data.startsWith("\x1b")) {
         this.inputMode += data;
@@ -1118,14 +1120,13 @@ class SubagentViewer {
       this.tui.requestRender();
       return true;
     }
-    // bare ESC = escape key (any longer sequence starting with ESC is a key
-    // like an arrow — fall through to the sequence table below)
-    if (data === "\x1b" || data === "q") {
+    // esc (any protocol encoding) or q = leave the viewer
+    if (matchesKey(data, Key.escape) || data === "\x1b" || data === "q") {
       this.stopTimer();
       this.done();
       return true;
     }
-    if (data === "\x03") {
+    if (matchesKey(data, Key.ctrl("c")) || data === "\x03") {
       // ctrl+c must never be swallowed by the viewer
       this.stopTimer();
       this.done();
@@ -1160,19 +1161,19 @@ class SubagentViewer {
       this.tui.requestRender();
       return true;
     }
-    if (data === "j" || data === "\x1b[B") {
+    if (data === "j" || matchesKey(data, Key.down)) {
       this.follow = false;
       this.scrollTop = Math.min(max, this.scrollTop + 1);
-    } else if (data === "k" || data === "\x1b[A") {
+    } else if (data === "k" || matchesKey(data, Key.up)) {
       this.scrollTop = Math.max(0, this.scrollTop - 1);
-    } else if (data === "\x1b[6~" || data === " ") {
+    } else if (matchesKey(data, Key.pageDown) || data === "\x1b[6~" || data === " ") {
       this.scrollTop = Math.min(max, this.scrollTop + VIEWER_ROWS);
-    } else if (data === "\x1b[5~") {
+    } else if (matchesKey(data, Key.pageUp) || data === "\x1b[5~") {
       this.scrollTop = Math.max(0, this.scrollTop - VIEWER_ROWS);
-    } else if (data === "g") {
+    } else if (data === "g" || matchesKey(data, Key.home)) {
       this.follow = false;
       this.scrollTop = 0;
-    } else if (data === "G" || data === "\x1b[F") {
+    } else if (data === "G" || matchesKey(data, Key.end) || data === "\x1b[F") {
       this.follow = true;
       this.scrollTop = max;
     } else {
