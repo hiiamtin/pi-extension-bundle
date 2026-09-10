@@ -451,8 +451,9 @@ Live-verified in the real TUI and in pi-web/ttyd (browser terminal).
   (LIVE marker). `esc`/`q`/`ctrl+c` exit; pi hands focused components RAW
   terminal data, so keys are matched as bytes, not parsed names. The header
   shows the latest context percentage and token/window values, with a themed
-  border and background; the fleet widget is hidden while the viewer (and
-  its picker) is open, then restored on close.
+  border and background; the footer keeps the normal terminal background for
+  visual separation. The fleet widget is hidden while the viewer (and its
+  picker) is open, then restored on close.
 - **Two-way actions**: `s` composes a message — live run ⇒ steer, finished
   run ⇒ background continue on the SAME run id (viewer follows, LIVE again).
   `D` twice stops the run (explicit two-press confirmation).
@@ -469,8 +470,9 @@ Live-verified in the real TUI and in pi-web/ttyd (browser terminal).
   and a 2s ticker. Setter + live theme captured from the first TUI context
   carrying `ui.setWidget`; rows render dim (thinking-style) via `theme.fg`,
   state token in accent, and show the latest context percentage (`ctx xx%`).
-  It is framed with themed top/bottom/side borders. String arrays only —
-  RPC/pi-web ignores factories.
+  It is framed with full-width themed top/bottom rules (no side borders).
+  Task text is shown until the actual viewport width truncates it. String
+  arrays only — RPC/pi-web ignores factories.
 - **Widget scope** (`/subagents widget [owner|all|off]`, bare = cycle,
   default `owner`): owner filters to runs whose `ownerSession` equals the
   current session file; all shows every active run on the machine; off hides

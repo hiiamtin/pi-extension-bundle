@@ -805,14 +805,16 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
     },
   });
   process.env.FAKE_SUBAGENT_DELAY_MS = "1200";
-  const wPromise = tool.execute("widget-live", { agent: "scout", task: "fleet widget run", run_in_background: true }, undefined, undefined, ctx);
+  const longWidgetTask = "fleet widget run with a deliberately long task description beyond forty characters";
+  const wPromise = tool.execute("widget-live", { agent: "scout", task: longWidgetTask, run_in_background: true }, undefined, undefined, ctx);
   const wRun = await waitFor(() => readdirSync(stateDir)
     .map((entry) => JSON.parse(readFileSync(path.join(stateDir, entry, "meta.json"), "utf8")))
-    .find((meta) => meta.task === "fleet widget run" && meta.state === "running"));
+    .find((meta) => meta.task === longWidgetTask && meta.state === "running"));
   const wCall = await waitFor(() => widgetCalls.slice(widgetStart).reverse().find((call) => call.lines?.some((line) => line.includes(wRun.id) && line.includes("running"))), 4000);
   assert.equal(wCall.key, "subagents", "widget key must be subagents");
   assert.match(wCall.lines[0], /^─+$/, "widget must have a full-width top border");
   assert.match(wCall.lines[1], /1 subagent run\(s\) active/, "widget header must count active runs");
+  assert(wCall.lines.some((line) => line.includes("beyond forty characters")), "widget must show the long task until viewport truncation");
   assert(!wCall.lines[1].startsWith("│") && !wCall.lines[1].endsWith("│"), "widget must not have side borders");
   assert.match(wCall.lines.at(-1), /^─+$/, "widget must have a full-width bottom border");
   await wPromise;

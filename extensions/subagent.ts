@@ -640,7 +640,8 @@ function updateFleetWidget(): void {
     // sufficient for a secondary status panel).
     const contextKey = run.context ? `${run.context.tokens}:${run.context.window}` : "-";
     keyParts.push(`${run.id}:${run.state}:${Math.floor(elapsedMs / 10_000)}:${contextKey}:${run.task}`);
-    contentLines.push(dim(`  ${run.id} · ${run.agent} · ${accent(run.state)} · ${elapsed} · ${formatContext(run.context)} · ${run.task.slice(0, 40)}`));
+    const task = run.task.replace(/\s+/g, " ").trim();
+    contentLines.push(dim(`  ${run.id} · ${run.agent} · ${accent(run.state)} · ${elapsed} · ${formatContext(run.context)} · ${task}`));
   }
   const key = keyParts.join("\n");
   if (key === fleetWidgetKey) return;
@@ -1433,17 +1434,24 @@ class SubagentViewer {
       : this.flash
         ? this.s.warn(this.flash)
         : this.s.dim(`↑↓/jk scroll · g/G ends · s talk · D stop · n ${notifyTag} · esc back`);
-    const content = [header, ...padded, footer];
-    if (width < 3) return content.map((line) => truncateToWidth(line, width));
+    const bodyContent = [header, ...padded];
+    if (width < 3) return [...bodyContent, footer].map((line) => truncateToWidth(line, width));
     const innerWidth = width - 2;
     const fill = (line: string) => {
       const clipped = truncateToWidth(line, innerWidth, "");
       return this.s.bg(clipped + " ".repeat(Math.max(0, innerWidth - visibleWidth(clipped))));
     };
+    const plain = (line: string) => {
+      const clipped = truncateToWidth(line, innerWidth, "");
+      return `${clipped}${" ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)))}`;
+    };
+    const side = (line: string) => `${this.s.border("│")}${line}${this.s.border("│")}`;
     const top = this.s.border(`╭${"─".repeat(innerWidth)}╮`);
     const bottom = this.s.border(`╰${"─".repeat(innerWidth)}╯`);
-    const body = content.map((line) => `${this.s.border("│")}${fill(line)}${this.s.border("│")}`);
-    return [top, ...body, bottom];
+    const body = bodyContent.map((line) => side(fill(line)));
+    // Keep controls visually separate: transcript/header get the gray panel
+    // background, while the footer stays on the terminal's normal background.
+    return [top, ...body, side(plain(footer)), bottom];
   }
 }
 
