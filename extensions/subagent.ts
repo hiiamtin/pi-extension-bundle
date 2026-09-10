@@ -625,9 +625,10 @@ function updateFleetWidget(): void {
   }
   const themed = !process.env.NO_COLOR && fleetTheme?.fg ? fleetTheme.fg.bind(fleetTheme) : null;
   const dim = (text: string) => (themed ? themed("dim", text) : text);
+  const border = (text: string) => (themed ? themed("borderAccent", text) : text);
   const accent = (text: string) => (themed ? themed("accent", text) : text);
   const now = Date.now();
-  const lines = [dim(`${active.length} subagent run(s) active (${fleetMode}) · ctrl+alt+s viewer`)];
+  const contentLines = [dim(`${active.length} subagent run(s) active (${fleetMode}) · ctrl+alt+s viewer`)];
   const keyParts = [`mode=${fleetMode}`];
   for (const run of active.slice(0, 5)) {
     const elapsedMs = now - (run.startedAt ?? run.createdAt);
@@ -637,11 +638,25 @@ function updateFleetWidget(): void {
     // sufficient for a secondary status panel).
     const contextKey = run.context ? `${run.context.tokens}:${run.context.window}` : "-";
     keyParts.push(`${run.id}:${run.state}:${Math.floor(elapsedMs / 10_000)}:${contextKey}:${run.task}`);
-    lines.push(dim(`  ${run.id} · ${run.agent} · ${accent(run.state)} · ${elapsed} · ${formatContext(run.context)} · ${run.task.slice(0, 40)}`));
+    contentLines.push(dim(`  ${run.id} · ${run.agent} · ${accent(run.state)} · ${elapsed} · ${formatContext(run.context)} · ${run.task.slice(0, 40)}`));
   }
   const key = keyParts.join("\n");
   if (key === fleetWidgetKey) return;
   fleetWidgetKey = key;
+
+  // ui.setWidget accepts string arrays in both interactive and RPC modes.
+  // Frame the compact panel without assuming the terminal width: derive a
+  // bounded inner width from the current content and truncate ANSI-safely.
+  const innerWidth = Math.min(76, Math.max(36, Math.max(...contentLines.map(visibleWidth))));
+  const frame = (line: string) => {
+    const clipped = truncateToWidth(line, innerWidth, "");
+    return `${border("│")}${clipped}${" ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)))}${border("│")}`;
+  };
+  const lines = [
+    border(`╭${"─".repeat(innerWidth)}╮`),
+    ...contentLines.map(frame),
+    border(`╰${"─".repeat(innerWidth)}╯`),
+  ];
   fleetSetWidget("subagents", lines);
 }
 

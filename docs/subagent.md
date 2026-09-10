@@ -469,7 +469,8 @@ Live-verified in the real TUI and in pi-web/ttyd (browser terminal).
   and a 2s ticker. Setter + live theme captured from the first TUI context
   carrying `ui.setWidget`; rows render dim (thinking-style) via `theme.fg`,
   state token in accent, and show the latest context percentage (`ctx xx%`).
-  String arrays only — RPC/pi-web ignores factories.
+  It is framed with themed top/bottom/side borders. String arrays only —
+  RPC/pi-web ignores factories.
 - **Widget scope** (`/subagents widget [owner|all|off]`, bare = cycle,
   default `owner`): owner filters to runs whose `ownerSession` equals the
   current session file; all shows every active run on the machine; off hides
