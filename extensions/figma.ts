@@ -26,7 +26,7 @@
 // Env overrides:
 //   PI_FIGMA_BRIDGE_PORT      (default 37373 — keep in sync with the plugin)
 //   PI_FIGMA_BRIDGE_TOKEN     (default pi-figma-export — same caveat)
-//   PI_FIGMA_EXPORT_DIR       (default ~/.pi/agent/figma-exports)
+//   PI_FIGMA_EXPORT_DIR       (default <project>/.pi/figma-exports — per session cwd)
 //   PI_FIGMA_MAX_EMBED_BYTES  (default 2 MiB — inline image size cap)
 //
 // After any pi upgrade run: node scripts/smoke-test.mjs
@@ -48,10 +48,21 @@ import type { ExportFormat, SavedExport } from "../lib/figma-export-store.ts";
 
 const DEFAULT_PORT = Number(process.env.PI_FIGMA_BRIDGE_PORT) || 37373;
 const DEFAULT_TOKEN = process.env.PI_FIGMA_BRIDGE_TOKEN || "pi-figma-export";
-const EXPORT_ROOT =
-  process.env.PI_FIGMA_EXPORT_DIR || path.join(os.homedir(), ".pi", "agent", "figma-exports");
 const MAX_EMBED_BYTES = Number(process.env.PI_FIGMA_MAX_EMBED_BYTES) || 2 * 1024 * 1024;
 const DEFAULT_TIMEOUT_SEC = 60;
+
+/** Export root per session cwd: project-local by default (./.pi/figma-exports)
+ * so captures stay with the repo they belong to; PI_FIGMA_EXPORT_DIR forces a
+ * single global dir (tests, shared setups). */
+function exportRootFor(cwd: string): string {
+  return process.env.PI_FIGMA_EXPORT_DIR || path.join(cwd, ".pi", "figma-exports");
+}
+
+/** cwd of the pi session for this tool call (modern convention carries ctx). */
+function callCwd(args: unknown[], fallback = process.cwd()): string {
+  const ctx = args.length >= 5 ? (args[4] as { cwd?: string } | undefined) : undefined;
+  return ctx && typeof ctx.cwd === "string" && ctx.cwd ? ctx.cwd : fallback;
+}
 /** If the user exported right before asking the model, still pick it up. */
 const LOOKBACK_MS = 15_000;
 
@@ -67,7 +78,8 @@ type ToolResult = { content: ToolContent[]; details: Record<string, unknown> };
 
 interface BridgeState {
   handle: BridgeHandle | null;
-  store: FigmaExportStore | null;
+  /** one store per export root (per project cwd) */
+  stores: Map<string, FigmaExportStore>;
   lastExport: SavedExport | null;
   /** createdAtMs of the export already handed to the model (0 = none). */
   handedOutMs: number;
@@ -84,7 +96,7 @@ function state(): BridgeState {
   if (!g.__figmaBridge) {
     g.__figmaBridge = {
       handle: null,
-      store: null,
+      stores: new Map<string, FigmaExportStore>(),
       lastExport: null,
       handedOutMs: 0,
       exportsCount: 0,
@@ -95,10 +107,12 @@ function state(): BridgeState {
   return g.__figmaBridge;
 }
 
-function ensureStore(): FigmaExportStore {
+function ensureStore(cwd = process.cwd()): FigmaExportStore {
   const st = state();
-  if (st.store) return st.store;
-  const store = new FigmaExportStore({ rootDir: EXPORT_ROOT });
+  const rootDir = exportRootFor(cwd);
+  const cached = st.stores.get(rootDir);
+  if (cached) return cached;
+  const store = new FigmaExportStore({ rootDir });
   store.ensureDirs();
   // Adopt exports persisted earlier (e.g. before a pi restart).
   const disk = store.readState();
@@ -106,30 +120,30 @@ function ensureStore(): FigmaExportStore {
     st.exportsCount = disk.exportsCount;
     st.lastExport = disk.lastExport ?? st.lastExport;
   }
-  st.store = store;
+  st.stores.set(rootDir, store);
   return store;
 }
 
-function recordExport(st: BridgeState, rec: SavedExport): void {
+function recordExport(st: BridgeState, rec: SavedExport, store: FigmaExportStore): void {
   st.lastExport = rec;
   st.exportsCount += 1;
-  st.store?.appendLog(rec);
-  st.store?.writeState({ exportsCount: st.exportsCount, lastExport: st.lastExport });
+  store.appendLog(rec);
+  store.writeState({ exportsCount: st.exportsCount, lastExport: st.lastExport });
   const waiter = st.waiters.shift();
   if (waiter) waiter(rec);
 }
 
-async function ensureServer(): Promise<BridgeState> {
+async function ensureServer(cwd = process.cwd()): Promise<BridgeState> {
   const st = state();
   if (st.handle) return st;
   if (!st.starting) {
     const start = async (): Promise<void> => {
-      const store = ensureStore();
+      const store = ensureStore(cwd);
       const handle = await startBridgeServer({
         port: DEFAULT_PORT,
         token: DEFAULT_TOKEN,
         store,
-        onExport: (rec) => recordExport(st, rec),
+        onExport: (rec) => recordExport(st, rec, store),
       });
       store.writeState({ port: handle.port, exportsCount: st.exportsCount, lastExport: st.lastExport });
       st.handle = handle;
@@ -247,7 +261,7 @@ async function readClipboardImage(): Promise<{ format: ExportFormat; bytes: Uint
  * the user right-clicks → Copy as PNG/SVG (free in every plan/mode), then we
  * persist whatever is on the clipboard through the same store/state/log path
  * as plugin pushes. */
-async function runSaveClipboard(args: unknown[]): Promise<ToolResult> {
+async function runSaveClipboard(args: unknown[], cwd = process.cwd()): Promise<ToolResult> {
   const params = extractToolArgs(args);
   const peek = params.peek === true;
   const embed = params.embed !== false;
@@ -275,7 +289,7 @@ async function runSaveClipboard(args: unknown[]): Promise<ToolResult> {
     );
   }
   const st = state();
-  const rec = ensureStore().save({
+  const rec = ensureStore(cwd).save({
     bytes: clip.bytes,
     format: clip.format,
     nodeName: "clipboard",
@@ -358,7 +372,7 @@ function summarizeNode(doc: any, node: any, depth: number, maxDepth: number, bud
   return out;
 }
 
-async function runParseLocalFig(args: unknown[]): Promise<ToolResult> {
+async function runParseLocalFig(args: unknown[], cwd = process.cwd()): Promise<ToolResult> {
   const params = extractToolArgs(args);
   const embed = params.embed !== false;
   const maxDepth = Math.min(12, Math.max(1, Number(params.depth) || 6));
@@ -381,7 +395,7 @@ async function runParseLocalFig(args: unknown[]): Promise<ToolResult> {
 
   // Persist thumbnail + raster assets to disk (same home as plugin exports).
   const stem = path.basename(figPath).replace(/\.fig$/i, "").replace(/[^\w.-]+/g, "_") || "fig";
-  const assetsDir = path.join(EXPORT_ROOT, `fig-${stem}`);
+  const assetsDir = path.join(exportRootFor(cwd), `fig-${stem}`);
   const imagesDir = path.join(assetsDir, "images");
   mkdirSync(imagesDir, { recursive: true });
   if (doc.thumbnail) writeFileSync(path.join(assetsDir, "thumbnail.png"), doc.thumbnail);
@@ -458,7 +472,7 @@ async function runParseLocalFig(args: unknown[]): Promise<ToolResult> {
 
 const FORMAT_PATTERN = /^(png|svg|jpg)$/;
 
-async function runTakeLatest(args: unknown[]): Promise<ToolResult> {
+async function runTakeLatest(args: unknown[], cwd = process.cwd()): Promise<ToolResult> {
   const params = extractToolArgs(args);
   const rawFormat = typeof params.format === "string" ? params.format.toLowerCase() : "";
   const format: ExportFormat | undefined = FORMAT_PATTERN.test(rawFormat) ? (rawFormat as ExportFormat) : undefined;
@@ -468,7 +482,7 @@ async function runTakeLatest(args: unknown[]): Promise<ToolResult> {
 
   let st: BridgeState;
   try {
-    st = await ensureServer();
+    st = await ensureServer(cwd);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return textResult(
@@ -487,7 +501,6 @@ async function runTakeLatest(args: unknown[]): Promise<ToolResult> {
   }
 
   st.handedOutMs = rec.createdAtMs;
-  st.store?.writeState({ exportsCount: st.exportsCount, lastExport: st.lastExport });
   return {
     content: embedImage(st, rec, embed),
     details: {
@@ -502,11 +515,11 @@ async function runTakeLatest(args: unknown[]): Promise<ToolResult> {
   };
 }
 
-async function runStatus(args: unknown[]): Promise<ToolResult> {
+async function runStatus(args: unknown[], cwd = process.cwd()): Promise<ToolResult> {
   extractToolArgs(args);
   let st: BridgeState;
   try {
-    st = await ensureServer();
+    st = await ensureServer(cwd);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return textResult(`error: cannot start the figma bridge: ${msg}`);
@@ -515,6 +528,7 @@ async function runStatus(args: unknown[]): Promise<ToolResult> {
   return textResult(
     [
       `figma bridge: running on ${st.handle?.address}`,
+      `export root: ${exportRootFor(cwd)}`,
       `exports: ${st.exportsCount}${st.handedOutMs ? ` (last handed to model at ${st.handedOutMs})` : ""}`,
       last
         ? `last export: ${last.path}\n  node ${last.nodeName} (${last.nodeId}), ${last.format} @${last.scale}x, ${last.bytes} bytes, ${last.createdAt}`
@@ -545,14 +559,14 @@ export default function (pi: ExtensionAPI): void {
       "Use figma_take_latest_export when the user wants the rendered PNG/SVG of their Figma selection (e.g. to implement a design). " +
         "It waits for the human to run the plugin in Figma — tell them: select node(s), then Plugins → Development → pi-figma-bridge → Export PNG @2x (⌘⌥P re-runs the last plugin).",
       "Use figma_bridge_status (or /figma status) to check whether the bridge is up and see the last export path; " +
-        "exports land in ~/.pi/agent/figma-exports/",
+        "exports land in <project>/.pi/figma-exports/ (per session cwd; PI_FIGMA_EXPORT_DIR overrides).",
     ],
     parameters: Type.Object({
       timeout_sec: Type.Optional(Type.Number({ description: "Seconds to wait for a fresh export (default 60, max 600)." })),
       format: Type.Optional(Type.String({ description: "Only accept this format: \"png\" | \"svg\" | \"jpg\" (default: any)." })),
       embed: Type.Optional(Type.Boolean({ description: "Embed the image inline for the model (default true; skipped over PI_FIGMA_MAX_EMBED_BYTES)." })),
     }),
-    execute: async (...args: unknown[]) => runTakeLatest(args),
+    execute: async (...args: unknown[]) => runTakeLatest(args, callCwd(args)),
   });
 
   pi.registerTool({
@@ -563,7 +577,7 @@ export default function (pi: ExtensionAPI): void {
       "Never waits; returns immediately.",
     promptSnippet: "Check the local Figma export bridge state and last export",
     parameters: Type.Object({}),
-    execute: async (...args: unknown[]) => runStatus(args),
+    execute: async (...args: unknown[]) => runStatus(args, callCwd(args)),
   });
 
   pi.registerTool({
@@ -578,7 +592,7 @@ export default function (pi: ExtensionAPI): void {
       peek: Type.Optional(Type.Boolean({ description: "Report clipboard contents without saving (default false)." })),
       embed: Type.Optional(Type.Boolean({ description: "Embed the image inline for the model (default true)." })),
     }),
-    execute: async (...args: unknown[]) => runSaveClipboard(args),
+    execute: async (...args: unknown[]) => runSaveClipboard(args, callCwd(args)),
   });
 
   pi.registerTool({
@@ -598,7 +612,7 @@ export default function (pi: ExtensionAPI): void {
       max_json_chars: Type.Optional(Type.Number({ description: "Subtree JSON character budget (default 20000, max 80000)." })),
       embed: Type.Optional(Type.Boolean({ description: "Embed the page thumbnail inline (default true)." })),
     }),
-    execute: async (...args: unknown[]) => runParseLocalFig(args),
+    execute: async (...args: unknown[]) => runParseLocalFig(args, callCwd(args)),
   });
 
   pi.registerCommand("figma", {
@@ -619,13 +633,13 @@ export default function (pi: ExtensionAPI): void {
       const [sub] = args.trim().split(/\s+/).filter(Boolean);
       try {
         if (sub === undefined || sub === "serve") {
-          const st = await ensureServer();
+          const st = await ensureServer(ctx.cwd);
           ctx.ui.notify(
-            `figma bridge serving on ${st.handle?.address ?? "?"} — exports land in ${EXPORT_ROOT}`,
+            `figma bridge serving on ${st.handle?.address ?? "?"} — exports land in ${exportRootFor(ctx.cwd)}`,
             "info",
           );
         } else if (sub === "status") {
-          const st = await ensureServer();
+          const st = await ensureServer(ctx.cwd);
           const last = st.lastExport;
           ctx.ui.notify(
             `figma bridge: ${st.handle?.address ?? "not running"}; ${st.exportsCount} export(s)` +
@@ -641,7 +655,7 @@ export default function (pi: ExtensionAPI): void {
             ctx.ui.notify("figma bridge is not running", "info");
           }
         } else if (sub === "clip") {
-          const res = await runSaveClipboard([{}]);
+          const res = await runSaveClipboard([], ctx.cwd);
           const first = res.content[0];
           ctx.ui.notify(first.type === "text" ? first.text : "clipboard saved", "info");
         } else if (sub === "help") {

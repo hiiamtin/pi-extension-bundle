@@ -23,7 +23,8 @@ so the plugin may reach the local bridge without any license or review.
 1. In Figma, select one or more nodes (frame, component, layer…).
 2. `Plugins → Development → pi-figma-bridge → Export PNG @2x` (or SVG / @1x).
    On macOS, ⌘⌥P re-runs the last plugin — select the next node, hit ⌘⌥P.
-3. The pi extension saves the bytes under `~/.pi/agent/figma-exports/` and the
+3. The pi extension saves the bytes under the project's `.pi/figma-exports/`
+(per session cwd) and the
    model receives the image (or ask it to via `figma_take_latest_export`, or
    inspect state with `/figma status`).
 

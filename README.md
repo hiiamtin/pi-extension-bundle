@@ -409,7 +409,8 @@ REST `GET /v1/images` is capped at ~20 renders/month on Starter plans, and the
 official Dev Mode MCP needs a paid seat; this path needs neither.
 
 - `figma_take_latest_export(timeout_sec?, format?, embed?)` — waits for a fresh
-export, saves it to `~/.pi/agent/figma-exports/`, and returns it to the model
+export, saves it to the project's `.pi/figma-exports/` (per session cwd;
+`PI_FIGMA_EXPORT_DIR` forces a global dir), and returns it to the model
 embedded inline (base64 image, capped at `PI_FIGMA_MAX_EMBED_BYTES` default
 2 MiB; beyond that it returns the path only).
 - `figma_bridge_status` / `/figma serve|status|stop|clip` — bridge lifecycle and
