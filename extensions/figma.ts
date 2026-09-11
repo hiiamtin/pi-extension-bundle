@@ -35,11 +35,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { extractToolArgs, textResult } from "../lib/tool-compat.ts";
 import { Type } from "typebox";
-import { readFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import * as os from "node:os";
 import * as path from "node:path";
+import { nodeId as figNodeId, parseFig } from "openfig-core";
 import { startBridgeServer } from "../lib/figma-bridge-server.ts";
 import type { BridgeHandle } from "../lib/figma-bridge-server.ts";
 import { FigmaExportStore } from "../lib/figma-export-store.ts";
@@ -289,6 +290,172 @@ async function runSaveClipboard(args: unknown[]): Promise<ToolResult> {
   };
 }
 
+// ── .fig local file parsing (offline; no Figma account/license needed) ──────────
+// Powered by the audited fork hiiamtin/openfig-core (MIT; audited 2026-09:
+// no network/exec/eval in runtime path, no lifecycle scripts).
+
+function resolveFigPath(raw: unknown): string | null {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  let p = raw.trim();
+  if (p.startsWith("~/")) p = path.join(os.homedir(), p.slice(2));
+  return path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+}
+
+function newestFigInDownloads(): string | null {
+  const dir = path.join(os.homedir(), "Downloads");
+  try {
+    const hits = readdirSync(dir)
+      .filter((f) => f.toLowerCase().endsWith(".fig"))
+      .map((f) => ({ f, t: statSync(path.join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.t - a.t);
+    return hits.length > 0 ? path.join(dir, hits[0].f) : null;
+  } catch {
+    return null;
+  }
+}
+
+function figColorToHex(c: any): string | undefined {
+  if (!c || typeof c !== "object") return undefined;
+  const clamp = (v: number) => Math.round(Math.max(0, Math.min(1, Number(v) || 0)) * 255);
+  const hex = (n: number) => n.toString(16).padStart(2, "0");
+  const base = `#${hex(clamp(c.r))}${hex(clamp(c.g))}${hex(clamp(c.b))}`;
+  return typeof c.a === "number" && c.a < 1 ? `${base}${hex(clamp(c.a))}` : base;
+}
+
+function summarizePaints(paints: any): any[] | undefined {
+  if (!Array.isArray(paints) || paints.length === 0) return undefined;
+  return paints.slice(0, 4).map((p: any) => {
+    if (p?.type === "SOLID") return { solid: figColorToHex(p.color) ?? "?" };
+    if (p?.image) {
+      const ref = typeof p.image === "string" ? p.image : (p.image.ref ?? p.image.imageHash ?? "image");
+      return { image: String(ref) };
+    }
+    return { paint: String(p?.type ?? "unknown").toLowerCase() };
+  });
+}
+
+function summarizeNode(doc: any, node: any, depth: number, maxDepth: number, budget: { left: number }): any {
+  const out: Record<string, unknown> = { type: node.type };
+  if (node.name) out.name = node.name;
+  const id = figNodeId(node);
+  if (id) out.id = id;
+  if (node.size) out.size = `${Math.round(node.size.x)}x${Math.round(node.size.y)}`;
+  if (node.visible === false) out.hidden = true;
+  if (typeof node.opacity === "number" && node.opacity < 1) out.opacity = Math.round(node.opacity * 100) / 100;
+  if (node.cornerRadius) out.radius = node.cornerRadius;
+  const fills = summarizePaints(node.fillPaints);
+  if (fills) out.fills = fills;
+  if (node.textData?.characters) out.text = node.textData.characters;
+  const kids = depth < maxDepth ? (doc.childrenMap.get(id ?? "") ?? []) : [];
+  if (kids.length > 0 && depth < maxDepth) {
+    const visible = kids.filter((k: any) => k.visible !== false);
+    out.children = visible.slice(0, 40).map((k: any) => summarizeNode(doc, k, depth + 1, maxDepth, budget));
+    if (visible.length > 40) out.children.push(`…+${visible.length - 40} more children`);
+  } else if (kids.length > 0) {
+    out.children = `…${kids.length} children below depth limit`;
+  }
+  budget.left -= JSON.stringify(out).length;
+  return out;
+}
+
+async function runParseLocalFig(args: unknown[]): Promise<ToolResult> {
+  const params = extractToolArgs(args);
+  const embed = params.embed !== false;
+  const maxDepth = Math.min(12, Math.max(1, Number(params.depth) || 6));
+  const maxChars = Math.min(80_000, Math.max(2_000, Number(params.max_json_chars) || 20_000));
+
+  const figPath = resolveFigPath(params.path) ?? newestFigInDownloads();
+  if (!figPath || !existsSync(figPath)) {
+    return textResult(
+      "error: no .fig file to parse. Pass `path` to a downloaded .fig (in Figma: main menu → File → Download → .fig), " +
+        "or download one into ~/Downloads and call again.",
+    );
+  }
+
+  let doc: any;
+  try {
+    doc = parseFig(new Uint8Array(readFileSync(figPath)));
+  } catch (e) {
+    return textResult(`error: parsing ${figPath}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  // Persist thumbnail + raster assets to disk (same home as plugin exports).
+  const stem = path.basename(figPath).replace(/\.fig$/i, "").replace(/[^\w.-]+/g, "_") || "fig";
+  const assetsDir = path.join(EXPORT_ROOT, `fig-${stem}`);
+  const imagesDir = path.join(assetsDir, "images");
+  mkdirSync(imagesDir, { recursive: true });
+  if (doc.thumbnail) writeFileSync(path.join(assetsDir, "thumbnail.png"), doc.thumbnail);
+  let savedImages = 0;
+  for (const [name, bytes] of doc.images) {
+    writeFileSync(path.join(imagesDir, path.basename(name)), bytes);
+    savedImages += 1;
+  }
+
+  // Top-level frames (direct children of pages).
+  const frames: Array<{ name: string; size: string; id: string }> = [];
+  for (const node of doc.nodes as any[]) {
+    if (node.type !== "FRAME" || !node.name) continue;
+    const pid = node.parentIndex ? `${node.parentIndex.guid.sessionID}:${node.parentIndex.guid.localID}` : "";
+    const parent = pid ? doc.nodeMap.get(pid) : undefined;
+    if (parent?.type !== "CANVAS") continue;
+    frames.push({
+      name: node.name,
+      size: node.size ? `${Math.round(node.size.x)}x${Math.round(node.size.y)}` : "?",
+      id: figNodeId(node) ?? "?",
+    });
+  }
+
+  const header =
+    `parsed: ${figPath}\n` +
+    `kiwi v${doc.header?.version ?? "?"}, ${doc.nodes.length} nodes, ${doc.images.size} images\n` +
+    `assets → ${assetsDir} (thumbnail.png + images/×${savedImages})\n` +
+    `top-level frames (${frames.length}):\n` +
+    frames.slice(0, 25).map((f) => `  - "${f.name}" ${f.size} [${f.id}]`).join("\n") +
+    (frames.length > 25 ? `\n  …+${frames.length - 25} more (pass frame:"<name>" for a subtree)` : "");
+
+  let subtreeText = "";
+  let chosen: string | null = null;
+  const wanted = typeof params.frame === "string" ? params.frame.trim().toLowerCase() : "";
+  if (wanted) {
+    const matches = frames.filter((f) => f.name.toLowerCase().includes(wanted));
+    const target = matches.length > 0 ? doc.nodeMap.get(matches[0].id) : undefined;
+    if (!target) {
+      subtreeText = `\nno top-level frame matching "${params.frame}" — use one of the names above.`;
+    } else {
+      chosen = matches[0].name;
+      const budget = { left: maxChars };
+      const tree = summarizeNode(doc, target, 0, maxDepth, budget);
+      subtreeText =
+        (matches.length > 1 ? `\n(${matches.length} frames match — using "${matches[0].name}")\n` : "") +
+        `\nsubtree of "${matches[0].name}" (depth ≤ ${maxDepth}):\n` +
+        JSON.stringify(tree, null, 1).slice(0, maxChars) +
+        (budget.left < 0 ? "\n…truncated (raise max_json_chars or lower depth)" : "");
+    }
+  } else if (frames.length > 0) {
+    subtreeText = `\ncall again with frame:"<name>" to get one frame's full layout subtree.`;
+  }
+
+  const content: ToolContent[] = [{ type: "text", text: header + subtreeText }];
+  if (embed && doc.thumbnail && doc.thumbnail.byteLength <= MAX_EMBED_BYTES) {
+    content.push({
+      type: "image",
+      source: { type: "base64", mediaType: "image/png", data: Buffer.from(doc.thumbnail).toString("base64") },
+    });
+  }
+  return {
+    content,
+    details: {
+      path: figPath,
+      nodes: doc.nodes.length,
+      images: doc.images.size,
+      frames: frames.length,
+      frameNames: frames.slice(0, 50).map((f) => f.name),
+      chosenFrame: chosen,
+      assetsDir,
+    },
+  };
+}
+
 const FORMAT_PATTERN = /^(png|svg|jpg)$/;
 
 async function runTakeLatest(args: unknown[]): Promise<ToolResult> {
@@ -412,6 +579,26 @@ export default function (pi: ExtensionAPI): void {
       embed: Type.Optional(Type.Boolean({ description: "Embed the image inline for the model (default true)." })),
     }),
     execute: async (...args: unknown[]) => runSaveClipboard(args),
+  });
+
+  pi.registerTool({
+    name: "figma_parse_local_fig",
+    label: "Figma .fig Parser",
+    description:
+      "Parse a downloaded Figma .fig file OFFLINE (no Figma account/license needed): node-tree JSON " +
+      "(types, names, sizes, fill colors, real text), extracted raster assets, and the page thumbnail, " +
+      "all saved to disk. The free equivalent of Dev Mode's structured data — use it when the design " +
+      "only exists as a .fig export (view-only files: File → Download → .fig). Default path: newest " +
+      ".fig in ~/Downloads. Pass frame:\"<name>\" to extract one frame's layout subtree.",
+    promptSnippet: "Parse a downloaded .fig file offline into node-tree JSON + assets (view-only file path)",
+    parameters: Type.Object({
+      path: Type.Optional(Type.String({ description: "Path to a .fig file (default: newest .fig in ~/Downloads)." })),
+      frame: Type.Optional(Type.String({ description: "Top-level frame name (substring, case-insensitive) to extract as a layout subtree." })),
+      depth: Type.Optional(Type.Number({ description: "Subtree depth limit (default 6, max 12)." })),
+      max_json_chars: Type.Optional(Type.Number({ description: "Subtree JSON character budget (default 20000, max 80000)." })),
+      embed: Type.Optional(Type.Boolean({ description: "Embed the page thumbnail inline (default true)." })),
+    }),
+    execute: async (...args: unknown[]) => runParseLocalFig(args),
   });
 
   pi.registerCommand("figma", {

@@ -16,6 +16,7 @@
     ]
   },
   "dependencies": {
+    "openfig-core": "github:hiiamtin/openfig-core",
     "yaml": "^2.9.0"
   },
   "peerDependencies": {

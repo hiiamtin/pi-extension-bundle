@@ -152,6 +152,7 @@ const MIN_ARGS = {
   figma_take_latest_export: { timeout_sec: 1 },
   figma_bridge_status: {},
   figma_save_clipboard: { peek: true },
+  figma_parse_local_fig: { path: "fixtures/figma/circle.fig", embed: false },
   subagent: { agent: "smoke", task: "say OK" },
 };
 
