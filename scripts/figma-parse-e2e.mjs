@@ -67,8 +67,8 @@ const frameName = res.details.frameNames[0];
 assert(!!frameName, "at least one named frame in fixture", JSON.stringify(res.details.frameNames));
 const res2 = await tool.execute("e2e-2", { path: fixture, frame: frameName, embed: false });
 const text2 = res2?.content?.[0]?.text ?? "";
-assert(text2.includes(`subtree of "${frameName}"`), "subtree header for matched frame", text2.slice(-200));
-assert(/"children"/.test(text2) || /"text"/.test(text2), "subtree contains node fields");
+assert(text2.includes("resolved node") && text2.includes(frameName), "subtree header for matched frame", text2.slice(-200));
+assert(/- /.test(text2) && (/(text|fills):/.test(text2) || /INSTANCE|ELLIPSE|RECTANGLE/.test(text2)), "subtree contains rendered node lines", text2.slice(-300));
 assert(res2.details.chosenFrame === frameName, "details.chosenFrame set");
 
 // ---------- 3. frame miss is loud ----------

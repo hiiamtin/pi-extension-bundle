@@ -420,13 +420,19 @@ last-export inspection. The HTTP bridge lazy-starts on the first tool call
 files** (where the plugin can't run): user right-clicks → Copy as PNG/SVG
 (free in every mode), the tool persists the clipboard image through the same
 store/log. macOS only (osascript/pbpaste); `/figma clip` is the shortcut.
-- `figma_parse_local_fig(path?, frame?, depth?, max_json_chars?, embed?)` —
-  parse a downloaded `.fig` OFFLINE into node-tree JSON (layout/fill colors/
-  real text) + extracted raster assets + page thumbnail, all saved to disk.
-  The free stand-in for Dev Mode's structured data (view-only files:
-  File → Download → .fig). Powered by the audited MIT fork
+- `figma_parse_local_fig(url?, node?, path?, frame?, depth?, ...)` — give it a
+  **figma.com link** and it matches the file to a local `.fig` snapshot (asks
+  the user to download if missing), locates the node from the URL's node-id,
+  and returns the resolved tree: layout, hex fills, and REAL component texts
+  (symbolOverrides + componentPropAssignments resolved against component
+  definitions) — the free stand-in for Dev Mode's structured data on
+  view-only files. Assets + thumbnail land in the project's
+  `.pi/figma-exports/fig-<name>/`. Powered by the audited MIT fork
   `hiiamtin/openfig-core` (audit 2026-09: no network/exec/eval in the runtime
   path, no lifecycle scripts).
+- Skill `figma-design-link` — the model-facing decision procedure for the
+  above (match → missing/ambiguous/stale handling → when to fall back to a
+  render via plugin or clipboard).
 
 The "push" side lives in `figma/plugin/` — a headless dev plugin imported
 yourself via `Plugins → Development → Import plugin from manifest…` (see
