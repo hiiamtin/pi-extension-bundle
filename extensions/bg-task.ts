@@ -108,6 +108,12 @@ const WIDGET_MS = envInt("PI_BG_TICK_MS", 5_000, 1_000, 300_000); // scan/heartb
 const FINISHED_LINGER_MS = 90_000; // finished own tasks stay in `own` (widget result line + tick retries) before eviction
 const SETTINGS_FILE = path.join(os.homedir(), ".pi/agent/bg-task-settings.json");
 const MAX_OUTPUT_CHARS = 8_000;
+
+// Subagent runs (extensions/subagent.ts) live in a sibling state dir. READ-ONLY
+// bridge: bg tools surface them in listings and answer with redirects, but never
+// write there — notification ownership (notifiedAt) and kill semantics (graceful
+// wrap-up) stay with the subagent extension (docs/subagent.md §8).
+const SUBAGENT_STATE_DIR = process.env.PI_SUBAGENT_STATE_DIR || path.join(os.homedir(), ".pi/agent/subagents");
 const INTERCEPTOR_MODE = (process.env.PI_BG_INTERCEPTOR || "auto-bg").toLowerCase(); // auto-bg | warn | off
 const ARTIFACT_PARSE_LIMIT = 8 * 1024 * 1024; // files bigger than this skip JSON.parse
 
@@ -891,6 +897,17 @@ function tailLog(id: string, lines: number, maxChars: number): string {
   return clampChars(arr.slice(Math.max(0, arr.length - lines)).join("\n"), maxChars);
 }
 
+// Tail an arbitrary file (subagent bridge) — bounded read, O(file) once per call.
+function tailAnyFile(file: string, maxChars: number): string {
+  try {
+    const text = readFileSync(file, "utf8");
+    if (!text.trim()) return "";
+    return text.length <= maxChars ? text : `…${text.slice(-maxChars)}`;
+  } catch {
+    return "";
+  }
+}
+
 // --- artifact summarizing (token-safe) ---------------------------------------
 
 function typeOf(v: unknown): string {
@@ -1019,10 +1036,89 @@ function taskLine(m: Meta): string {
 function bgListText(): string {
   refreshScan();
   const metas = listDiskMetas();
-  if (!metas.length) return "no background tasks (state: " + STATE_DIR + ")";
-  const { total } = runningCount();
-  const head = `${metas.length} task(s), ${total} running (limit ${MAX_CONCURRENT}) · interceptor: ${INTERCEPTOR_MODE}:\n`;
-  return clampChars(head + metas.slice(0, 20).map((m) => taskLine(m)).join("\n"), MAX_OUTPUT_CHARS);
+  const subs = listSubagentMetas();
+  if (!metas.length && !subs.length) return `no background tasks or subagent runs (bg state: ${STATE_DIR})`;
+  const parts: string[] = [];
+  if (metas.length) {
+    const { total } = runningCount();
+    parts.push(`${metas.length} task(s), ${total} running (limit ${MAX_CONCURRENT}) · interceptor: ${INTERCEPTOR_MODE}:`);
+    parts.push(...metas.slice(0, 20).map((m) => taskLine(m)));
+  } else {
+    parts.push("no bg tasks (interceptor: " + INTERCEPTOR_MODE + ")");
+  }
+  // Subagent runs — active first, then recently finished; history stays on disk
+  // but is not listed (runs are pruned by the subagent extension, not here).
+  const active = subs.filter((m) => m.state === "running" || m.state === "queued");
+  const recentDone = subs.filter((m) => m.state !== "running" && m.state !== "queued" && (m.finishedAt ?? 0) > Date.now() - 3_600_000);
+  if (active.length || recentDone.length) {
+    const hidden = subs.length - active.length - Math.min(recentDone.length, 6);
+    parts.push("", `subagent runs (read-only view; wait: subagent_wait · stop: /subagents kill):`);
+    parts.push(...active.map(subagentLine), ...recentDone.slice(0, 6).map(subagentLine));
+    if (hidden > 0) parts.push(`… +${hidden} older finished run(s) not shown`);
+  }
+  return clampChars(parts.join("\n"), MAX_OUTPUT_CHARS);
+}
+
+// --- subagent bridge (read-only) ---------------------------------------------
+
+interface SubagentMeta {
+  id: string;
+  agent: string;
+  state: string;
+  startedAt?: number;
+  finishedAt?: number;
+  exitCode?: number | null;
+  ownerSession?: string;
+  model?: string;
+  resultPath?: string;
+}
+
+function subagentStateIcon(state: string): string {
+  return state === "done" ? "✅" : state === "running" || state === "queued" ? "⚙️" : "❌";
+}
+
+function subagentLine(m: SubagentMeta): string {
+  const start = m.startedAt ?? m.finishedAt ?? Date.now();
+  const dur = fmtDur((m.finishedAt ?? Date.now()) - start);
+  const flag = m.ownerSession && m.ownerSession === currentSessionFile ? " [this session]" : "";
+  const exit = m.exitCode != null && m.exitCode !== 0 ? ` exit=${m.exitCode}` : "";
+  return `${subagentStateIcon(m.state)} ${m.id} · subagent:${m.agent}${m.model ? ` · ${m.model}` : ""} · ${m.state}${exit} · ${dur}${flag}`;
+}
+
+function subagentDetailText(m: SubagentMeta): string {
+  const start = m.startedAt ?? Date.now();
+  const dur = m.finishedAt ? `ran ${fmtDur(m.finishedAt - start)}` : `running for ${fmtDur(Date.now() - start)}`;
+  const pending = m.state === "running" || m.state === "queued";
+  return clampChars(
+    [
+      `${subagentStateIcon(m.state)} ${m.id} '${m.agent}' — subagent run, ${m.state}, ${dur}${m.model ? ` · ${m.model}` : ""}`,
+      `result: ${m.resultPath ?? "(none yet)"}`,
+      pending
+        ? `wait: subagent_wait({ id: "${m.id}" }) · stop: /subagents kill ${m.id} (bg_kill/bg_wait do not manage subagents)`
+        : `continue: subagent({ continue: "${m.id}", task: "..." })`,
+    ].join("\n"),
+    MAX_OUTPUT_CHARS,
+  );
+}
+
+function readSubagentMeta(id: string): SubagentMeta | null {
+  if (!id.startsWith("s-")) return null; // subagent ids are s-prefixed; bg task ids are bare base36
+  try {
+    return JSON.parse(readFileSync(path.join(SUBAGENT_STATE_DIR, id, "meta.json"), "utf8")) as SubagentMeta;
+  } catch {
+    return null;
+  }
+}
+
+function listSubagentMetas(): SubagentMeta[] {
+  try {
+    return readdirSync(SUBAGENT_STATE_DIR)
+      .map((name) => readSubagentMeta(name))
+      .filter((m): m is SubagentMeta => !!m)
+      .sort((a, b) => (b.startedAt ?? b.finishedAt ?? 0) - (a.startedAt ?? a.finishedAt ?? 0));
+  } catch {
+    return [];
+  }
 }
 
 function bgDetailText(id: string): string {
@@ -1102,7 +1198,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     name: "bg_status",
     label: "Background status",
     description:
-      "Check background tasks. With id or unique name: state, elapsed, exit code, last output. Without id: list ALL tasks across every pi session on this machine (marked [this session] where applicable).",
+      "Check background tasks. With id or unique name: state, elapsed, exit code, last output. Without id: list ALL tasks across every pi session on this machine (marked [this session] where applicable). Also lists background subagent runs (read-only) — an s-… id resolves to that subagent's detail.",
     parameters: Type.Object({
       id: Type.Optional(Type.String({ description: "Task id or unique task name (omit to list all tasks)" })),
     }),
@@ -1110,8 +1206,12 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       const params = extractToolArgs(cbArgs) as Record<string, unknown>;
       if (!settings.toolsEnabled) return disabled();
       if (typeof params.id === "string" && params.id.trim()) {
-        const found = resolveTask(params.id.trim());
-        return textResult(found ? bgDetailText(found.id) : `task '${params.id}' not found — use bg_status without args to list tasks`);
+        const wanted = params.id.trim();
+        const found = resolveTask(wanted);
+        if (found) return textResult(bgDetailText(found.id));
+        const sub = readSubagentMeta(wanted);
+        if (sub) return textResult(subagentDetailText(sub));
+        return textResult(`task '${wanted}' not found — use bg_status without args to list tasks`);
       }
       return textResult(bgListText());
     },
@@ -1132,7 +1232,14 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       if (missing) return textResult(missing.errorText);
       const id = String(params.id).trim();
       const m = resolveTask(id);
-      if (!m) return textResult(`task '${id}' not found — use bg_status without args to list tasks`);
+      if (!m) {
+        const sub = readSubagentMeta(id);
+        if (sub) {
+          const tail = sub.resultPath && existsSync(sub.resultPath) ? tailAnyFile(sub.resultPath, 800) : "";
+          return textResult(`subagent run '${id}' (${sub.agent}, ${sub.state}) — bg_log reads bg tasks only.${tail ? ` result tail:\n${tail}` : ""}`);
+        }
+        return textResult(`task '${id}' not found — use bg_status without args to list tasks`);
+      }
       const lines = Math.min(400, Math.max(1, Number(params.tail_lines) || 50));
       const text = tailLog(id, lines, MAX_OUTPUT_CHARS);
       return textResult(text ? `bg '${m.name}' (${m.state}) — last ${lines} lines:\n${text}` : `bg '${m.name}' (${m.state}) has no output yet`);
@@ -1143,7 +1250,7 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
     name: "bg_wait",
     label: "Background wait",
     description:
-      "Wait synchronously (blocking this turn) for a background task to finish, up to the timeout. Returns immediately if it is already finished. Prefer this over ending the turn when the task is short and you need its result to continue; for long tasks end the turn instead — you will be notified on exit. Accepts id or unique task name.",
+      "Wait synchronously (blocking this turn) for a background task to finish, up to the timeout. Returns immediately if it is already finished. Prefer this over ending the turn when the task is short and you need its result to continue; for long tasks end the turn instead — you will be notified on exit. Accepts id or unique task name. Does not manage subagent runs — those use subagent_wait.",
     parameters: Type.Object({
       id: Type.String({ description: "Task id or unique task name" }),
       timeout_sec: Type.Optional(Type.Number({ description: "Max seconds to wait (default 30, max 600)" })),
@@ -1154,7 +1261,11 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       const missing = requireString(params, "id");
       if (missing) return textResult(missing.errorText);
       const found = resolveTask(String(params.id).trim());
-      if (!found) return textResult(`task '${params.id}' not found — use bg_status without args to list tasks`);
+      if (!found) {
+        const sub = readSubagentMeta(String(params.id).trim());
+        if (sub) return textResult(`'${params.id}' is a subagent run (${sub.agent}, ${sub.state}) — bg_wait cannot wait on subagents; use subagent_wait`);
+        return textResult(`task '${params.id}' not found — use bg_status without args to list tasks`);
+      }
       if (found.state !== "running") return textResult(bgDetailText(found.id));
       const timeoutSec = Math.min(600, Math.max(1, Math.round(Number(params.timeout_sec) || 30)));
       const signal = cbArgs[2] as AbortSignal | undefined;
@@ -1196,8 +1307,13 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       let file = pathArg;
       if (!file) {
         const m = readMeta(id);
-        if (!m) return textResult(`task '${id}' not found — use bg_status without args to list tasks`);
-        file = existsSync(path.join(dirOf(id), "out.log")) ? path.join(dirOf(id), "out.log") : path.join(dirOf(id), "out.1.log");
+        if (m) {
+          file = existsSync(path.join(dirOf(id), "out.log")) ? path.join(dirOf(id), "out.log") : path.join(dirOf(id), "out.1.log");
+        } else {
+          const sub = readSubagentMeta(id);
+          if (!sub?.resultPath) return textResult(`task '${id}' not found — use bg_status without args to list tasks`);
+          file = sub.resultPath;
+        }
       }
       if (!path.isAbsolute(file) && !existsSync(file)) {
         // relative path might be relative to the task's original cwd context — try cwd first (default), that's it
@@ -1227,7 +1343,11 @@ export default function bgTaskExtension(pi: ExtensionAPI): void {
       if (missing) return textResult(missing.errorText);
       const id = String(params.id).trim();
       const resolved = resolveTask(id);
-      if (!resolved) return textResult(`task '${id}' not found — use bg_status without args to list tasks`);
+      if (!resolved) {
+        const sub = readSubagentMeta(id);
+        if (sub) return textResult(`'${id}' is a subagent run (${sub.agent}, ${sub.state}) — bg_kill does not manage subagents; stop it with /subagents kill ${id}`);
+        return textResult(`task '${id}' not found — use bg_status without args to list tasks`);
+      }
       const t = own.get(resolved.id);
       const m = t?.meta ?? resolved;
       if (!m) return textResult(`task '${id}' not found — use bg_status without args to list tasks`);

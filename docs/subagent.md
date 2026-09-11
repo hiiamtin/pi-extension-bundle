@@ -92,6 +92,15 @@ subagent({ continue: "<run-id>", task })                     // continue a finis
   (activation sweep, context-hook injection). Background runs ignore the
   tool-call abort signal — they are stopped via `/subagents kill`, not by
   parent-turn aborts.
+- **Waiting for a background run** (added after the 2026-09-12 ai-review
+  session where the model hand-rolled a bash sleep-poll loop): the DEFAULT
+  way to wait is to end the turn and take the completion notice. For the
+  rare case where the remaining steps of the turn genuinely depend on the
+  run's result, `subagent_wait({ id, timeout_sec? })` blocks up to 600s and
+  returns the same notice text in-band. When the waiter IS the owner session,
+  in-band delivery consumes the completion notice (`notifiedAt`), so the
+  session is never notified twice; foreign waiters never spend the owner's
+  notice. `bgStartText` teaches both paths.
 - **Parallel = N sibling tool calls in the SAME assistant response.** pi
   executes sibling calls concurrently by default (docs/extensions.md §tool
   execution). Calling one, waiting for its result, then calling another is
@@ -256,6 +265,14 @@ notification retry/adoption, widget tick + renderers, SIGTERM→SIGKILL
 escalation, prune, debug-log capping, `envInt` knobs, settings file.
 State dir is separate (`~/.pi/agent/subagents/`, not `bg-tasks/`) so scans
 never collide.
+
+Cross-visibility (added 2026-09-12): bg-task reads the subagent state dir
+READ-ONLY (`PI_SUBAGENT_STATE_DIR`, same env as subagent.ts) and surfaces
+runs in `bg_status` listings/details; `bg_wait`/`bg_kill`/`bg_log` answer
+with redirects (`subagent_wait`, `/subagents kill`) instead of "not found".
+bg-task never writes there — notification ownership (`notifiedAt`) and kill
+semantics (graceful wrap-up) stay with subagent.ts; `bg_kill` must not
+raw-SIGTERM a subagent process group.
 
 **Implemented in P2** as `lib/agent-runs.ts` — lifted: capture registry +
 `seq` claiming, strict `canNotifyHere` ownership, late-bound

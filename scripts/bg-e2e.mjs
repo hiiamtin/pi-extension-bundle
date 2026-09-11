@@ -26,6 +26,10 @@ const pkgRoot = path.dirname(here);
 const STATE_DIR = path.join(os.tmpdir(), `pi-bg-e2e-${process.pid}`);
 rmSync(STATE_DIR, { recursive: true, force: true });
 process.env.PI_BG_STATE_DIR = STATE_DIR;
+// read-only subagent bridge must also be isolated from the real ~/.pi/agent/subagents
+const SUB_STATE_DIR = path.join(os.tmpdir(), `pi-bg-e2e-subs-${process.pid}`);
+rmSync(SUB_STATE_DIR, { recursive: true, force: true });
+process.env.PI_SUBAGENT_STATE_DIR = SUB_STATE_DIR;
 const mod = await import(path.join(pkgRoot, "extensions", "bg-task.ts"));
 
 const registered = {};
@@ -185,6 +189,49 @@ if (typeof ssHook === "function") {
   check("context hook: session that owns nothing gets no injection", !Array.isArray(ctxRes3?.messages));
 } else {
   check("session_start hook registered", false);
+}
+
+// --- N: subagent bridge (read-only view + redirects) ---
+{
+  const writeSub = (id, extra = {}) => {
+    mkdirSync(path.join(SUB_STATE_DIR, id), { recursive: true });
+    const meta = { id, agent: "reviewer", state: "running", startedAt: Date.now() - 60_000, model: "test/model", resultPath: path.join(SUB_STATE_DIR, id, "result.md"), ...extra };
+    writeFileSync(path.join(SUB_STATE_DIR, id, "meta.json"), JSON.stringify(meta));
+    return meta;
+  };
+  writeSub("s-bridgerun");
+  writeFileSync(path.join(SUB_STATE_DIR, "s-bridgerun", "result.md"), "partial output so far");
+  writeSub("s-bridgedone", { state: "done", finishedAt: Date.now() - 30_000, exitCode: 0 });
+  writeFileSync(path.join(SUB_STATE_DIR, "s-bridgedone", "result.md"), "## Verdict\nPASS\nlooks good");
+
+  const listed = await exec("bg_status", {});
+  check("list: subagent section appears", /subagent runs/.test(listed));
+  check("list: running subagent shown", listed.includes("s-bridgerun"));
+  check("list: recently finished subagent shown", listed.includes("s-bridgedone"));
+  check("list: read-only hint present", /read-only/.test(listed));
+
+  const detail = await exec("bg_status", { id: "s-bridgerun" });
+  check("status(id): subagent detail rendered", /subagent run.*running/.test(detail));
+  check("status(id): points at subagent_wait", detail.includes("subagent_wait"));
+
+  const waitRes = await exec("bg_wait", { id: "s-bridgerun" });
+  check("wait(id): redirects to subagent_wait", /subagent_wait/.test(waitRes) && !/not found/.test(waitRes));
+
+  const killRes = await exec("bg_kill", { id: "s-bridgerun" });
+  check("kill(id): redirects to /subagents kill", /\/subagents kill/.test(killRes) && !/not found/.test(killRes));
+  const stillRunning = JSON.parse(readFileSync(path.join(SUB_STATE_DIR, "s-bridgerun", "meta.json"), "utf8"));
+  check("kill(id): subagent state untouched (read-only bridge)", stillRunning.state === "running");
+
+  const logRes = await exec("bg_log", { id: "s-bridgedone" });
+  check("log(id): shows result tail", /Verdict/.test(logRes));
+
+  const artRes = await exec("bg_artifact", { id: "s-bridgedone" });
+  check("artifact(id): summarizes result.md", /Verdict/.test(artRes));
+
+  const missing = await exec("bg_status", { id: "s-nonexistent" });
+  check("status(id): unknown s- id still says not found", /not found/.test(missing));
+
+  rmSync(SUB_STATE_DIR, { recursive: true, force: true });
 }
 
 console.log(failures === 0 ? "\nALL OK" : `\n${failures} FAILURE(S)`);
