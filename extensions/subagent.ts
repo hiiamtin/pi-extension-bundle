@@ -28,6 +28,7 @@ import { startRpcChild, type RpcChild } from "../lib/rpc-child.ts";
 import { lowPrio } from "../lib/low-prio.ts";
 import { KNOWN_COMBOS, resolveCapabilities } from "./9router.ts";
 import {
+  buildRunNotice,
   captureExtensionApi,
   deliverRunNotice,
   sendToSession,
@@ -568,9 +569,22 @@ function bgStartText(id: string, agentName: string, model?: string): string {
   const modelTag = model ? ` · ${model}` : "";
   return [
     `Background subagent started: ${id} (${agentName}${modelTag}).`,
-    "You will be notified here when it finishes; keep working meanwhile.",
-    `Progress: /subagents list · Stop: /subagents kill ${id}`,
+    "You will be notified here when it finishes — the default way to wait is to simply END YOUR TURN; do not poll files and never write sleep loops.",
+    `If the remaining steps of this turn genuinely depend on this result, block with subagent_wait (${id}) instead of staying idle.`,
+    `Progress: bg_status · Stop: /subagents kill ${id}`,
   ].join("\n");
+}
+
+// In-band delivery for subagent_wait: same text the push notice would carry.
+// When the waiter IS the owner session, consume the completion notice here —
+// notifiedAt blocks the guaranteed channels, so the session is not notified
+// twice for a result it already received. Foreign waiters must NOT consume:
+// the owner's notice is not theirs to spend.
+function waitFinishedText(meta: RunMeta): string {
+  if (meta.ownerSession && meta.ownerSession === currentSessionFilePath() && !meta.notifiedAt) {
+    markInlineDelivered(meta.id);
+  }
+  return buildRunNotice(meta).content;
 }
 
 // FleetView widget (below editor): compact live summary of active runs.
@@ -1705,7 +1719,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
     description: [
       "Delegate one task to an isolated specialist child. Blocking by default; pass run_in_background: true to return immediately and be notified on completion.",
       "For parallel work, emit every independent subagent call as sibling tool calls in the SAME assistant response; pi executes those calls concurrently.",
-      "Do not call one subagent and wait before issuing another independent call. Wait only when the later task depends on an earlier result.",
+      "Do not call one subagent and wait before issuing another independent call. Wait only when the later task depends on an earlier result — then end your turn for the completion notice, or block with subagent_wait.",
       "Users may mention agents as #name in their message (e.g. '#scout find the auth flow') — treat that as a request to delegate that task to that agent via this tool. @path mentions are file attachments, not agent references.",
       `Available user agents: ${catalog}.`,
     ].join(" "),
@@ -1713,7 +1727,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       agent: Type.Optional(Type.String({ description: "Agent name for a new run" })),
       continue: Type.Optional(Type.String({ description: "Run id to continue instead of starting fresh" })),
       task: Type.String({ description: "Task or follow-up instruction" }),
-      run_in_background: Type.Optional(Type.Boolean({ description: "Return immediately and notify this session when the run finishes" })),
+      run_in_background: Type.Optional(Type.Boolean({ description: "Return immediately and notify this session when the run finishes (just end your turn to receive the notice; subagent_wait only if you must block)" })),
       model: Type.Optional(Type.String({ description: "Per-call provider/model override" })),
       cwd: Type.Optional(Type.String({ description: "Working directory override" })),
     }),
@@ -1798,6 +1812,40 @@ export default function subagentExtension(pi: ExtensionAPI): void {
         ? `\n${theme.fg("dim", `${details.activities.length} tool call(s) · full result: ${run.resultPath} · ${inspectHint}`)}`
         : `\n${theme.fg("dim", inspectHint)}`;
       return new Text(`${icon} ${theme.fg("toolTitle", theme.bold(run.agent))} ${theme.fg("muted", idText)}\n${theme.fg("toolOutput", body)}\n${theme.fg("dim", usage)}${extra}`, 0, 0);
+    },
+  });
+
+  pi.registerTool({
+    name: "subagent_wait",
+    label: "Subagent wait",
+    description: [
+      "Wait synchronously (blocking this turn) for a background subagent run to finish, up to 600s. Returns the result immediately if it is already finished.",
+      "PREFER NOT to call this: ending your turn is the normal way to wait — a completion notice is pushed automatically. Use subagent_wait only when later steps of the current turn genuinely depend on the run's result.",
+      "When this session owns the run, in-band delivery consumes the completion notice (no double notification).",
+    ].join(" "),
+    parameters: Type.Object({
+      id: Type.String({ description: "Subagent run id (s-…)" }),
+      timeout_sec: Type.Optional(Type.Number({ description: "Max seconds to wait (default 30, max 600)" })),
+    }),
+    async execute(...cbArgs: unknown[]) {
+      const params = extractToolArgs(cbArgs);
+      const missing = requireString(params, "id");
+      if (missing) return textResult(missing.errorText);
+      const id = String(params.id).trim();
+      const meta = readMeta(id);
+      if (!meta) return textResult(`run '${id}' not found — bg_status lists all background work (bg tasks + subagent runs)`);
+      if (meta.state !== "queued" && meta.state !== "running") return textResult(waitFinishedText(meta));
+      const timeoutSec = Math.min(600, Math.max(1, Math.round(Number(params.timeout_sec) || 30)));
+      const signal = (typeof cbArgs[0] === "string" ? cbArgs[2] : undefined) as AbortSignal | undefined;
+      const deadline = Date.now() + timeoutSec * 1000;
+      while (Date.now() < deadline) {
+        if (signal?.aborted) return textResult(`wait aborted — run '${id}' (${meta.agent}) is still running; you'll be notified when it finishes`);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        const cur = readMeta(id);
+        if (!cur) continue; // transient mid-write read (meta.json rename is atomic)
+        if (cur.state !== "queued" && cur.state !== "running") return textResult(waitFinishedText(cur));
+      }
+      return textResult(`still running after ${timeoutSec}s — run '${id}' (${meta.agent}). It keeps running; you'll be notified when it finishes, or subagent_wait again.`);
     },
   });
 

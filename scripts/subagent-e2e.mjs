@@ -892,5 +892,55 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
   assert.deepEqual(idle, { prefix: "", items: [] }, "non-@ text must fall through to the built-in provider");
 }
 
+// subagent_wait tool: the mid-turn blocking primitive for background runs
+{
+  const wait = registered.subagent_wait;
+  assert(wait, "subagent_wait tool must be registered");
+  assert.match(wait.description, /(ending|end) your turn/i, "description must teach that ending the turn is the default way to wait");
+  assert.match(wait.description, /genuinely depend/i, "description must scope subagent_wait to true dependency blocking");
+
+  // unknown id → actionable error, not a dead end
+  const miss = await wait.execute("w-miss", { id: "s-missingrun" });
+  assert.match(miss.content?.[0]?.text ?? "", /s-missingrun.*not found/, "unknown id must say not found");
+  assert.match(miss.content?.[0]?.text ?? "", /bg_status/, "unknown id error must point at bg_status");
+
+  // in-band delivery as OWNER consumes the completion notice (no double notify).
+  // NOTE: the owner session must be one the harness already tracked+claimed
+  // (bgSessionFile) — late-appearing sessions have no captured api to deliver
+  // through, which is a harness artifact, not production behavior.
+  const ownDone = baseRun("s-waitown", "done", 999_999_999, { finishedAt: Date.now() - 1000, ownerSession: bgSessionFile, exitCode: 0, resultPath: path.join(stateDir, "s-waitown", "result.md") });
+  fire("session_start", { sessionManager: { getSessionFile: () => bgSessionFile } });
+  mkdirSync(path.join(stateDir, ownDone.id), { recursive: true });
+  writeFileSync(ownDone.resultPath, "result payload for owner wait");
+  writeFileSync(path.join(stateDir, ownDone.id, "meta.json"), JSON.stringify(ownDone));
+  const own = await wait.execute("w-own", { id: ownDone.id });
+  assert.match(own.content?.[0]?.text ?? "", /'scout' \(s-waitown\) finished: done/, "finished run must deliver the notice text in-band");
+  assert.match(own.content?.[0]?.text ?? "", /result payload for owner wait/, "in-band delivery must carry the result tail");
+  assert(JSON.parse(readFileSync(path.join(stateDir, ownDone.id, "meta.json"))).notifiedAt, "owner waiter must consume the completion notice");
+
+  // foreign waiter must NOT consume the owner's notice
+  const foreignDone = baseRun("s-waitforeign", "done", 999_999_999, { finishedAt: Date.now() - 1000, ownerSession: path.join(root, "someone-else.jsonl"), exitCode: 0, resultPath: path.join(stateDir, "s-waitforeign", "result.md") });
+  mkdirSync(path.join(stateDir, foreignDone.id), { recursive: true });
+  writeFileSync(foreignDone.resultPath, "foreign result");
+  writeFileSync(path.join(stateDir, foreignDone.id, "meta.json"), JSON.stringify(foreignDone));
+  const foreign = await wait.execute("w-foreign", { id: foreignDone.id });
+  assert.match(foreign.content?.[0]?.text ?? "", /finished: done/, "foreign waiter still sees the result text");
+  assert(!JSON.parse(readFileSync(path.join(stateDir, foreignDone.id, "meta.json"))).notifiedAt, "foreign waiter must not spend the owner's notice");
+
+  // timeout path: still-running run keeps its pending notice for the push channel
+  process.env.FAKE_SUBAGENT_DELAY_MS = "2500";
+  const slowStart = await tool.execute("w-slow", { agent: "scout", task: "slow background", run_in_background: true }, undefined, undefined, { ...ctx, sessionManager: { getSessionFile: () => bgSessionFile } });
+  delete process.env.FAKE_SUBAGENT_DELAY_MS;
+  const slowId = (slowStart.content[0].text.match(/s-[a-z0-9]+/) || [])[0];
+  const slowMeta = () => JSON.parse(readFileSync(path.join(stateDir, slowId, "meta.json")));
+  const timedOut = await wait.execute("w-slow", { id: slowId, timeout_sec: 1 });
+  assert.match(timedOut.content?.[0]?.text ?? "", /still running after 1s/, "timeout must report the wait window");
+  assert(/you'll be notified|subagent_wait again/.test(timedOut.content[0].text), "timeout text must offer the follow-up paths");
+  assert(!slowMeta().notifiedAt, "timed-out wait must not consume the notice");
+  await waitFor(() => slowMeta().state === "done", 8000);
+  await waitFor(() => !!slowMeta().notifiedAt, 3000);
+  assert(bgNotices.some((n) => String(n.message?.content ?? "").includes(slowId)), "push channel must still fire after a timed-out wait");
+}
+
 console.log("ALL SUBAGENT E2E TESTS PASSED");
 rmSync(root, { recursive: true, force: true });
