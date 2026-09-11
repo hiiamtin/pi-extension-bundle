@@ -412,9 +412,13 @@ official Dev Mode MCP needs a paid seat; this path needs neither.
 export, saves it to `~/.pi/agent/figma-exports/`, and returns it to the model
 embedded inline (base64 image, capped at `PI_FIGMA_MAX_EMBED_BYTES` default
 2 MiB; beyond that it returns the path only).
-- `figma_bridge_status` / `/figma serve|status|stop` — bridge lifecycle and
+- `figma_bridge_status` / `/figma serve|status|stop|clip` — bridge lifecycle and
 last-export inspection. The HTTP bridge lazy-starts on the first tool call
 (127.0.0.1 only, token header required on every POST — CSRF-safe).
+- `figma_save_clipboard(peek?, embed?)` — pull-based fallback for **view-only
+files** (where the plugin can't run): user right-clicks → Copy as PNG/SVG
+(free in every mode), the tool persists the clipboard image through the same
+store/log. macOS only (osascript/pbpaste); `/figma clip` is the shortcut.
 
 The "push" side lives in `figma/plugin/` — a headless dev plugin imported
 yourself via `Plugins → Development → Import plugin from manifest…` (see

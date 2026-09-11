@@ -51,3 +51,6 @@ match.
   `X-Figma-Bridge` token header, so web pages cannot write files to your disk.
 - Multi-node selection exports every selected node in one run (each becomes
   its own file). The model's capture tool returns the newest one.
+- **View-only files:** dev plugins need edit access, so the plugin refuses to
+  run there — but right-click → Copy as PNG/SVG still works. Copy the node,
+  then use `/figma clip` (or the `figma_save_clipboard` tool) to persist it.
