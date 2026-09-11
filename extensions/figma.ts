@@ -35,7 +35,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { extractToolArgs, textResult } from "../lib/tool-compat.ts";
 import { Type } from "typebox";
-import { readFileSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import * as os from "node:os";
 import * as path from "node:path";
 import { startBridgeServer } from "../lib/figma-bridge-server.ts";
@@ -51,6 +53,8 @@ const MAX_EMBED_BYTES = Number(process.env.PI_FIGMA_MAX_EMBED_BYTES) || 2 * 1024
 const DEFAULT_TIMEOUT_SEC = 60;
 /** If the user exported right before asking the model, still pick it up. */
 const LOOKBACK_MS = 15_000;
+
+const execFileP = promisify(execFile);
 
 type Ui = { notify: (msg: string, level: string) => void };
 
@@ -90,35 +94,44 @@ function state(): BridgeState {
   return g.__figmaBridge;
 }
 
+function ensureStore(): FigmaExportStore {
+  const st = state();
+  if (st.store) return st.store;
+  const store = new FigmaExportStore({ rootDir: EXPORT_ROOT });
+  store.ensureDirs();
+  // Adopt exports persisted earlier (e.g. before a pi restart).
+  const disk = store.readState();
+  if (disk.exportsCount > st.exportsCount) {
+    st.exportsCount = disk.exportsCount;
+    st.lastExport = disk.lastExport ?? st.lastExport;
+  }
+  st.store = store;
+  return store;
+}
+
+function recordExport(st: BridgeState, rec: SavedExport): void {
+  st.lastExport = rec;
+  st.exportsCount += 1;
+  st.store?.appendLog(rec);
+  st.store?.writeState({ exportsCount: st.exportsCount, lastExport: st.lastExport });
+  const waiter = st.waiters.shift();
+  if (waiter) waiter(rec);
+}
+
 async function ensureServer(): Promise<BridgeState> {
   const st = state();
   if (st.handle) return st;
   if (!st.starting) {
     const start = async (): Promise<void> => {
-      const store = new FigmaExportStore({ rootDir: EXPORT_ROOT });
-      store.ensureDirs();
-      // Adopt exports persisted earlier (e.g. before a pi restart).
-      const disk = store.readState();
-      if (disk.exportsCount > st.exportsCount) {
-        st.exportsCount = disk.exportsCount;
-        st.lastExport = disk.lastExport ?? st.lastExport;
-      }
+      const store = ensureStore();
       const handle = await startBridgeServer({
         port: DEFAULT_PORT,
         token: DEFAULT_TOKEN,
         store,
-        onExport: (rec) => {
-          st.lastExport = rec;
-          st.exportsCount += 1;
-          st.store?.appendLog(rec);
-          st.store?.writeState({ exportsCount: st.exportsCount, lastExport: st.lastExport });
-          const waiter = st.waiters.shift();
-          if (waiter) waiter(rec);
-        },
+        onExport: (rec) => recordExport(st, rec),
       });
       store.writeState({ port: handle.port, exportsCount: st.exportsCount, lastExport: st.lastExport });
       st.handle = handle;
-      st.store = store;
     };
     const running = start().finally(() => {
       st.starting = null; // allow retry after a failed start
@@ -192,6 +205,88 @@ function embedImage(st: BridgeState, rec: SavedExport, embed: boolean): ToolCont
   } catch {
     return [text]; // file vanished — still report the path
   }
+}
+
+/** Pull an image off the macOS clipboard: Figma "Copy as SVG" rides as text,
+ * "Copy as PNG" as the «class PNGf» binary flavor. Returns null when neither
+ * is present. macOS only. */
+async function readClipboardImage(): Promise<{ format: ExportFormat; bytes: Uint8Array } | null> {
+  try {
+    const { stdout } = await execFileP("pbpaste", [], { timeout: 5_000, maxBuffer: 64 * 1024 * 1024 });
+    const head = stdout.trimStart().slice(0, 500);
+    if (head.startsWith("<svg") || head.startsWith("<?xml")) {
+      return { format: "svg", bytes: Buffer.from(stdout, "utf8") };
+    }
+  } catch {
+    /* fall through to the PNG flavor */
+  }
+  const tmp = path.join(os.tmpdir(), `figma-clipboard-${process.pid}-${Date.now()}.png`);
+  const script = [
+    "set pngData to (the clipboard as «class PNGf»)",
+    `set f to open for access (POSIX file "${tmp}") with write permission`,
+    "set eof f to 0",
+    "write pngData to f",
+    "close access f",
+  ].join("\n");
+  try {
+    await execFileP("osascript", ["-e", script], { timeout: 5_000 });
+    return { format: "png", bytes: readFileSync(tmp) };
+  } catch {
+    return null;
+  } finally {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* never created */
+    }
+  }
+}
+
+/** Pull-based capture for files where the plugin cannot run (view-only):
+ * the user right-clicks → Copy as PNG/SVG (free in every plan/mode), then we
+ * persist whatever is on the clipboard through the same store/state/log path
+ * as plugin pushes. */
+async function runSaveClipboard(args: unknown[]): Promise<ToolResult> {
+  const params = extractToolArgs(args);
+  const peek = params.peek === true;
+  const embed = params.embed !== false;
+  if (process.platform !== "darwin") {
+    return textResult(
+      "error: figma_save_clipboard supports macOS only (osascript/pbpaste). " +
+        "On other platforms use the pi-figma-bridge plugin flow (figma_take_latest_export).",
+    );
+  }
+  let clip: { format: ExportFormat; bytes: Uint8Array } | null;
+  try {
+    clip = await readClipboardImage();
+  } catch (e) {
+    return textResult(`error: clipboard read failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (!clip) {
+    return textResult(
+      "clipboard has no Figma PNG/SVG. In Figma: right-click the node → Copy as → PNG (or SVG), " +
+        "then call figma_save_clipboard again. Copy as image works even in view-only files.",
+    );
+  }
+  if (peek) {
+    return textResult(
+      `clipboard contains a ${clip.format} image, ${clip.bytes.byteLength} bytes (peek only — nothing saved).`,
+    );
+  }
+  const st = state();
+  const rec = ensureStore().save({
+    bytes: clip.bytes,
+    format: clip.format,
+    nodeName: "clipboard",
+    nodeId: "clipboard",
+    scale: 1,
+  });
+  recordExport(st, rec); // also feeds any waiting figma_take_latest_export call
+  st.handedOutMs = rec.createdAtMs;
+  return {
+    content: embedImage(st, rec, embed),
+    details: { path: rec.path, format: rec.format, bytes: rec.bytes, source: "clipboard" },
+  };
 }
 
 const FORMAT_PATTERN = /^(png|svg|jpg)$/;
@@ -304,14 +399,30 @@ export default function (pi: ExtensionAPI): void {
     execute: async (...args: unknown[]) => runStatus(args),
   });
 
+  pi.registerTool({
+    name: "figma_save_clipboard",
+    label: "Figma Clipboard Save",
+    description:
+      "Save a Figma image from the macOS clipboard to disk and view it inline. For files where the " +
+      "pi-figma-bridge plugin cannot run (view-only files): ask the user to right-click the node → " +
+      'Copy as → PNG (or SVG), then call this tool. Use peek:true to inspect the clipboard without saving.',
+    promptSnippet: "Save a Figma Copy-as-PNG/SVG from the macOS clipboard (works in view-only files)",
+    parameters: Type.Object({
+      peek: Type.Optional(Type.Boolean({ description: "Report clipboard contents without saving (default false)." })),
+      embed: Type.Optional(Type.Boolean({ description: "Embed the image inline for the model (default true)." })),
+    }),
+    execute: async (...args: unknown[]) => runSaveClipboard(args),
+  });
+
   pi.registerCommand("figma", {
-    description: "Figma export bridge control. /figma [serve|status|stop|help]",
+    description: "Figma export bridge control. /figma [serve|status|stop|clip|help]",
     getArgumentCompletions: (prefix: string) => {
       const n = prefix.trimStart();
-      if (n.includes(" ") && !/^(serve|status|stop|help)\s/.test(n)) return null;
+      if (n.includes(" ") && !/^(serve|status|stop|clip|help)\s/.test(n)) return null;
       const items = [
         { value: "serve", label: "serve — start (or restart) the local export bridge" },
         { value: "status", label: "status — bridge state + last export" },
+        { value: "clip", label: "clip — save Figma Copy-as-PNG/SVG from the clipboard" },
         { value: "stop", label: "stop — close the local export bridge" },
         { value: "help", label: "help — usage summary" },
       ].filter((i) => i.value.startsWith(n));
@@ -342,8 +453,15 @@ export default function (pi: ExtensionAPI): void {
           } else {
             ctx.ui.notify("figma bridge is not running", "info");
           }
+        } else if (sub === "clip") {
+          const res = await runSaveClipboard([{}]);
+          const first = res.content[0];
+          ctx.ui.notify(first.type === "text" ? first.text : "clipboard saved", "info");
         } else if (sub === "help") {
-          ctx.ui.notify("/figma serve|status|stop|help — Figma export bridge (see figma/README.md for plugin install)", "info");
+          ctx.ui.notify(
+            "/figma serve|status|stop|clip|help — bridge: figma/README.md; clipboard path works in view-only files",
+            "info",
+          );
         } else {
           ctx.ui.notify(`unknown /figma subcommand "${sub}" — usage: /figma serve|status|stop|help`, "error");
         }

@@ -26,6 +26,10 @@ const pkgRoot = path.dirname(here);
 // isolate bg-task test tasks from the real state dir (~/.pi/agent/bg-tasks)
 import os from "node:os";
 process.env.PI_BG_STATE_DIR = path.join(os.tmpdir(), `pi-bg-smoke-${process.pid}`);
+// isolate figma export writes from the real ~/.pi/agent/figma-exports
+process.env.PI_FIGMA_EXPORT_DIR = path.join(os.tmpdir(), `pi-figma-smoke-${process.pid}`);
+// random bridge port so smoke never collides with a live pi session on 37373
+process.env.PI_FIGMA_BRIDGE_PORT = String(30000 + (process.pid % 20000));
 const subagentRoot = path.join(os.tmpdir(), `pi-subagent-smoke-${process.pid}`);
 process.env.PI_CODING_AGENT_DIR = path.join(subagentRoot, "agent-dir");
 process.env.PI_SUBAGENT_STATE_DIR = path.join(subagentRoot, "state");
@@ -147,6 +151,7 @@ const MIN_ARGS = {
   bg_artifact: { path: "package.json" },
   figma_take_latest_export: { timeout_sec: 1 },
   figma_bridge_status: {},
+  figma_save_clipboard: { peek: true },
   subagent: { agent: "smoke", task: "say OK" },
 };
 
