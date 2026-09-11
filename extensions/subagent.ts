@@ -575,6 +575,14 @@ function bgStartText(id: string, agentName: string, model?: string): string {
   ].join("\n");
 }
 
+// In-process owner waiters (subagent_wait). The settle watcher checks this
+// before pushing: an owner waiter gets the result in-band instead of a
+// duplicate followUp notice. Single-threaded JS makes the handoff atomic:
+// the watcher's get+wake runs in one synchronous block, so it can never
+// interleave with the waiter's timeout cleanup. Foreign waiters never
+// register a claim here — the owner's push is not theirs to suppress.
+const activeWaits = new Map<string, { owner?: string; wake: () => void }>();
+
 // In-band delivery for subagent_wait: same text the push notice would carry.
 // When the waiter IS the owner session, consume the completion notice here —
 // notifiedAt blocks the guaranteed channels, so the session is not notified
@@ -708,10 +716,20 @@ function updateFleetWidget(): void {
 
 // Fire-and-forget: when a background run settles, push its notice to the owner
 // session. Failed pushes stay pending — the sweep and context pump own them.
+// Exception: an owner-session subagent_wait active in THIS process takes the
+// result in-band (wake it; it delivers the same notice text and consumes
+// notifiedAt). Pushing would double-notify: the watcher settles ~0ms after
+// child exit and always beats the waiter's 250ms poll (observed live in
+// print-mode test 2026-09-12: duplicate followUp for the quick run).
 function launchBackground(running: Promise<unknown>, id: string, runsIo: RunsIo): void {
   void running.then(() => {
     const final = readMeta(id);
     if (!final || final.notifiedAt) return;
+    const wait = activeWaits.get(id);
+    if (wait && (!final.ownerSession || final.ownerSession === wait.owner)) {
+      wait.wake();
+      return;
+    }
     if (final.notifyOnDone === false) {
       // quiet round (user sent it from the viewer and is watching there):
       // mark delivered so sweeps never resurface it — no chat push, no turn
@@ -1838,14 +1856,21 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       const timeoutSec = Math.min(600, Math.max(1, Math.round(Number(params.timeout_sec) || 30)));
       const signal = (typeof cbArgs[0] === "string" ? cbArgs[2] : undefined) as AbortSignal | undefined;
       const deadline = Date.now() + timeoutSec * 1000;
-      while (Date.now() < deadline) {
-        if (signal?.aborted) return textResult(`wait aborted — run '${id}' (${meta.agent}) is still running; you'll be notified when it finishes`);
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        const cur = readMeta(id);
-        if (!cur) continue; // transient mid-write read (meta.json rename is atomic)
-        if (cur.state !== "queued" && cur.state !== "running") return textResult(waitFinishedText(cur));
+      let wake!: () => void;
+      const woken = new Promise<void>((resolve) => { wake = resolve; });
+      activeWaits.set(id, { owner: currentSessionFilePath(), wake });
+      try {
+        while (Date.now() < deadline) {
+          if (signal?.aborted) return textResult(`wait aborted — run '${id}' (${meta.agent}) is still running; you'll be notified when it finishes`);
+          await Promise.race([new Promise((resolve) => setTimeout(resolve, 250)), woken]);
+          const cur = readMeta(id);
+          if (!cur) continue; // transient mid-write read (meta.json rename is atomic)
+          if (cur.state !== "queued" && cur.state !== "running") return textResult(waitFinishedText(cur));
+        }
+        return textResult(`still running after ${timeoutSec}s — run '${id}' (${meta.agent}). It keeps running; you'll be notified when it finishes, or subagent_wait again.`);
+      } finally {
+        activeWaits.delete(id);
       }
-      return textResult(`still running after ${timeoutSec}s — run '${id}' (${meta.agent}). It keeps running; you'll be notified when it finishes, or subagent_wait again.`);
     },
   });
 

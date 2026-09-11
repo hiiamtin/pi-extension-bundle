@@ -927,6 +927,22 @@ assert(notices.some((notice) => /STEER-PIVOTED/.test(notice.message)), "text fal
   assert.match(foreign.content?.[0]?.text ?? "", /finished: done/, "foreign waiter still sees the result text");
   assert(!JSON.parse(readFileSync(path.join(stateDir, foreignDone.id, "meta.json"))).notifiedAt, "foreign waiter must not spend the owner's notice");
 
+  // race: watcher settles while an owner waiter is live → wake, don't push.
+  // Regression for the live-print-mode finding (2026-09-12): without the
+  // activeWaits handoff the watcher always wins (0ms vs 250ms poll) and the
+  // owner receives BOTH the in-band result and a duplicate followUp notice.
+  process.env.FAKE_SUBAGENT_DELAY_MS = "700";
+  const raceStart = await tool.execute("w-race", { agent: "scout", task: "race waiter", run_in_background: true }, undefined, undefined, { ...ctx, sessionManager: { getSessionFile: () => bgSessionFile } });
+  delete process.env.FAKE_SUBAGENT_DELAY_MS;
+  const raceId = (raceStart.content[0].text.match(/s-[a-z0-9]+/) || [])[0];
+  const raceMeta = () => JSON.parse(readFileSync(path.join(stateDir, raceId, "meta.json")));
+  const raceWait = await wait.execute("w-race", { id: raceId, timeout_sec: 60 });
+  assert.match(raceWait.content?.[0]?.text ?? "", new RegExp(`'scout' \\(${raceId}\\) finished: done`), "race waiter must get the result in-band");
+  await sleep(600); // give a (wrong) watcher push time to land if the fix regressed
+  assert(raceMeta().notifiedAt, "woken owner waiter must consume the notice");
+  assert(!bgNotices.some((n) => String(n.message?.content ?? "").includes(raceId)), "watcher must NOT push when it woke an owner waiter");
+  assert(!raceMeta().notifyTries, "no push attempt may be recorded for a woken waiter");
+
   // timeout path: still-running run keeps its pending notice for the push channel
   process.env.FAKE_SUBAGENT_DELAY_MS = "2500";
   const slowStart = await tool.execute("w-slow", { agent: "scout", task: "slow background", run_in_background: true }, undefined, undefined, { ...ctx, sessionManager: { getSessionFile: () => bgSessionFile } });
