@@ -401,6 +401,28 @@ for this layout (root needs `none`, repos want `message`). Config edits take
 effect after restarting pi (persistent plugins read the file once on load);
 `apiToken` is the only exception.
 
+### figma.ts — Figma export bridge (PNG/SVG/JPG, no Dev Mode license)
+
+Captures the user's Figma selection as a rendered image — same client-side
+renderer as right-click → "Copy as PNG", which is free on every plan. Figma's
+REST `GET /v1/images` is capped at ~20 renders/month on Starter plans, and the
+official Dev Mode MCP needs a paid seat; this path needs neither.
+
+- `figma_take_latest_export(timeout_sec?, format?, embed?)` — waits for a fresh
+export, saves it to `~/.pi/agent/figma-exports/`, and returns it to the model
+embedded inline (base64 image, capped at `PI_FIGMA_MAX_EMBED_BYTES` default
+2 MiB; beyond that it returns the path only).
+- `figma_bridge_status` / `/figma serve|status|stop` — bridge lifecycle and
+last-export inspection. The HTTP bridge lazy-starts on the first tool call
+(127.0.0.1 only, token header required on every POST — CSRF-safe).
+
+The "push" side lives in `figma/plugin/` — a headless dev plugin imported
+yourself via `Plugins → Development → Import plugin from manifest…` (see
+`figma/README.md`): select node(s) → run it → bytes land on disk. Port/token
+must match between `extensions/figma.ts` env and `figma/plugin/code.js`.
+
+Test: `node scripts/figma-bridge-e2e.mjs` (lib-level, isolated tmp dirs).
+
 ## Conventions for new extensions
 
 - **Every command must be autocomplete-ready.** Any `pi.registerCommand()`

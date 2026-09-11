@@ -145,6 +145,8 @@ const MIN_ARGS = {
   bg_log: { id: "nope-smoke" },
   bg_kill: { id: "nope-smoke" },
   bg_artifact: { path: "package.json" },
+  figma_take_latest_export: { timeout_sec: 1 },
+  figma_bridge_status: {},
   subagent: { agent: "smoke", task: "say OK" },
 };
 
