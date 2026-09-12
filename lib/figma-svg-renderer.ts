@@ -41,30 +41,99 @@ function esc(s: string): string {
 function hexFill(paint: any): string | null {
   if (!paint?.color || typeof paint.color !== "object") return undefined;
   const b = (v: number) => Math.round(Math.max(0, Math.min(1, Number(v) || 0)) * 255).toString(16).padStart(2, "0");
-  const base = `#${b(paint.color.r)}${b(paint.color.g)}${b(paint.color.b)}`;
-  return typeof paint.color.a === "number" && paint.color.a < 1 ? `${base}${b(paint.color.a)}` : base;
+  return `#${b(paint.color.r)}${b(paint.color.g)}${b(paint.color.b)}`;
 }
 
-function paintInfo(paints: any): { fill: string | undefined; imageHash: string | null; stops: any[] | null } {
-  if (!Array.isArray(paints)) return { fill: undefined, imageHash: null, stops: null };
+// total paint opacity = paint.opacity * color.a; paints at ~0 are invisible
+// (e.g. state-layer SOLID #fff opacity 0 — painting it opaque would blank
+// everything beneath it)
+function paintOpacity(paint: any): number {
+  const po = typeof paint?.opacity === "number" ? paint.opacity : 1;
+  const ca = typeof paint?.color?.a === "number" ? paint.color.a : 1;
+  return po * ca;
+}
+
+// Figma vector-geometry blob decoder. Same wire format openfig-core decodes
+// (0=close, 1=move, 2=line, 4=cubic, LE float32 args) PLUS command 3 =
+// QUADRATIC_TO (16 bytes: qx,qy,x,y) which upstream silently bails on —
+// TrueType-derived glyphs (e.g. the Thai/Latin UI font) use quads heavily.
+// Quads are converted to cubics inline. Returns an SVG path string.
+function decodeGeometryPathQ(blob: Uint8Array): string {
+  if (!blob.length) return "";
+  const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  let o = 0;
+  let out = "";
+  let cx = 0, cy = 0; // current point
+  let sx = 0, sy = 0; // subpath start
+  let open = false;
+  const f = (off: number) => Math.round(view.getFloat32(off, true) * 100) / 100;
+  while (o < blob.length) {
+    const cmd = blob[o++];
+    if (cmd === 0) {
+      if (open) {
+        out += "Z";
+        cx = sx; cy = sy; open = false;
+      }
+    } else if (cmd === 1 && o + 8 <= blob.length) {
+      cx = f(o); cy = f(o + 4); o += 8;
+      sx = cx; sy = cy; open = true;
+      out += `M${cx} ${cy}`;
+    } else if (cmd === 2 && o + 8 <= blob.length) {
+      cx = f(o); cy = f(o + 4); o += 8;
+      out += `L${cx} ${cy}`;
+    } else if (cmd === 3 && o + 16 <= blob.length) {
+      const qx = f(o), qy = f(o + 4);
+      const ex = f(o + 8), ey = f(o + 12);
+      o += 16;
+      if (!open) { out += `M${cx} ${cy}`; open = true; }
+      const c1x = Math.round((cx + (2 / 3) * (qx - cx)) * 100) / 100;
+      const c1y = Math.round((cy + (2 / 3) * (qy - cy)) * 100) / 100;
+      const c2x = Math.round((ex + (2 / 3) * (qx - ex)) * 100) / 100;
+      const c2y = Math.round((ey + (2 / 3) * (qy - ey)) * 100) / 100;
+      out += `C${c1x} ${c1y} ${c2x} ${c2y} ${ex} ${ey}`;
+      cx = ex; cy = ey;
+    } else if (cmd === 4 && o + 24 <= blob.length) {
+      const x1 = f(o), y1 = f(o + 4), x2 = f(o + 8), y2 = f(o + 12);
+      const ex = f(o + 16), ey = f(o + 20);
+      o += 24;
+      out += `C${x1} ${y1} ${x2} ${y2} ${ex} ${ey}`;
+      cx = ex; cy = ey; open = true;
+    } else {
+      break; // unknown command — keep what we have
+    }
+  }
+  return out;
+}
+
+// decode a glyph blob with quad support; returns "" when undecodable
+function glyphPathD(doc: any, blobIndex: any): string {
+  const bytes = getBlobBytes(doc, blobIndex);
+  if (!bytes) return "";
+  return decodeGeometryPathQ(bytes);
+}
+
+function paintInfo(paints: any): { fill: string | undefined; fillOpacity: number; imageHash: string | null; stops: any[] | null } {
+  if (!Array.isArray(paints)) return { fill: undefined, fillOpacity: 1, imageHash: null, stops: null };
   for (const p of paints) {
     if (p?.visible === false) continue;
+    const op = paintOpacity(p);
+    if (op <= 0.001) continue;
     if (p.type === "SOLID") {
       const f = hexFill(p);
-      if (f) return { fill: f, imageHash: null, stops: null };
+      if (f) return { fill: f, fillOpacity: op, imageHash: null, stops: null };
     }
     if (p.type === "IMAGE") {
       const m = /[\da-f]{40}/.exec(JSON.stringify(p));
-      if (m) return { fill: undefined, imageHash: m[0], stops: null };
+      if (m) return { fill: undefined, fillOpacity: 1, imageHash: m[0], stops: null };
     }
   }
   for (const p of paints) {
     if (p?.visible === false) continue;
     if (Array.isArray(p.gradientStops) && p.gradientStops.length) {
-      return { fill: undefined, imageHash: null, stops: p.gradientStops };
+      return { fill: undefined, fillOpacity: 1, imageHash: null, stops: p.gradientStops };
     }
   }
-  return { fill: undefined, imageHash: null, stops: null };
+  return { fill: undefined, fillOpacity: 1, imageHash: null, stops: null };
 }
 
 // tiny string hash so gradient defs can be deduped without a deps-heavy map
@@ -176,7 +245,7 @@ export function renderNodeSVG(
     const t = n.transform ?? { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0 };
     const tf = depth === 0 ? "" : ` transform="matrix(${r(t.m00)},${r(t.m10)},${r(t.m01)},${r(t.m11)},${r(t.m02)},${r(t.m12)})"`;
     const opacity = typeof n.opacity === "number" && n.opacity < 1 ? ` opacity="${r(n.opacity)}"` : "";
-    const { fill, imageHash, stops } = paintInfo(n.fillPaints);
+    const { fill, fillOpacity, imageHash, stops } = paintInfo(n.fillPaints);
     let gradient = "";
     if (stops) {
       const gid = `grad${gradSeq++}`;
@@ -195,14 +264,13 @@ export function renderNodeSVG(
     switch (n.type) {
       case "TEXT": {
         const fillHere = overrideMap?.get(id)?.fill ?? fill ?? "#1a152b";
+        void fillHere;
         const glyphs = overrideMap?.get(id)?.glyphs ?? (noText ? null : n.derivedTextData?.glyphs);
         if (glyphs && glyphs.length) {
           let runs = "";
           for (const g of glyphs) {
-            const bytes = getBlobBytes(doc, g.commandsBlob);
-            if (!bytes) continue;
-            let d = geometryBlobToSVGPath(bytes);
-            if (d.startsWith("Z")) d = d.slice(1);
+            const d = glyphPathD(doc, g.commandsBlob);
+            if (!d) continue;
             runs += `<g transform="translate(${r(g.position?.x ?? 0)},${r(g.position?.y ?? 0)}) scale(${r(g.fontSize ?? 14)},${-r(g.fontSize ?? 14)})"><path d="${d}" fill="${fillHere}"/></g>`;
           }
           if (runs) return `<g${tf}>${runs}</g>`;
@@ -241,19 +309,22 @@ export function renderNodeSVG(
             if (symId) childIds = fig.kidsOf.get(symId) ?? [];
           }
           for (const kid of childIds) {
-            childrenSvg += walk(kid, depth + 1, noText || n.type === "INSTANCE", childOverrideMap ?? overrideMap);
+            // bound slots render their override glyphs; unbound slots keep
+            // the component default text — no blanket suppression
+            childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap);
           }
         }
 
         let inner = childrenSvg;
-        if (clipsContent(n) && inner && w > 0 && h > 0) {
+        const clips = (n.type === "FRAME" || n.type === "INSTANCE") && n.clipsContent === true; // Figma UI default is NO clip
+        if (clips && inner && w > 0 && h > 0) {
           const cid = `clip${clipSeq++}`;
           defs.push(`<clipPath id="${cid}"><rect x="0" y="0" width="${w}" height="${h}"/></clipPath>`);
           inner = `<g clip-path="url(#${cid})">${inner}</g>`;
         }
         let bg = "";
         const paint = gradient || (fill && n.type !== "GROUP" ? fill : undefined);
-        if (paint && w > 0 && h > 0) bg = `<rect x="0" y="0" width="${w}" height="${h}" fill="${paint}"/>`;
+        if (paint && w > 0 && h > 0) bg = `<rect x="0" y="0" width="${w}" height="${h}" fill="${paint}"${fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : ""}/>`;
         let img = "";
         if (imageHash && w > 0 && h > 0) {
           const bytes = images.get(imageHash);
@@ -271,11 +342,13 @@ export function renderNodeSVG(
       case "ROUNDED_RECTANGLE": {
         const rx = n.cornerRadius ? ` rx="${r(n.cornerRadius)}"` : "";
         const paint = gradient || fill || "none";
-        return `<rect x="0" y="0" width="${w}" height="${h}"${rx} fill="${paint}"${strokeText(n)}${opacity}/>`;
+        const fo = fill && fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : "";
+        return `<rect x="0" y="0" width="${w}" height="${h}"${rx} fill="${paint}"${fo}${strokeText(n)}${opacity}/>`;
       }
       case "ELLIPSE": {
         const paint = gradient || fill || "none";
-        return `<ellipse cx="${r(w / 2)}" cy="${r(h / 2)}" rx="${r(w / 2)}" ry="${r(h / 2)}" fill="${paint}"${opacity}/>`;
+        const fo = fill && fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : "";
+        return `<ellipse cx="${r(w / 2)}" cy="${r(h / 2)}" rx="${r(w / 2)}" ry="${r(h / 2)}" fill="${paint}"${fo}${opacity}/>`;
       }
       case "VECTOR":
       case "BOOLEAN_OPERATION":
