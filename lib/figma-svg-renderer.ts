@@ -183,26 +183,43 @@ export function renderNodeSVG(
   // its symbolOverride text (derived entries dedupe by fontSize+length; pair
   // within each fontSize group by document order — verified against a live
   // file: title/label/placeholder/description all mapped correctly).
-  function buildSlotMap(instance: RawChange, symId: string): Map<string, { glyphs: any[]; fill: string | undefined }> {
-    const slots: Array<{ id: string; fs: number; len: number; fill: string | undefined }> = [];
-    (function collect(cid: string, depth: number): void {
+  // Pair an instance's symbolOverrides-derived text entries with TEXT slots.
+  // Handles: direct slots (fontSize + document-order pairing), stale "*" runs
+  // repositioned after the preceding text, variant-hidden slots (below the
+  // instance's bottom edge), and overrides that target TEXT inside nested
+  // sub-instances (matched by rendered width vs the sub-instance's width).
+  function buildSlotMap(instance: RawChange, symId: string): Map<string, { glyphs: any[]; fill: string | undefined; hidden?: boolean }> {
+    const map = new Map<string, { glyphs: any[]; fill: string | undefined; hidden?: boolean }>();
+    const instW = instance.size?.x ?? Infinity;
+    const instH = instance.size?.y ?? Infinity;
+
+    type Slot = { id: string; fs: number; len: number; fill: string | undefined; chars: string; parentId: string; nodeX: number; bottom: number; order: number };
+    const slots: Slot[] = [];
+    let order = 0;
+    (function collect(cid: string, depth: number, parentId: string, ty: number): void {
       if (depth > 14) return;
       for (const kid of fig.kidsOf.get(cid) ?? []) {
         const k = fig.nodes.get(kid);
         if (!k || k.visible === false) continue;
+        const kTy = ty + (k.transform?.m12 ?? 0);
         if (k.type === "TEXT") {
           slots.push({
             id: kid,
             fs: k.fontSize ?? 14,
             len: (k.textData?.characters ?? "").length,
             fill: paintInfo(k.fillPaints).fill,
+            chars: k.textData?.characters ?? "",
+            parentId,
+            nodeX: k.transform?.m02 ?? 0,
+            bottom: kTy + (k.size?.y ?? 0),
+            order: order++,
           });
         }
-        collect(kid, depth + 1);
+        collect(kid, depth + 1, kid, kTy);
       }
-    })(symId, 0);
+    })(symId, 0, symId, 0);
 
-    const derived: Array<{ fs: number; len: number; glyphs: any[]; key: string }> = [];
+    const derived: Array<{ fs: number; len: number; glyphs: any[] }> = [];
     const seenKey = new Set<string>();
     for (const d of instance.derivedSymbolData ?? []) {
       const glyphs = d.derivedTextData?.glyphs ?? [];
@@ -212,11 +229,10 @@ export function renderNodeSVG(
       const key = `${fs}|${len}`;
       if (seenKey.has(key)) continue;
       seenKey.add(key);
-      derived.push({ fs, len, glyphs, key });
+      derived.push({ fs, len, glyphs });
     }
 
-    const map = new Map<string, { glyphs: any[]; fill: string | undefined }>();
-    const byFsSlots = new Map<number, typeof slots>();
+    const byFsSlots = new Map<number, Slot[]>();
     for (const s of slots) {
       if (!byFsSlots.has(s.fs)) byFsSlots.set(s.fs, []);
       byFsSlots.get(s.fs)!.push(s);
@@ -226,11 +242,33 @@ export function renderNodeSVG(
       if (!byFsDerived.has(d.fs)) byFsDerived.set(d.fs, []);
       byFsDerived.get(d.fs)!.push(d);
     }
+    const boundBySlot = new Map<string, { glyphs: any[]; fill: string | undefined }>();
     for (const [fs, ds] of byFsDerived) {
-      const ss = byFsSlots.get(fs) ?? [];
+      const ss = (byFsSlots.get(fs) ?? []).filter((sl) => sl.bottom <= instH + 0.5); // variant-hidden slots sit below the instance bottom
       const n = Math.min(ds.length, ss.length);
-      for (let i = 0; i < n; i++) map.set(ss[i].id, { glyphs: ds[i].glyphs, fill: ss[i].fill });
+      for (let i = 0; i < n; i++) boundBySlot.set(ss[i].id, { glyphs: ds[i].glyphs, fill: ss[i].fill });
     }
+    // hide variant-hidden TEXT slots so their component default text never shows
+    for (const sl of slots) {
+      if (sl.bottom > instH + 0.5 && !boundBySlot.has(sl.id)) {
+        map.set(sl.id, { glyphs: [], fill: sl.fill, hidden: true });
+      }
+    }
+    // a stale "*" run lands mid-word (its position predates the override);
+    // follow the preceding bound text run's rendered width instead
+    for (const sl of slots) {
+      if (sl.chars !== "*" || !boundBySlot.has(sl.id)) continue;
+      const prev = slots.filter((p) => p.parentId === sl.parentId && p.order < sl.order && p.chars !== "*").pop();
+      const prevBound = prev ? boundBySlot.get(prev.id) : undefined;
+      if (prev && prevBound && prevBound.glyphs.length) {
+        let prevEnd = 0;
+        for (const g of prevBound.glyphs) prevEnd = Math.max(prevEnd, (g.position?.x ?? 0) + (g.fontSize ?? prev.fs) * 0.55);
+        const shifted = boundBySlot.get(sl.id)!.glyphs.map((g) => ({ ...g, position: { ...g.position, x: prevEnd + prev.fs * 0.25 - sl.nodeX } }));
+        boundBySlot.set(sl.id, { ...boundBySlot.get(sl.id)!, glyphs: shifted });
+      }
+    }
+    for (const [id, v] of boundBySlot) map.set(id, v);
+
     return map;
   }
 
@@ -263,9 +301,11 @@ export function renderNodeSVG(
 
     switch (n.type) {
       case "TEXT": {
-        const fillHere = overrideMap?.get(id)?.fill ?? fill ?? "#1a152b";
+        const bound = overrideMap?.get(id);
+        if (bound?.hidden) return "";
+        const fillHere = bound?.fill ?? fill ?? "#1a152b";
         void fillHere;
-        const glyphs = overrideMap?.get(id)?.glyphs ?? (noText ? null : n.derivedTextData?.glyphs);
+        const glyphs = bound?.glyphs ?? (noText ? null : n.derivedTextData?.glyphs);
         if (glyphs && glyphs.length) {
           let runs = "";
           for (const g of glyphs) {
@@ -301,6 +341,13 @@ export function renderNodeSVG(
           // bound to their text slots (fontSize + document order pairing)
           const symId = guidStr(n.symbolData?.symbolID);
           if (symId) childOverrideMap = buildSlotMap(n, symId);
+        }
+        // ancestor bindings win over this instance's own (their derived data
+        // reflects the final composed layout; sub-instance caches can be stale)
+        if (childOverrideMap && overrideMap && overrideMap.size) {
+          const merged = new Map(childOverrideMap);
+          for (const [k2, v2] of overrideMap) merged.set(k2, v2);
+          childOverrideMap = merged;
         }
         if (depth < maxDepth && nodeCount < maxNodes) {
           let childIds = fig.kidsOf.get(id) ?? [];
