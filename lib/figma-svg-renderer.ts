@@ -286,7 +286,6 @@ export function renderNodeSVG(
   const maxNodes = Math.max(50, opts?.maxNodes ?? 4000);
   const warnings: string[] = [];
   let nodeCount = 0;
-  const resizedNodes = new Set<string>();
   let clipSeq = 0;
   let gradSeq = 0;
   const defs: string[] = [];
@@ -384,13 +383,16 @@ export function renderNodeSVG(
         }
       }
     }
-    // authoritative: slot overrideKey -> own derived run
+    // authoritative: slot overrideKey -> own derived run. For swapped
+    // instances the baked derived data belongs to the current variant, so the
+    // run is fresh even when the instance node itself is not.
+    const swapped = symId !== guidStr(instance.symbolData?.symbolID);
     for (const sl of slots) {
       if (locked.has(sl.id) || sl.bottom > instH + 0.5) continue;
       const run = sl.okey ? ownByGuid.get(sl.okey) : undefined;
       if (run) {
         locked.add(sl.id);
-        boundBySlot.set(sl.id, { glyphs: run, fill: sl.fill, upgraded: false });
+        boundBySlot.set(sl.id, { glyphs: run, fill: sl.fill, upgraded: swapped });
       }
     }
     // variant-hidden: VISIBLE prop false, or slot past the instance bottom
@@ -431,7 +433,7 @@ export function renderNodeSVG(
       const prop = assigns.get(textRef)?.text;
       if (!prop) continue;
       const bound = boundBySlot.get(sl.id);
-      if (bound && bound.glyphs.length === prop.length) continue;
+      if (bound && (bound.upgraded || bound.glyphs.length === prop.length)) continue;
       boundBySlot.set(sl.id, { fill: sl.fill, propText: prop, upgraded: !!bound });
     }
     for (const sl of slots) {
@@ -444,6 +446,125 @@ export function renderNodeSVG(
     for (const [id, v] of boundBySlot) map.set(id, v);
     return map;
   }
+
+  /**
+   * Minimal auto-layout for instances whose resolved component is a Figma
+   * stack (stackMode set). The .fig bakes the component-subtree child
+   * transforms from the library component, which go stale when an instance's
+   * text grows (e.g. footer "Button" -> "Delete saved filters"). Re-lays-out
+   * children from the component's own stack props:
+   * - child width grows to fit its bound text run (text extent + padding)
+   * - two-child stacks with a large baked gap are SPACE_BETWEEN
+   *   (leading child pinned left, trailing child pinned right)
+   * - counter axis centered
+   * Only fires when something actually overflows or a 2-child stack is
+   * space-between, so correctly-baked layouts stay untouched.
+   */
+  const applyStackLayout = (compId: string, instNode: any, ancDir?: DirNode) => {
+    const comp = fig.nodes.get(compId);
+    if (!comp?.stackMode) return;
+    const horiz = comp.stackMode === "HORIZONTAL";
+    const kids = fig.kidsOf.get(compId) ?? [];
+    if (kids.length < 2) return;
+    const spacing = typeof comp.stackSpacing === "number" ? comp.stackSpacing : 0;
+    const padMain = horiz ? (comp.stackHorizontalPadding ?? 0) : (comp.stackVerticalPadding ?? 0);
+    const W = instNode.size?.x ?? comp.size?.x ?? 0;
+    const H = instNode.size?.y ?? comp.size?.y ?? 0;
+    const main = horiz ? W : H;
+    const extOf = (cn: any): number => {
+      const merged = mergeDir(ancDir?.children.get(okeyOf(cn) ?? ""), buildDirectiveTree(cn));
+      const symId2 = merged?.swapSym && fig.nodes.has(merged.swapSym) ? merged.swapSym : guidStr(cn.symbolData?.symbolID);
+      if (!symId2) return 0;
+      // measure with the instance's OWN derived runs only — ancestor-composed
+      // runs may be positioned in a parent coordinate space
+      const dirOwn = merged ? { ...merged, textByKey: new Map() } : undefined;
+      const map2 = buildSlotMap(cn, symId2, { dir: dirOwn, inheritedAssigns: new Map([...(ancDir?.assigns ?? [])]) });
+      let ext = 0;
+      let propCap = Infinity;
+      for (const b of map2.values()) {
+        if (!b || b.hidden) continue;
+        for (const gg of b.glyphs ?? []) ext = Math.max(ext, (gg.position?.x ?? 0) + (gg.fontSize ?? 16) * 0.62);
+        if (b.propText) propCap = Math.min(propCap, b.propText.length * 8.7 + 32);
+      }
+      // glyph runs inherited from an ancestor scope can carry that scope's
+      // positions; the prop text length is a safe upper bound on the true
+      // button width
+      if (ext > 0) return Math.min(ext, propCap);
+      return isFinite(propCap) ? propCap : 0;
+    };
+    const estimateW = (fid: string): number => {
+      const f = fig.nodes.get(fid);
+      if (!f?.stackMode) return f?.size?.x ?? 0;
+      const kids2 = fig.kidsOf.get(fid) ?? [];
+      if (!kids2.length) return f.size?.x ?? 0;
+      let sum = 0;
+      let n2 = 0;
+      for (const k2 of kids2) {
+        const cn2 = fig.nodes.get(k2);
+        if (!cn2 || cn2.visible === false) continue;
+        n2++;
+        let w2 = cn2.size?.x ?? 0;
+        if (cn2.type === "INSTANCE") w2 = Math.max(w2, Math.round(extOf(cn2)) + 16);
+        else if (cn2.stackMode) w2 = estimateW(k2);
+        sum += w2;
+      }
+      return Math.round(sum + (f.stackSpacing ?? 0) * Math.max(0, n2 - 1) + 2 * (f.stackHorizontalPadding ?? 0));
+    };
+    const items: { cn: any; w: number; h: number; bakedW: number }[] = [];
+    for (const kid of kids) {
+      const cn = fig.nodes.get(kid);
+      if (!cn || cn.visible === false) continue;
+      const bakedW = cn.size?.x ?? 24;
+      let w = bakedW;
+      if (cn.type === "INSTANCE") {
+        const ext = extOf(cn);
+        if (ext > 0) w = Math.max(bakedW, Math.round(ext) + 16);
+      } else if (cn.stackMode) {
+        w = Math.max(bakedW, estimateW(kid));
+      } else {
+        // plain frame: simulate its children flowing with their baked gaps
+        const kids2 = (fig.kidsOf.get(kid) ?? []).map((k2) => fig.nodes.get(k2)).filter(Boolean) as any[];
+        if (kids2.length) {
+          const sorted = [...kids2].sort((a, b) => (a.transform?.m02 ?? 0) - (b.transform?.m02 ?? 0));
+          let cur = sorted[0].transform?.m02 ?? 0;
+          let end = cur;
+          for (const c2 of sorted) {
+            const bw2 = c2.size?.x ?? 0;
+            let ew2 = bw2;
+            if (c2.type === "INSTANCE") ew2 = Math.max(bw2, Math.round(extOf(c2)) + 16);
+            else if (c2.stackMode) ew2 = Math.max(bw2, estimateW(c2.guid ? guidStr(c2.guid) : ""));
+            if (c2 !== sorted[0]) cur = end + ((c2.transform?.m02 ?? 0) - ((sorted[sorted.indexOf(c2) - 1]?.transform?.m02 ?? 0) + (sorted[sorted.indexOf(c2) - 1]?.size?.x ?? 0)) + (sorted[sorted.indexOf(c2) - 1] === c2 ? 0 : 0));
+            cur = c2 === sorted[0] ? cur : end + Math.max(0, (c2.transform?.m02 ?? 0) - ((sorted[sorted.indexOf(c2) - 1]?.transform?.m02 ?? 0) + (sorted[sorted.indexOf(c2) - 1]?.size?.x ?? 0)));
+            end = cur + ew2;
+          }
+          w = Math.max(bakedW, Math.round(end) + (cn.stackPaddingRight ?? 0));
+        }
+      }
+      items.push({ cn, w, h: cn.size?.y ?? 24, bakedW });
+    }
+    if (items.length < 2) return;
+    const total = items.reduce((a, it) => a + it.w, 0) + spacing * (items.length - 1);
+    const t1 = items[1].cn.transform;
+    const bakedGap = t1 ? (horiz ? t1.m02 : t1.m12) - (horiz ? items[0].cn.transform?.m02 ?? 0 : items[0].cn.transform?.m12 ?? 0) - items[0].bakedW : 0;
+    const between = total < main - 2 * padMain - 12 && bakedGap > spacing * 3 + 8;
+    const overflow = items.some((it) => it.w > it.bakedW + 2);
+    if (!(overflow || (between && items.length === 2))) return;
+    let p = padMain;
+    items.forEach((it, i) => {
+      const t = it.cn.transform;
+      if (!t) return;
+      const last = i === items.length - 1;
+      const pos = between && (i === 0 || last)
+        ? last
+          ? main - padMain - it.w
+          : padMain
+        : p;
+      const cross = horiz ? (H - it.h) / 2 : (W - it.w) / 2;
+      it.cn.transform = horiz ? { ...t, m02: pos, m12: cross } : { ...t, m12: pos, m02: cross };
+      if (it.w !== it.bakedW && it.cn.size) it.cn.size = { ...it.cn.size, x: it.w };
+      p = pos + it.w + spacing;
+    });
+  };
 
   const walk = (
     id: string,
@@ -531,43 +652,21 @@ export function renderNodeSVG(
           if (node.swapSym && fig.nodes.has(node.swapSym)) {
             swapApplied = { newSym: node.swapSym };
             symId = node.swapSym;
-            if (node.textByKey.size && n.size) {
-              let tw = 0;
-              for (const glyphs of node.textByKey.values()) {
-                for (const gg of glyphs) tw = Math.max(tw, (gg.position?.x ?? 0) + (gg.fontSize ?? 16) * 0.6);
-              }
-              if (tw + 40 > n.size.x) {
-                n.size = { ...n.size, x: Math.round(tw + 40) };
-                w = Math.round(n.size.x);
-              }
-            }
           }
           if (symId) {
             childOverrideMap = buildSlotMap(n, symId, { dir: node, inheritedAssigns: new Map([...(dir?.assigns ?? [])]) });
             if (node) childDir = node;
+            applyStackLayout(symId, n, node);
           }
+        } else if (n.stackMode && dir) {
+          // frames inside an instance's component subtree only — doc-level
+          // stacks carry correct baked positions already
+          applyStackLayout(id, n, dir);
         }
         if (childOverrideMap && overrideMap && overrideMap.size) {
           const merged = new Map(childOverrideMap);
           for (const [k2, v2] of overrideMap) merged.set(k2, v2);
           childOverrideMap = merged;
-        }
-        // single-text instances whose binding was UPGRADED size to their text;
-        // right-hugging ones grow leftward (auto-layout right alignment)
-        if (n.type === "INSTANCE" && childOverrideMap && n.size && !resizedNodes.has(id)) {
-          const bounds = [...childOverrideMap.values()].filter((v) => !v?.hidden && v?.glyphs?.length && v?.upgraded);
-          if (bounds.length === 1) {
-            let tw = 0;
-            for (const gg of bounds[0].glyphs) tw = Math.max(tw, (gg.position?.x ?? 0) + (gg.fontSize ?? 16) * 0.6);
-            const want = Math.round(tw + 40);
-            if (want > n.size.x) {
-              resizedNodes.add(id);
-              const rightHugging = parentW !== undefined && parentW - (n.transform!.m02 + n.size.x) < 32;
-              if (rightHugging && n.transform) n.transform = { ...n.transform, m02: n.transform.m02 - (want - n.size.x) };
-              n.size = { ...n.size, x: want };
-              w = want;
-            }
-          }
         }
         if (depth < maxDepth && nodeCount < maxNodes) {
           let childIds = fig.kidsOf.get(id) ?? [];
