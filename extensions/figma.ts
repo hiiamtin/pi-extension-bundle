@@ -545,7 +545,7 @@ async function runParseLocalFig(args: unknown[], cwd = process.cwd()): Promise<T
           }
         }
       } catch (e) {
-        lines.push(`render (SVG) failed: ${e instanceof Error ? e.message : String(e)}`);
+        lines.push(`render (SVG) failed: ${e instanceof Error ? e.message : String(e)}\n${e instanceof Error && e.stack ? e.stack.split("\n").slice(1, 4).join("\n") : ""}`);
       }
     }
   } else {

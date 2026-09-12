@@ -149,6 +149,133 @@ function sniffImageMime(bytes: Uint8Array): string {
   return "application/octet-stream";
 }
 
+type AssignVal = { bool?: boolean; text?: string };
+type AssignMap = Map<string, AssignVal>;
+type DirNode = { swapSym?: string; assigns: AssignMap; textByKey: Map<string, any[]>; children: Map<string, DirNode> };
+type SlotBinding = {
+  glyphs?: any[];
+  fill?: string | undefined;
+  hidden?: boolean;
+  propText?: string;
+  upgraded?: boolean;
+};
+
+const newDirNode = (): DirNode => ({ assigns: new Map(), textByKey: new Map(), children: new Map() });
+
+/** flatten componentPropAssignments into defId -> {bool?, text?} */
+function assignMap(list: any[] | undefined): AssignMap {
+  const m: AssignMap = new Map();
+  for (const a of list ?? []) {
+    const defId = a?.defID ? guidStr(a.defID) : null;
+    if (!defId) continue;
+    const bool = a?.varValue?.value?.boolValue ?? a?.value?.boolValue;
+    const text = a?.value?.textValue?.characters ?? a?.varValue?.value?.textDataValue?.characters;
+    m.set(defId, { bool: typeof bool === "boolean" ? bool : undefined, text: typeof text === "string" ? text : undefined });
+  }
+  return m;
+}
+
+function nodeVisibleRefs(n: RawChange): string[] {
+  return (n.componentPropRefs ?? [])
+    .filter((r: any) => r?.componentPropNodeField === "VISIBLE")
+    .map((r: any) => guidStr(r.defID))
+    .filter(Boolean) as string[];
+}
+
+function nodeTextRef(n: RawChange): string | null {
+  const r = (n.componentPropRefs ?? []).find((r: any) => r?.componentPropNodeField === "TEXT_DATA");
+  return r ? guidStr(r.defID) : null;
+}
+
+const guidPathOf = (d: any): string[] => ((d?.guidPath?.guids ?? []).map(guidStr).filter(Boolean)) as string[];
+const okeyOf = (n: RawChange): string | null => {
+  const o = n.overrideKey;
+  return o ? `${o.sessionID}:${o.localID}` : null;
+};
+
+/**
+ * Directive tree for one instance: symbolOverrides / derivedSymbolData paths
+ * are addressed by overrideKey chains ([childKey, grandKey, ..., textGuid]),
+ * so every node in the tree addresses exactly one descendant — no heuristics.
+ */
+function buildDirectiveTree(instance: RawChange): DirNode {
+  const root = newDirNode();
+  const ensure = (keys: string[]): DirNode => {
+    let cur = root;
+    for (const k of keys) {
+      let c = cur.children.get(k);
+      if (!c) {
+        c = newDirNode();
+        cur.children.set(k, c);
+      }
+      cur = c;
+    }
+    return cur;
+  };
+  for (const o of instance.symbolData?.symbolOverrides ?? []) {
+    const path = guidPathOf(o);
+    if (!path.length) continue;
+    const node = ensure(path);
+    for (const [k, v] of assignMap(o.componentPropAssignments)) node.assigns.set(k, v);
+    const sw = guidStr(o.overriddenSymbolID);
+    if (sw) node.swapSym = sw;
+  }
+  for (const d of instance.derivedSymbolData ?? []) {
+    const glyphs = d.derivedTextData?.glyphs ?? [];
+    if (!glyphs.length) continue;
+    const path = guidPathOf(d);
+    if (!path.length) continue;
+    const node = ensure(path);
+    const last = path[path.length - 1];
+    const prev = node.textByKey.get(last);
+    if (!prev || glyphs.length > prev.length) node.textByKey.set(last, glyphs);
+  }
+  return root;
+}
+
+/** merge ancestor directive over own tree: ancestor wins per key, deeper
+ * children merge recursively; text runs keep the LONGER (more composed) */
+function mergeDir(anc: DirNode | undefined, own: DirNode): DirNode {
+  if (!anc) return own;
+  const out: DirNode = { swapSym: anc.swapSym ?? own.swapSym, assigns: new Map([...own.assigns, ...anc.assigns]), textByKey: new Map(own.textByKey), children: new Map() };
+  const keys = new Set([...own.children.keys(), ...anc.children.keys()]);
+  for (const k of keys) {
+    const o = own.children.get(k);
+    const a = anc.children.get(k);
+    if (o && a) {
+      const textByKey = new Map(o.textByKey);
+      for (const [gk, gv] of a.textByKey) {
+        const prev = textByKey.get(gk);
+        if (!prev || gv.length > prev.length) textByKey.set(gk, gv);
+      }
+      out.children.set(k, { swapSym: a.swapSym ?? o.swapSym, assigns: new Map([...o.assigns, ...a.assigns]), textByKey, children: mergeDirChildren(a.children, o.children) });
+    } else {
+      out.children.set(k, (a ?? o)!);
+    }
+  }
+  return out;
+}
+
+function mergeDirChildren(anc: Map<string, DirNode>, own: Map<string, DirNode>): Map<string, DirNode> {
+  const out: Map<string, DirNode> = new Map();
+  const keys = new Set([...own.keys(), ...anc.keys()]);
+  for (const k of keys) {
+    const o = own.get(k);
+    const a = anc.get(k);
+    if (o && a) {
+      const textByKey = new Map(o.textByKey);
+      for (const [gk, gv] of a.textByKey) {
+        const prev = textByKey.get(gk);
+        if (!prev || gv.length > prev.length) textByKey.set(gk, gv);
+      }
+      out.set(k, { swapSym: a.swapSym ?? o.swapSym, assigns: new Map([...o.assigns, ...a.assigns]), textByKey, children: mergeDirChildren(a.children, o.children) });
+    } else {
+      out.set(k, (a ?? o)!);
+    }
+  }
+  return out;
+}
+
 export function renderNodeSVG(
   doc: any,
   fig: MergedFig,
@@ -159,6 +286,7 @@ export function renderNodeSVG(
   const maxNodes = Math.max(50, opts?.maxNodes ?? 4000);
   const warnings: string[] = [];
   let nodeCount = 0;
+  const resizedNodes = new Set<string>();
   let clipSeq = 0;
   let gradSeq = 0;
   const defs: string[] = [];
@@ -179,25 +307,28 @@ export function renderNodeSVG(
     return s && w > 0 ? ` stroke="${s}" stroke-width="${r(w)}"` : "";
   };
 
-  // walk the component subtree of an instance and pair every TEXT slot with
-  // its symbolOverride text (derived entries dedupe by fontSize+length; pair
-  // within each fontSize group by document order — verified against a live
-  // file: title/label/placeholder/description all mapped correctly).
-  // Pair an instance's symbolOverrides-derived text entries with TEXT slots.
-  // Handles: direct slots (fontSize + document-order pairing), stale "*" runs
-  // repositioned after the preceding text, variant-hidden slots (below the
-  // instance's bottom edge), and overrides that target TEXT inside nested
-  // sub-instances (matched by rendered width vs the sub-instance's width).
+  type SlotBinding = {
+    glyphs?: any[];
+    fill?: string | undefined;
+    hidden?: boolean;
+    propText?: string;
+    upgraded?: boolean;
+    lastGuid?: string;
+  };
+
+  type Ctx = { dir: DirNode };
+
   function buildSlotMap(
     instance: RawChange,
     symId: string,
-    opts?: { swapEntries?: any[][]; ancTextByGuid?: Map<string, { glyphs: any[]; count: number }> },
-  ): Map<string, { glyphs: any[]; fill: string | undefined; hidden?: boolean }> {
-    const map = new Map<string, { glyphs: any[]; fill: string | undefined; hidden?: boolean }>();
+    opts?: { dir?: DirNode; inheritedAssigns?: AssignMap },
+  ): Map<string, SlotBinding> {
+    const map = new Map<string, SlotBinding>();
     const instW = instance.size?.x ?? Infinity;
     const instH = instance.size?.y ?? Infinity;
+    const dir = opts?.dir ?? newDirNode();
 
-    type Slot = { id: string; fs: number; len: number; fill: string | undefined; chars: string; parentId: string; nodeX: number; bottom: number; order: number };
+    type Slot = { id: string; fs: number; fill: string | undefined; chars: string; parentId: string; nodeX: number; bottom: number; order: number; okey: string | null; textRef: string | null; visRefs: string[] };
     const slots: Slot[] = [];
     let order = 0;
     (function collect(cid: string, depth: number, parentId: string, ty: number): void {
@@ -210,117 +341,126 @@ export function renderNodeSVG(
           slots.push({
             id: kid,
             fs: k.fontSize ?? 14,
-            len: (k.textData?.characters ?? "").length,
             fill: paintInfo(k.fillPaints).fill,
             chars: k.textData?.characters ?? "",
             parentId,
             nodeX: k.transform?.m02 ?? 0,
             bottom: kTy + (k.size?.y ?? 0),
             order: order++,
+            okey: okeyOf(k),
+            textRef: nodeTextRef(k),
+            visRefs: nodeVisibleRefs(k),
           });
         }
         collect(kid, depth + 1, kid, kTy);
       }
     })(symId, 0, symId, 0);
 
-    const derived: Array<{ fs: number; len: number; glyphs: any[]; lastGuid?: string }> = [];
-    const seenKey = new Set<string>();
+    const assigns: AssignMap = new Map([...(opts?.inheritedAssigns ?? []), ...dir.assigns]);
+    const ownByGuid = new Map<string, any[]>();
     for (const d of instance.derivedSymbolData ?? []) {
       const glyphs = d.derivedTextData?.glyphs ?? [];
       if (!glyphs.length) continue;
-      const fs = glyphs[0]?.fontSize ?? 14;
-      const len = d.derivedTextData?.baselines?.[0]?.endCharacter ?? -1;
-      const key = `${fs}|${len}`;
-      if (seenKey.has(key)) continue;
-      seenKey.add(key);
-      const path = (d.guidPath?.guids ?? []).map(guidStr).filter(Boolean) as string[];
-      derived.push({ fs, len, glyphs, lastGuid: path[path.length - 1] });
+      const path = guidPathOf(d);
+      const last = path[path.length - 1];
+      if (!last) continue;
+      const prev = ownByGuid.get(last);
+      if (!prev || glyphs.length > prev.length) ownByGuid.set(last, glyphs);
     }
 
-    const byFsSlots = new Map<number, Slot[]>();
-    for (const s of slots) {
-      if (!byFsSlots.has(s.fs)) byFsSlots.set(s.fs, []);
-      byFsSlots.get(s.fs)!.push(s);
-    }
-    const byFsDerived = new Map<number, typeof derived>();
-    for (const d of derived) {
-      if (!byFsDerived.has(d.fs)) byFsDerived.set(d.fs, []);
-      byFsDerived.get(d.fs)!.push(d);
-    }
-    const boundBySlot = new Map<string, { glyphs: any[]; fill: string | undefined; lastGuid?: string }>();
-    // symbol-swap entries (ancestor swapped this instance's component) bind first
+    const boundBySlot = new Map<string, SlotBinding>();
     const locked = new Set<string>();
-    if (opts?.swapEntries) {
-      const swapDerived = opts.swapEntries
-        .map((glyphs) => ({ fs: glyphs[0]?.fontSize ?? 14, glyphs }))
-        .sort((a, b) => a.fs - b.fs);
+    // swapped-component runs pair by fontSize/order (their guids belong to the
+    // swapped variant's library space)
+    const swapRuns = [...dir.textByKey.values()].sort((a, b) => (a[0]?.fontSize ?? 14) - (b[0]?.fontSize ?? 14));
+    if (swapRuns.length) {
       const free = slots.filter((sl) => sl.bottom <= instH + 0.5);
-      for (const sd of swapDerived) {
-        const cand = free.find((sl) => !locked.has(sl.id) && sl.fs === sd.fs);
+      for (const glyphs of swapRuns) {
+        const fs = glyphs[0]?.fontSize ?? 14;
+        const cand = free.find((sl) => !locked.has(sl.id) && sl.fs === fs);
         if (cand) {
           locked.add(cand.id);
-          boundBySlot.set(cand.id, { glyphs: sd.glyphs, fill: cand.fill });
+          boundBySlot.set(cand.id, { glyphs, fill: cand.fill, upgraded: true });
         }
       }
     }
-    for (const [fs, ds] of byFsDerived) {
-      const ss = (byFsSlots.get(fs) ?? []).filter((sl) => sl.bottom <= instH + 0.5 && !locked.has(sl.id)); // variant-hidden slots sit below the instance bottom
-      const n = Math.min(ds.length, ss.length);
-      for (let i = 0; i < n; i++) {
-        const path = (ds[i] as any).lastGuid as string | undefined;
-        boundBySlot.set(ss[i].id, { glyphs: ds[i].glyphs, fill: ss[i].fill, lastGuid: path });
-      }
-    }
-    // hide variant-hidden TEXT slots so their component default text never shows
+    // authoritative: slot overrideKey -> own derived run
     for (const sl of slots) {
-      if (sl.bottom > instH + 0.5 && !boundBySlot.has(sl.id)) {
-        map.set(sl.id, { glyphs: [], fill: sl.fill, hidden: true });
+      if (locked.has(sl.id) || sl.bottom > instH + 0.5) continue;
+      const run = sl.okey ? ownByGuid.get(sl.okey) : undefined;
+      if (run) {
+        locked.add(sl.id);
+        boundBySlot.set(sl.id, { glyphs: run, fill: sl.fill, upgraded: false });
       }
     }
-    // a stale "*" run lands mid-word (its position predates the override);
-    // follow the preceding bound text run's rendered width instead
+    // variant-hidden: VISIBLE prop false, or slot past the instance bottom
+    for (const sl of slots) {
+      let propHidden = false;
+      for (const ref of sl.visRefs) {
+        const a = assigns.get(ref);
+        if (a && a.bool === false) propHidden = true;
+      }
+      if (propHidden && boundBySlot.has(sl.id)) {
+        boundBySlot.delete(sl.id);
+        map.set(sl.id, { glyphs: [], fill: sl.fill, hidden: true });
+      } else if (propHidden || sl.bottom > instH + 0.5) {
+        if (!boundBySlot.has(sl.id)) map.set(sl.id, { glyphs: [], fill: sl.fill, hidden: true });
+      }
+    }
+    // a stale "*" run lands mid-word; follow the preceding text run's width
     for (const sl of slots) {
       if (sl.chars !== "*" || !boundBySlot.has(sl.id)) continue;
       const prev = slots.filter((p) => p.parentId === sl.parentId && p.order < sl.order && p.chars !== "*").pop();
       const prevBound = prev ? boundBySlot.get(prev.id) : undefined;
+      let prevEnd = 0;
       if (prev && prevBound && prevBound.glyphs.length) {
-        let prevEnd = 0;
-        for (const g of prevBound.glyphs) prevEnd = Math.max(prevEnd, (g.position?.x ?? 0) + (g.fontSize ?? prev.fs) * 0.55);
-        const shifted = boundBySlot.get(sl.id)!.glyphs.map((g) => ({ ...g, position: { ...g.position, x: prevEnd + prev.fs * 0.25 - sl.nodeX } }));
-        boundBySlot.set(sl.id, { ...boundBySlot.get(sl.id)!, glyphs: shifted });
-      }
+        for (const gg of prevBound.glyphs) prevEnd = Math.max(prevEnd, (gg.position?.x ?? 0) + (gg.fontSize ?? prev.fs) * 0.55);
+      } else if (prev) {
+        const pb = map.get(prev.id);
+        prevEnd = prev.nodeX + (pb?.propText ?? prev.chars).length * prev.fs * 0.55;
+      } else continue;
+      const shifted = boundBySlot.get(sl.id)!.glyphs.map((gg) => ({ ...gg, position: { ...gg.position, x: prevEnd + prev.fs * 0.25 - sl.nodeX } }));
+      boundBySlot.set(sl.id, { ...boundBySlot.get(sl.id)!, glyphs: shifted });
     }
-    // Rule A: when an ancestor instance carries a LONGER derived run for the
-    // same library text guid, its composed layout is the final one (sub caches
-    // can be stale mid-edit snapshots)
-    if (opts?.ancTextByGuid) {
-      for (const [id2, v] of boundBySlot) {
-        if (!v.lastGuid) continue;
-        const anc = opts.ancTextByGuid.get(v.lastGuid);
-        // only when exactly one descendant claims that guid — components
-        // reused by several sibling instances would cross-bind otherwise
-        if (anc && anc.count === 1 && anc.glyphs.length > v.glyphs.length) boundBySlot.set(id2, { ...v, glyphs: anc.glyphs });
+    // prop-driven texts (TEXT_DATA assignments) carry the CURRENT content;
+    // cached derived glyph runs can predate the edit (stale counts). When the
+    // prop text length differs from the bound run, the prop text wins.
+    for (const sl of slots) {
+      const textRef = sl.textRef;
+      if (!textRef) continue;
+      const prop = assigns.get(textRef)?.text;
+      if (!prop) continue;
+      const bound = boundBySlot.get(sl.id);
+      if (bound && bound.glyphs.length === prop.length) continue;
+      boundBySlot.set(sl.id, { fill: sl.fill, propText: prop, upgraded: !!bound });
+    }
+    for (const sl of slots) {
+      if (map.has(sl.id)) continue;
+      const textRef = sl.textRef;
+      if (textRef && assigns.get(textRef)?.text && !boundBySlot.has(sl.id)) {
+        map.set(sl.id, { fill: sl.fill, propText: assigns.get(textRef)!.text });
       }
     }
     for (const [id, v] of boundBySlot) map.set(id, v);
-
     return map;
   }
 
-  type AncCtx = { textByGuid: Map<string, any[]>; swaps: Map<string, { newSym: string; textEntries: any[][] }> };
-  const walk = (id: string, depth: number, noText: boolean, overrideMap?: Map<string, { glyphs: any[]; fill: string | undefined; hidden?: boolean }>, ctx?: AncCtx): string => {
+  const walk = (
+    id: string,
+    depth: number,
+    noText: boolean,
+    overrideMap?: Map<string, SlotBinding>,
+    dir?: DirNode,
+    parentW?: number,
+  ): string => {
     if (depth > maxDepth || nodeCount >= maxNodes) return "";
     const n = fig.nodes.get(id);
     if (!n || n.visible === false) return "";
     nodeCount++;
 
-    // the ROOT node's own placement transform is ignored: its local space IS
-    // the canvas (children are already relative to it)
     const t = n.transform ?? { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0 };
     const tf = depth === 0 ? "" : ` transform="matrix(${r(t.m00)},${r(t.m10)},${r(t.m01)},${r(t.m11)},${r(t.m02)},${r(t.m12)})"`;
     const opacity = typeof n.opacity === "number" && n.opacity < 1 ? ` opacity="${r(n.opacity)}"` : "";
-    let w = n.size ? Math.round(n.size.x) : 0;
-    let h = n.size ? Math.round(n.size.y) : 0;
     const { fill, fillOpacity, imageHash, stops } = paintInfo(n.fillPaints);
     let gradient = "";
     if (stops) {
@@ -334,13 +474,17 @@ export function renderNodeSVG(
       );
       gradient = `url(#${gid})`;
     }
+    let w = n.size ? Math.round(n.size.x) : 0;
+    let h = n.size ? Math.round(n.size.y) : 0;
+
     switch (n.type) {
       case "TEXT": {
         const bound = overrideMap?.get(id);
         if (bound?.hidden) return "";
         const fillHere = bound?.fill ?? fill ?? "#1a152b";
-        void fillHere;
-        const glyphs = bound?.glyphs ?? (noText ? null : n.derivedTextData?.glyphs);
+        // a resolved binding (even glyph-less, e.g. prop-text) suppresses the
+        // node's own stale cached run
+        const glyphs = bound ? bound.glyphs : noText ? null : n.derivedTextData?.glyphs;
         if (glyphs && glyphs.length) {
           let runs = "";
           for (const g of glyphs) {
@@ -350,6 +494,14 @@ export function renderNodeSVG(
           }
           if (runs) return `<g${tf}>${runs}</g>`;
         }
+        const propText = bound?.propText;
+        if (propText) {
+          const fs = n.fontSize ?? 14;
+          const family = n.fontName?.family ?? "Inter";
+          const align = n.textAlignHorizontal === "CENTER" ? ' text-anchor="middle"' : n.textAlignHorizontal === "RIGHT" ? ' text-anchor="end"' : "";
+          const x = n.textAlignHorizontal === "CENTER" ? w / 2 : n.textAlignHorizontal === "RIGHT" ? w : 0;
+          return `<text${tf} x="${r(x)}" y="${r(fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillHere}"${align}>${esc(propText)}</text>`;
+        }
         if (noText) return "";
         const fs = n.fontSize ?? 14;
         const chars = n.textData?.characters ?? "";
@@ -358,8 +510,7 @@ export function renderNodeSVG(
         const align = n.textAlignHorizontal === "CENTER" ? ' text-anchor="middle"' : n.textAlignHorizontal === "RIGHT" ? ' text-anchor="end"' : "";
         const x = n.textAlignHorizontal === "CENTER" ? w / 2 : n.textAlignHorizontal === "RIGHT" ? w : 0;
         const y = r(fs * 0.8);
-        const tf2 = fill ?? "#1a152b";
-        return `<text x="${r(x)}" y="${y}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${tf2}"${align}>${esc(chars)}</text>`;
+        return `<text${tf} x="${r(x)}" y="${y}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillHere}"${align}>${esc(chars)}</text>`;
       }
       case "FRAME":
       case "SECTION":
@@ -368,164 +519,72 @@ export function renderNodeSVG(
       case "GROUP":
       case "INSTANCE": {
         let childrenSvg = "";
-        let glyphSvg = "";
-        let childOverrideMap: Map<string, { glyphs: any[]; fill: string | undefined; hidden?: boolean }> | undefined;
+        let childOverrideMap: Map<string, SlotBinding> | undefined;
         let swapApplied: { newSym: string } | undefined;
+        let childDir: DirNode | undefined;
         if (n.type === "INSTANCE") {
-          // instance internals are not materialized — render the component's
-          // own subtree under the instance transform, with override texts
-          // bound to their text slots (fontSize + document order pairing)
-          const swap = ctx?.swaps.get(id);
+          const okey = okeyOf(n);
+          const ancNode = dir?.children.get(okey ?? "");
+          const ownTree = buildDirectiveTree(n);
+          const node = mergeDir(ancNode, ownTree);
           let symId = guidStr(n.symbolData?.symbolID);
-          // ancestor swapped this instance's component (e.g. secondary ->
-          // danger variant): render the swapped component instead
-          if (swap && swap.newSym && fig.nodes.has(swap.newSym)) {
-            swapApplied = { newSym: swap.newSym };
-            symId = swap.newSym;
-            if (swap.textEntries.length && n.size) {
+          if (node.swapSym && fig.nodes.has(node.swapSym)) {
+            swapApplied = { newSym: node.swapSym };
+            symId = node.swapSym;
+            if (node.textByKey.size && n.size) {
               let tw = 0;
-              for (const glyphs of swap.textEntries) {
+              for (const glyphs of node.textByKey.values()) {
                 for (const gg of glyphs) tw = Math.max(tw, (gg.position?.x ?? 0) + (gg.fontSize ?? 16) * 0.6);
               }
-              n.size = { ...n.size, x: Math.max(n.size.x, tw + 40) };
+              if (tw + 40 > n.size.x) {
+                n.size = { ...n.size, x: Math.round(tw + 40) };
+                w = Math.round(n.size.x);
+              }
             }
           }
-          if (symId) childOverrideMap = buildSlotMap(n, symId, { swapEntries: swap?.textEntries, ancTextByGuid: ctx?.textByGuid });
-          if (swapApplied && n.size) {
-            w = Math.round(n.size.x);
-            h = Math.round(n.size.y);
+          if (symId) {
+            childOverrideMap = buildSlotMap(n, symId, { dir: node, inheritedAssigns: new Map([...(dir?.assigns ?? [])]) });
+            if (node) childDir = node;
           }
         }
-        // ancestor bindings win over this instance's own (their derived data
-        // reflects the final composed layout; sub-instance caches can be stale)
         if (childOverrideMap && overrideMap && overrideMap.size) {
           const merged = new Map(childOverrideMap);
           for (const [k2, v2] of overrideMap) merged.set(k2, v2);
           childOverrideMap = merged;
         }
-        // single-text instances (buttons) size to their text: an override can
-        // be longer than the stale cached width allowed
-        if (n.type === "INSTANCE" && childOverrideMap && n.size) {
-          const bounds = [...childOverrideMap.values()].filter((v) => !v.hidden && v.glyphs.length);
+        // single-text instances whose binding was UPGRADED size to their text;
+        // right-hugging ones grow leftward (auto-layout right alignment)
+        if (n.type === "INSTANCE" && childOverrideMap && n.size && !resizedNodes.has(id)) {
+          const bounds = [...childOverrideMap.values()].filter((v) => !v?.hidden && v?.glyphs?.length && v?.upgraded);
           if (bounds.length === 1) {
             let tw = 0;
             for (const gg of bounds[0].glyphs) tw = Math.max(tw, (gg.position?.x ?? 0) + (gg.fontSize ?? 16) * 0.6);
-            if (tw + 40 > n.size.x) {
-              n.size = { ...n.size, x: Math.round(tw + 40) };
-              w = Math.round(n.size.x);
+            const want = Math.round(tw + 40);
+            if (want > n.size.x) {
+              resizedNodes.add(id);
+              const rightHugging = parentW !== undefined && parentW - (n.transform!.m02 + n.size.x) < 32;
+              if (rightHugging && n.transform) n.transform = { ...n.transform, m02: n.transform.m02 - (want - n.size.x) };
+              n.size = { ...n.size, x: want };
+              w = want;
             }
           }
-        }
-        // ancestor context for descendants: my derived runs keyed by library
-        // text guid (descendants sharing that guid get the longer run), plus
-        // symbol-swap directives resolved to concrete child instance ids
-        let childCtx: AncCtx | undefined;
-        if (n.type === "INSTANCE") {
-          const symId0 = guidStr(n.symbolData?.symbolID);
-          // count how many distinct child instances claim each library text guid
-          const claims = new Map<string, Set<string>>();
-          (function countClaims(cid: string, d2: number): void {
-            if (d2 > 6) return;
-            for (const kid of fig.kidsOf.get(cid) ?? []) {
-              const k = fig.nodes.get(kid);
-              if (!k || k.visible === false) continue;
-              if (k.type === "INSTANCE") {
-                for (const d of k.derivedSymbolData ?? []) {
-                  const gl = d.derivedTextData?.glyphs ?? [];
-                  if (!gl.length) continue;
-                  const p = (d.guidPath?.guids ?? []).map(guidStr).filter(Boolean) as string[];
-                  const last = p[p.length - 1];
-                  if (!last) continue;
-                  if (!claims.has(last)) claims.set(last, new Set());
-                  claims.get(last)!.add(kid);
-                }
-                // claims made by nodes inside the sub-instance's component
-                const kSym = guidStr(k.symbolData?.symbolID);
-                if (kSym) countClaims(kSym, d2 + 1);
-              } else {
-                countClaims(kid, d2 + 1);
-              }
-            }
-          })(symId0!, 0);
-          const textByGuid = new Map<string, { glyphs: any[]; count: number }>(ctx?.textByGuid ?? []);
-          for (const d of n.derivedSymbolData ?? []) {
-            const glyphs = d.derivedTextData?.glyphs ?? [];
-            if (!glyphs.length) continue;
-            const path = (d.guidPath?.guids ?? []).map(guidStr).filter(Boolean) as string[];
-            const last = path[path.length - 1];
-            if (!last) continue;
-            const prev = textByGuid.get(last);
-            if (!prev || glyphs.length > prev.glyphs.length) textByGuid.set(last, { glyphs, count: claims.get(last)?.size ?? 0 });
-          }
-          let swaps: Map<string, { newSym: string; textEntries: any[][] }> | undefined;
-          for (const o of n.symbolData?.symbolOverrides ?? []) {
-            const sw = guidStr(o.overriddenSymbolID);
-            if (!sw || !symId0) continue;
-            // a child sub-instance is "claimed" when it overrides the same
-            // library text node I have a composed run for
-            const claimed = new Set<string>();
-            (function findChildren(cid: string, d2: number): void {
-              if (d2 > 6) return;
-              for (const kid of fig.kidsOf.get(cid) ?? []) {
-                const k = fig.nodes.get(kid);
-                if (!k || k.visible === false) continue;
-                if (k.type === "INSTANCE") {
-                  for (const d of k.derivedSymbolData ?? []) {
-                    const gl = d.derivedTextData?.glyphs ?? [];
-                    if (!gl.length) continue;
-                    const p = (d.guidPath?.guids ?? []).map(guidStr).filter(Boolean) as string[];
-                    const last = p[p.length - 1];
-                    if (last && textByGuid.has(last)) {
-                      claimed.add(kid);
-                      return;
-                    }
-                  }
-                }
-                findChildren(kid, d2 + 1);
-              }
-            })(symId0, 0);
-            // target: first unclaimed instance descendant (doc order)
-            let target: string | undefined;
-            (function findTarget(cid: string, d2: number): void {
-              if (target || d2 > 6) return;
-              for (const kid of fig.kidsOf.get(cid) ?? []) {
-                const k = fig.nodes.get(kid);
-                if (!k || k.visible === false) continue;
-                if (k.type === "INSTANCE" && !claimed.has(kid)) {
-                  target = kid;
-                  return;
-                }
-                findTarget(kid, d2 + 1);
-              }
-            })(symId0, 0);
-            if (target) {
-              const first = guidStr(o.guidPath?.guids?.[0]);
-              const textEntries = (n.derivedSymbolData ?? [])
-                .filter((d) => guidStr(d.guidPath?.guids?.[0]) === first && d.derivedTextData?.glyphs?.length)
-                .map((d) => d.derivedTextData.glyphs);
-              (swaps ??= new Map()).set(target, { newSym: sw, textEntries });
-            }
-          }
-          if (textByGuid.size || swaps) childCtx = { textByGuid, swaps: swaps ?? new Map() };
         }
         if (depth < maxDepth && nodeCount < maxNodes) {
           let childIds = fig.kidsOf.get(id) ?? [];
           if (n.type === "INSTANCE" && childIds.length === 0) {
-            const symId = swapApplied?.newSym ?? guidStr(n.symbolData?.symbolID);
+            const symId = swapApplied?.newSym ?? symId0Of(n);
             if (symId) childIds = fig.kidsOf.get(symId) ?? [];
           }
+          const kidDir = n.type === "INSTANCE" ? (childDir ?? dir) : dir;
           for (const kid of childIds) {
-            // bound slots render their override glyphs; unbound slots keep
-            // the component default text — no blanket suppression
-            childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, childCtx ?? (ctx ? { textByGuid: ctx.textByGuid, swaps: new Map() } : undefined));
+            childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w);
           }
         }
 
         let inner = childrenSvg;
         // instances ALWAYS clip: component subtrees carry variant sections
-        // (labels/descriptions of other states) outside the instance box that
-        // the live design never shows
-        const clips = n.type === "INSTANCE" || (n.type === "FRAME" && n.clipsContent === true); // frames: Figma UI default is NO clip
+        // outside the instance box that the live design never draws
+        const clips = n.type === "INSTANCE" || (n.type === "FRAME" && n.clipsContent === true);
         if (clips && inner && w > 0 && h > 0) {
           const cid = `clip${clipSeq++}`;
           defs.push(`<clipPath id="${cid}"><rect x="0" y="0" width="${w}" height="${h}"/></clipPath>`);
@@ -534,13 +593,17 @@ export function renderNodeSVG(
         let bg = "";
         let paint = gradient || (fill && n.type !== "GROUP" ? fill : undefined);
         if (swapApplied) {
-          // the variant component carries the visual identity (e.g. danger
-          // red); the copy instance's own fills are stale pre-swap values
+          // the variant component carries the visual identity (e.g. danger red)
           const comp = fig.nodes.get(swapApplied.newSym);
           const ci = comp ? paintInfo(comp.fillPaints) : null;
           if (ci?.fill) paint = ci.fill;
         }
-        if (paint && w > 0 && h > 0) bg = `<rect x="0" y="0" width="${w}" height="${h}" fill="${paint}"${fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : ""}/>`;
+        const bgFo = fill && fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : "";
+        const rad = n.cornerRadius ?? n.rectangleTopLeftCornerRadius ?? 0;
+        const rxAttr = rad ? ` rx="${r(rad)}"` : "";
+        if (paint || strokeText(n) || (rad && n.type !== "GROUP")) {
+          bg = `<rect x="0" y="0" width="${w}" height="${h}" fill="${paint ?? "none"}"${bgFo}${rxAttr}${strokeText(n)}/>`;
+        }
         let img = "";
         if (imageHash && w > 0 && h > 0) {
           const bytes = images.get(imageHash);
@@ -551,7 +614,6 @@ export function renderNodeSVG(
             warnings.push(`image ${imageHash} not found in doc.images`);
           }
         }
-        void glyphSvg;
         return `<g${tf}${opacity}>${bg}${img}${inner}</g>`;
       }
       case "RECTANGLE":
@@ -593,6 +655,10 @@ export function renderNodeSVG(
         return "";
     }
   };
+
+  function symId0Of(n: RawChange): string | null {
+    return guidStr(n.symbolData?.symbolID);
+  }
 
   const inner = walk(rootId, 0, false);
 
