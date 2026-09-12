@@ -112,6 +112,18 @@ const btn = (header?.children ?? []).find((c) => c.type === "INSTANCE" && c.name
 assert(!!btn && btn.component === "Size=M, Type=Tertiary, Background?=No", "nested instance inside component resolved (recursion)", JSON.stringify(btn));
 assert(header.propTexts?.[0] === "Save", "componentPropAssignments text captured", JSON.stringify(header?.propTexts));
 
+// ---------- 5. SVG renderer ----------
+const { renderNodeSVG } = await import(
+  path.join(path.dirname(path.dirname(new URL(import.meta.url).pathname)), "lib", "figma-svg-renderer.ts")
+);
+const stubDoc = { images: new Map() }; // no VECTOR nodes → blob helpers never called
+const svgRes = renderNodeSVG(stubDoc, doc, "470:25675");
+assert(!!svgRes && svgRes.svg.startsWith("<svg"), "renderer produces SVG");
+assert(svgRes.svg.includes('width="600"'), "root size drives viewBox", svgRes.svg.slice(0, 120));
+assert(svgRes.svg.includes("Full screen modal"), "instance component default text rendered");
+assert(svgRes.svg.includes('fill="#ffffff"'), "solid fills rendered");
+assert(svgRes.nodeCount >= 3, "renderer walked the subtree", String(svgRes.nodeCount));
+
 // ---------- summary ----------
 console.log(`\nfigma-resolver: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

@@ -44,6 +44,7 @@ import { parseFig } from "openfig-core";
 import { guidStr, mergeNodeChanges, resolveSubtree } from "../lib/figma-instance-resolver.ts";
 import type { ResolvedNode } from "../lib/figma-instance-resolver.ts";
 import { matchFigFiles, parseFigmaUrl } from "../lib/figma-link.ts";
+import { renderNodeSVG } from "../lib/figma-svg-renderer.ts";
 import { startBridgeServer } from "../lib/figma-bridge-server.ts";
 import type { BridgeHandle } from "../lib/figma-bridge-server.ts";
 import { FigmaExportStore } from "../lib/figma-export-store.ts";
@@ -526,6 +527,27 @@ async function runParseLocalFig(args: unknown[], cwd = process.cwd()): Promise<T
         ? "\n…truncated (raise max_json_chars or lower depth)"
         : "\n(instance texts are the REAL rendered values: symbolOverrides + componentPropAssignments)",
     );
+
+    // offline SVG render (structure/shapes/images; text via local fonts)
+    if (params.svg !== false) {
+      try {
+        const render = renderNodeSVG(doc, fig, rootId, { maxDepth: maxDepth + 4 });
+        if (render) {
+          const renderDir = path.join(assetsDir, "render");
+          mkdirSync(renderDir, { recursive: true });
+          const svgPath = path.join(renderDir, `${rootId.replace(":", "-")}.svg`);
+          writeFileSync(svgPath, render.svg);
+          lines.push(
+            `render (SVG) → ${svgPath} (${render.width}x${render.height}, ${render.nodeCount} nodes drawn)`,
+          );
+          if (render.warnings.length) {
+            lines.push(`  render warnings: ${render.warnings.slice(0, 5).join(" | ")}`);
+          }
+        }
+      } catch (e) {
+        lines.push(`render (SVG) failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
   } else {
     lines.push(
       `\ntop-level frames (${topLevel.length}):` +
@@ -708,6 +730,7 @@ export default function (pi: ExtensionAPI): void {
       frame: Type.Optional(Type.String({ description: "Top-level frame name (substring, case-insensitive) when no node is given." })),
       depth: Type.Optional(Type.Number({ description: "Subtree depth limit (default 10, max 14)." })),
       max_json_chars: Type.Optional(Type.Number({ description: "Output character budget (default 20000, max 80000)." })),
+      svg: Type.Optional(Type.Boolean({ description: "Also render the resolved node to an SVG file under assets (default true)." })),
       embed: Type.Optional(Type.Boolean({ description: "Embed the page thumbnail inline (default true)." })),
     }),
     execute: async (...args: unknown[]) => runParseLocalFig(args, callCwd(args)),
