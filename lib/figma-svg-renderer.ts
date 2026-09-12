@@ -13,7 +13,7 @@
 //
 // Pure Node + openfig-core — unit-testable with synthetic documents.
 
-import { resolveVectorNodePaths } from "openfig-core";
+import { geometryBlobToSVGPath, getBlobBytes, resolveVectorNodePaths } from "openfig-core";
 import type { MergedFig } from "./figma-instance-resolver.ts";
 import { guidStr } from "./figma-instance-resolver.ts";
 
@@ -91,6 +91,7 @@ export function renderNodeSVG(
   const warnings: string[] = [];
   let nodeCount = 0;
   let clipSeq = 0;
+  let gradSeq = 0;
   const defs: string[] = [];
   const images = doc.images as Map<string, Uint8Array>;
 
@@ -109,21 +110,76 @@ export function renderNodeSVG(
     return s && w > 0 ? ` stroke="${s}" stroke-width="${r(w)}"` : "";
   };
 
-  const walk = (id: string, depth: number): string => {
+  // walk the component subtree of an instance and pair every TEXT slot with
+  // its symbolOverride text (derived entries dedupe by fontSize+length; pair
+  // within each fontSize group by document order — verified against a live
+  // file: title/label/placeholder/description all mapped correctly).
+  function buildSlotMap(instance: RawChange, symId: string): Map<string, { glyphs: any[]; fill: string | undefined }> {
+    const slots: Array<{ id: string; fs: number; len: number; fill: string | undefined }> = [];
+    (function collect(cid: string, depth: number): void {
+      if (depth > 14) return;
+      for (const kid of fig.kidsOf.get(cid) ?? []) {
+        const k = fig.nodes.get(kid);
+        if (!k || k.visible === false) continue;
+        if (k.type === "TEXT") {
+          slots.push({
+            id: kid,
+            fs: k.fontSize ?? 14,
+            len: (k.textData?.characters ?? "").length,
+            fill: paintInfo(k.fillPaints).fill,
+          });
+        }
+        collect(kid, depth + 1);
+      }
+    })(symId, 0);
+
+    const derived: Array<{ fs: number; len: number; glyphs: any[]; key: string }> = [];
+    const seenKey = new Set<string>();
+    for (const d of instance.derivedSymbolData ?? []) {
+      const glyphs = d.derivedTextData?.glyphs ?? [];
+      if (!glyphs.length) continue;
+      const fs = glyphs[0]?.fontSize ?? 14;
+      const len = d.derivedTextData?.baselines?.[0]?.endCharacter ?? -1;
+      const key = `${fs}|${len}`;
+      if (seenKey.has(key)) continue;
+      seenKey.add(key);
+      derived.push({ fs, len, glyphs, key });
+    }
+
+    const map = new Map<string, { glyphs: any[]; fill: string | undefined }>();
+    const byFsSlots = new Map<number, typeof slots>();
+    for (const s of slots) {
+      if (!byFsSlots.has(s.fs)) byFsSlots.set(s.fs, []);
+      byFsSlots.get(s.fs)!.push(s);
+    }
+    const byFsDerived = new Map<number, typeof derived>();
+    for (const d of derived) {
+      if (!byFsDerived.has(d.fs)) byFsDerived.set(d.fs, []);
+      byFsDerived.get(d.fs)!.push(d);
+    }
+    for (const [fs, ds] of byFsDerived) {
+      const ss = byFsSlots.get(fs) ?? [];
+      const n = Math.min(ds.length, ss.length);
+      for (let i = 0; i < n; i++) map.set(ss[i].id, { glyphs: ds[i].glyphs, fill: ss[i].fill });
+    }
+    return map;
+  }
+
+  const walk = (id: string, depth: number, noText: boolean, overrideMap?: Map<string, { glyphs: any[]; fill: string | undefined }>): string => {
     if (depth > maxDepth || nodeCount >= maxNodes) return "";
     const n = fig.nodes.get(id);
     if (!n || n.visible === false) return "";
     nodeCount++;
 
-    // local transform (root's own placement is ignored: its local space IS
-    // the canvas)
+    // the ROOT node's own placement transform is ignored: its local space IS
+    // the canvas (children are already relative to it)
     const t = n.transform ?? { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0 };
     const tf = depth === 0 ? "" : ` transform="matrix(${r(t.m00)},${r(t.m10)},${r(t.m01)},${r(t.m11)},${r(t.m02)},${r(t.m12)})"`;
     const opacity = typeof n.opacity === "number" && n.opacity < 1 ? ` opacity="${r(n.opacity)}"` : "";
     const { fill, imageHash, stops } = paintInfo(n.fillPaints);
     let gradient = "";
     if (stops) {
-      const gid = `grad${clipSeq++}`;
+      const gid = `grad${gradSeq++}`;
       defs.push(
         `<linearGradient id="${gid}" x1="0" y1="0" x2="1" y2="0">` +
           stops
@@ -136,25 +192,59 @@ export function renderNodeSVG(
     const w = n.size ? Math.round(n.size.x) : 0;
     const h = n.size ? Math.round(n.size.y) : 0;
 
-    let childrenSvg = "";
-    if (depth < maxDepth && nodeCount < maxNodes) {
-      let childIds = fig.kidsOf.get(id) ?? [];
-      if (n.type === "INSTANCE" && childIds.length === 0) {
-        // instance internals are not materialized — render the component's
-        // own subtree under the instance transform (default texts)
-        const symId = guidStr(n.symbolData?.symbolID);
-        if (symId) childIds = fig.kidsOf.get(symId) ?? [];
-      }
-      for (const kid of childIds) childrenSvg += walk(kid, depth + 1);
-    }
-
     switch (n.type) {
+      case "TEXT": {
+        const fillHere = overrideMap?.get(id)?.fill ?? fill ?? "#1a152b";
+        const glyphs = overrideMap?.get(id)?.glyphs ?? (noText ? null : n.derivedTextData?.glyphs);
+        if (glyphs && glyphs.length) {
+          let runs = "";
+          for (const g of glyphs) {
+            const bytes = getBlobBytes(doc, g.commandsBlob);
+            if (!bytes) continue;
+            let d = geometryBlobToSVGPath(bytes);
+            if (d.startsWith("Z")) d = d.slice(1);
+            runs += `<g transform="translate(${r(g.position?.x ?? 0)},${r(g.position?.y ?? 0)}) scale(${r(g.fontSize ?? 14)},${-r(g.fontSize ?? 14)})"><path d="${d}" fill="${fillHere}"/></g>`;
+          }
+          if (runs) return `<g${tf}>${runs}</g>`;
+        }
+        if (noText) return "";
+        const fs = n.fontSize ?? 14;
+        const chars = n.textData?.characters ?? "";
+        if (!chars) return "";
+        const family = n.fontName?.family ?? "Inter";
+        const align = n.textAlignHorizontal === "CENTER" ? ' text-anchor="middle"' : n.textAlignHorizontal === "RIGHT" ? ' text-anchor="end"' : "";
+        const x = n.textAlignHorizontal === "CENTER" ? w / 2 : n.textAlignHorizontal === "RIGHT" ? w : 0;
+        const y = r(fs * 0.8);
+        const tf2 = fill ?? "#1a152b";
+        return `<text x="${r(x)}" y="${y}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${tf2}"${align}>${esc(chars)}</text>`;
+      }
       case "FRAME":
       case "SECTION":
       case "COMPONENT":
       case "SYMBOL":
       case "GROUP":
       case "INSTANCE": {
+        let childrenSvg = "";
+        let glyphSvg = "";
+        let childOverrideMap: Map<string, { glyphs: any[]; fill: string | undefined }> | undefined;
+        if (n.type === "INSTANCE") {
+          // instance internals are not materialized — render the component's
+          // own subtree under the instance transform, with override texts
+          // bound to their text slots (fontSize + document order pairing)
+          const symId = guidStr(n.symbolData?.symbolID);
+          if (symId) childOverrideMap = buildSlotMap(n, symId);
+        }
+        if (depth < maxDepth && nodeCount < maxNodes) {
+          let childIds = fig.kidsOf.get(id) ?? [];
+          if (n.type === "INSTANCE" && childIds.length === 0) {
+            const symId = guidStr(n.symbolData?.symbolID);
+            if (symId) childIds = fig.kidsOf.get(symId) ?? [];
+          }
+          for (const kid of childIds) {
+            childrenSvg += walk(kid, depth + 1, noText || n.type === "INSTANCE", childOverrideMap ?? overrideMap);
+          }
+        }
+
         let inner = childrenSvg;
         if (clipsContent(n) && inner && w > 0 && h > 0) {
           const cid = `clip${clipSeq++}`;
@@ -174,6 +264,7 @@ export function renderNodeSVG(
             warnings.push(`image ${imageHash} not found in doc.images`);
           }
         }
+        void glyphSvg;
         return `<g${tf}${opacity}>${bg}${img}${inner}</g>`;
       }
       case "RECTANGLE":
@@ -209,27 +300,12 @@ export function renderNodeSVG(
         }
         return "";
       }
-      case "TEXT": {
-        const fs = n.fontSize ?? 14;
-        const chars = n.textData?.characters ?? "";
-        if (!chars) return "";
-        const family = n.fontName?.family ?? "Inter";
-        const align = n.textAlignHorizontal === "CENTER" ? ' text-anchor="middle"' : n.textAlignHorizontal === "RIGHT" ? ' text-anchor="end"' : "";
-        const x = n.textAlignHorizontal === "CENTER" ? w / 2 : n.textAlignHorizontal === "RIGHT" ? w : 0;
-        const y = r(fs * 0.8);
-        const tf2 = fill ?? "#1a152b";
-        return `<text x="${r(x)}" y="${y}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${tf2}"${align}>${esc(chars)}</text>`;
-      }
       default:
-        return childrenSvg; // unknown type — still render resolved children
+        return "";
     }
   };
 
-  function clipsContent(n: RawChange): boolean {
-    return n.type === "FRAME" && (n.clipsContent === undefined ? true : n.clipsContent === true);
-  }
-
-  const inner = walk(rootId, 0);
+  const inner = walk(rootId, 0, false);
 
   const svg =
     `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">\n` +
