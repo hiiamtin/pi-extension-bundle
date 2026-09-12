@@ -1,17 +1,17 @@
 // Minimal offline SVG renderer for parsed .fig node trees.
 //
-// Walks the merged nodeChanges tree (lib/figma-instance-resolver.ts merge),
-// accumulates absolute transforms, and emits SVG: frames with clipping,
-// rectangles/ellipses, vector geometry (via openfig's blob → SVG path
-// helpers), solid/gradient/image paints, and text.
+// Scene-graph model: each node emits its OWN local transform and LOCAL
+// coordinates; nesting inside the parent's <g> accumulates the transforms
+// exactly once. (An earlier version emitted absolute coordinates INSIDE the
+// transformed groups — double-transforming everything into a blank page.)
 //
-// Fidelity: MVP (~90% for flat design-system UI). Effects, blend modes,
-// masks and exotic paints are skipped; text is drawn with <text> (font
-// availability affects look). instance text overrides are overlaid at their
-// derived positions with component-default slots skipped when they collide.
+// Supports: frame clipping, rect/ellipse + radius, vector geometry via
+// openfig's resolveVectorNodePaths (commandsBlobs → SVG paths), solid fills,
+// image fills as data URIs, opacity, strokes, and <text> (local font
+// availability affects the look). Instance internals render through their
+// component subtree when not materialized in the export.
 //
-// Pure Node + openfig-core (already a dependency) — unit-testable with
-// synthetic documents (pass a stub `doc` when there are no VECTOR nodes).
+// Pure Node + openfig-core — unit-testable with synthetic documents.
 
 import { resolveVectorNodePaths } from "openfig-core";
 import type { MergedFig } from "./figma-instance-resolver.ts";
@@ -22,30 +22,12 @@ export interface RenderOptions {
   maxNodes?: number;
 }
 
-interface Matrix {
-  a: number;
-  b: number;
-  c: number;
-  d: number;
-  e: number;
-  f: number;
-}
-
-const IDENTITY: Matrix = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
-
-function multiply(m: Matrix, c: Matrix): Matrix {
-  return {
-    a: m.a * c.a + m.c * c.b,
-    b: m.b * c.a + m.d * c.b,
-    c: m.a * c.c + m.c * c.d,
-    d: m.b * c.c + m.d * c.d,
-    e: m.a * c.e + m.c * c.f + m.e,
-    f: m.b * c.e + m.d * c.f + m.f,
-  };
-}
-
-function toMatrixAttr(m: Matrix): string {
-  return `matrix(${r(m.a)},${r(m.b)},${r(m.c)},${r(m.d)},${r(m.e)},${r(m.f)})`;
+export interface RenderResult {
+  svg: string;
+  width: number;
+  height: number;
+  warnings: string[];
+  nodeCount: number;
 }
 
 function r(n: number): number {
@@ -57,44 +39,45 @@ function esc(s: string): string {
 }
 
 function hexFill(paint: any): string | null {
-  if (!paint?.color || typeof paint.color !== "object") return null;
+  if (!paint?.color || typeof paint.color !== "object") return undefined;
   const b = (v: number) => Math.round(Math.max(0, Math.min(1, Number(v) || 0)) * 255).toString(16).padStart(2, "0");
-  return `#${b(paint.color.r)}${b(paint.color.g)}${b(paint.color.b)}`;
+  const base = `#${b(paint.color.r)}${b(paint.color.g)}${b(paint.color.b)}`;
+  return typeof paint.color.a === "number" && paint.color.a < 1 ? `${base}${b(paint.color.a)}` : base;
 }
 
-/** pick the first visible paint: solid → hex, IMAGE → hash, else type */
-function paintInfo(paints: any): { fill: string | null; imageHash: string | null; gradient: any | null } {
-  if (!Array.isArray(paints)) return { fill: null, imageHash: null, gradient: null };
+function paintInfo(paints: any): { fill: string | undefined; imageHash: string | null; stops: any[] | null } {
+  if (!Array.isArray(paints)) return { fill: undefined, imageHash: null, stops: null };
   for (const p of paints) {
     if (p?.visible === false) continue;
     if (p.type === "SOLID") {
       const f = hexFill(p);
-      if (f) return { fill: f, imageHash: null, gradient: null };
+      if (f) return { fill: f, imageHash: null, stops: null };
     }
     if (p.type === "IMAGE") {
       const m = /[\da-f]{40}/.exec(JSON.stringify(p));
-      if (m) return { fill: null, imageHash: m[0], gradient: null };
+      if (m) return { fill: undefined, imageHash: m[0], stops: null };
     }
   }
   for (const p of paints) {
     if (p?.visible === false) continue;
-    if (Array.isArray(p.gradientStops) && p.gradientStops.length) return { fill: null, imageHash: null, gradient: p };
+    if (Array.isArray(p.gradientStops) && p.gradientStops.length) {
+      return { fill: undefined, imageHash: null, stops: p.gradientStops };
+    }
   }
-  return { fill: null, imageHash: null, gradient: null };
+  return { fill: undefined, imageHash: null, stops: null };
+}
+
+// tiny string hash so gradient defs can be deduped without a deps-heavy map
+function hashCode(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  return h;
 }
 
 function sniffImageMime(bytes: Uint8Array): string {
   if (bytes[0] === 0x89 && bytes[1] === 0x50) return "image/png";
   if (bytes[0] === 0xff && bytes[1] === 0xd8) return "image/jpeg";
   return "application/octet-stream";
-}
-
-export interface RenderResult {
-  svg: string;
-  width: number;
-  height: number;
-  warnings: string[];
-  nodeCount: number;
 }
 
 export function renderNodeSVG(
@@ -108,59 +91,100 @@ export function renderNodeSVG(
   const warnings: string[] = [];
   let nodeCount = 0;
   let clipSeq = 0;
-  const body: string[] = [];
+  const defs: string[] = [];
+  const images = doc.images as Map<string, Uint8Array>;
 
   const root = fig.nodes.get(rootId);
   if (!root) return null;
   const size = root.size ?? { x: 100, y: 100 };
   const W = Math.max(1, Math.round(size.x));
   const H = Math.max(1, Math.round(size.y));
-  const images = doc.images as Map<string, Uint8Array>;
 
-  const walk = (id: string, m: Matrix, depth: number): void => {
-    if (depth > maxDepth || nodeCount >= maxNodes) return;
+  const strokeText = (n: RawChange): string => {
+    const sp = Array.isArray(n.strokePaints)
+      ? n.strokePaints.find((p: any) => p?.visible !== false && p?.type === "SOLID")
+      : null;
+    const s = sp ? hexFill(sp) : null;
+    const w = n.strokeWeight ?? 0;
+    return s && w > 0 ? ` stroke="${s}" stroke-width="${r(w)}"` : "";
+  };
+
+  const walk = (id: string, depth: number): string => {
+    if (depth > maxDepth || nodeCount >= maxNodes) return "";
     const n = fig.nodes.get(id);
-    if (!n || n.visible === false) return;
+    if (!n || n.visible === false) return "";
     nodeCount++;
 
-    // the ROOT node's own placement transform is ignored: its local space IS
-    // the canvas (children are already relative to it)
+    // local transform (root's own placement is ignored: its local space IS
+    // the canvas)
     const t = n.transform ?? { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0 };
-    const own: Matrix = { a: t.m00, b: t.m10, c: t.m01, d: t.m11, e: t.m02, f: t.m12 };
-    const abs = depth === 0 ? IDENTITY : multiply(m, own);
+    const tf = depth === 0 ? "" : ` transform="matrix(${r(t.m00)},${r(t.m10)},${r(t.m01)},${r(t.m11)},${r(t.m02)},${r(t.m12)})"`;
+    const opacity = typeof n.opacity === "number" && n.opacity < 1 ? ` opacity="${r(n.opacity)}"` : "";
+    const { fill, imageHash, stops } = paintInfo(n.fillPaints);
+    let gradient = "";
+    if (stops) {
+      const gid = `grad${clipSeq++}`;
+      defs.push(
+        `<linearGradient id="${gid}" x1="0" y1="0" x2="1" y2="0">` +
+          stops
+            .map((s: any) => `<stop offset="${r((Number(s.position) || 0) * 100)}%" stop-color="${hexFill(s) ?? "#000"}"/>`)
+            .join("") +
+          `</linearGradient>`,
+      );
+      gradient = `url(#${gid})`;
+    }
     const w = n.size ? Math.round(n.size.x) : 0;
     const h = n.size ? Math.round(n.size.y) : 0;
-    const opacity = typeof n.opacity === "number" && n.opacity < 1 ? ` opacity="${r(n.opacity)}"` : "";
-    const { fill, imageHash, gradient } = paintInfo(n.fillPaints);
 
-    const container = n.type === "FRAME" || n.type === "SECTION" || n.type === "COMPONENT" || n.type === "SYMBOL" || n.type === "GROUP" || n.type === "INSTANCE";
-    const clips = n.type === "FRAME" && (n.clipsContent === undefined ? true : n.clipsContent === true);
-
-    let openTag = "";
-    let closeTag = "";
-    let clipAttr = "";
-    if (container) {
-      openTag = `<g transform="${toMatrixAttr(abs)}"${opacity}>`;
-      closeTag = `</g>`;
-      if (clips && w > 0 && h > 0) {
-        const cid = `clip${clipSeq++}`;
-        body.push(`<clipPath id="${cid}"><rect x="0" y="0" width="${w}" height="${h}"/></clipPath>`);
-        clipAttr = ` clip-path="url(#${cid})"`;
+    let childrenSvg = "";
+    if (depth < maxDepth && nodeCount < maxNodes) {
+      let childIds = fig.kidsOf.get(id) ?? [];
+      if (n.type === "INSTANCE" && childIds.length === 0) {
+        // instance internals are not materialized — render the component's
+        // own subtree under the instance transform (default texts)
+        const symId = guidStr(n.symbolData?.symbolID);
+        if (symId) childIds = fig.kidsOf.get(symId) ?? [];
       }
-      if (fill && n.type !== "GROUP") body.push(`<rect x="0" y="0" width="${w}" height="${h}" fill="${fill}"${clipAttr}/>`);
+      for (const kid of childIds) childrenSvg += walk(kid, depth + 1);
     }
 
     switch (n.type) {
+      case "FRAME":
+      case "SECTION":
+      case "COMPONENT":
+      case "SYMBOL":
+      case "GROUP":
+      case "INSTANCE": {
+        let inner = childrenSvg;
+        if (clipsContent(n) && inner && w > 0 && h > 0) {
+          const cid = `clip${clipSeq++}`;
+          defs.push(`<clipPath id="${cid}"><rect x="0" y="0" width="${w}" height="${h}"/></clipPath>`);
+          inner = `<g clip-path="url(#${cid})">${inner}</g>`;
+        }
+        let bg = "";
+        const paint = gradient || (fill && n.type !== "GROUP" ? fill : undefined);
+        if (paint && w > 0 && h > 0) bg = `<rect x="0" y="0" width="${w}" height="${h}" fill="${paint}"/>`;
+        let img = "";
+        if (imageHash && w > 0 && h > 0) {
+          const bytes = images.get(imageHash);
+          if (bytes) {
+            const uri = `data:${sniffImageMime(bytes)};base64,${Buffer.from(bytes).toString("base64")}`;
+            img = `<image x="0" y="0" width="${w}" height="${h}" href="${uri}" preserveAspectRatio="xMidYMid slice"/>`;
+          } else {
+            warnings.push(`image ${imageHash} not found in doc.images`);
+          }
+        }
+        return `<g${tf}${opacity}>${bg}${img}${inner}</g>`;
+      }
       case "RECTANGLE":
       case "ROUNDED_RECTANGLE": {
         const rx = n.cornerRadius ? ` rx="${r(n.cornerRadius)}"` : "";
-        const stroke = strokeAttrs(n);
-        body.push(`<rect x="${r(abs.e)}" y="${r(abs.f)}" width="${w}" height="${h}"${rx} fill="${fill ?? "none"}"${strokeAttrsToText(stroke)}${opacity}/>`);
-        break;
+        const paint = gradient || fill || "none";
+        return `<rect x="0" y="0" width="${w}" height="${h}"${rx} fill="${paint}"${strokeText(n)}${opacity}/>`;
       }
       case "ELLIPSE": {
-        body.push(`<ellipse cx="${r(abs.e + w / 2)}" cy="${r(abs.f + h / 2)}" rx="${r(w / 2)}" ry="${r(h / 2)}" fill="${fill ?? "none"}"${opacity}/>`);
-        break;
+        const paint = gradient || fill || "none";
+        return `<ellipse cx="${r(w / 2)}" cy="${r(h / 2)}" rx="${r(w / 2)}" ry="${r(h / 2)}" fill="${paint}"${opacity}/>`;
       }
       case "VECTOR":
       case "BOOLEAN_OPERATION":
@@ -169,75 +193,49 @@ export function renderNodeSVG(
       case "REGULAR_POLYGON": {
         try {
           const paths = resolveVectorNodePaths(doc, n as any);
+          const g: string[] = [];
           for (const p of paths.fill) {
             if (!p.svgPath) continue;
             const pf = p.paints?.find((pp: any) => pp?.type === "SOLID");
-            const f = pf ? hexFill(pf) : fill;
-            body.push(`<g transform="${toMatrixAttr(abs)}"${opacity}><path d="${p.svgPath}" fill="${f ?? "none"}"/></g>`);
+            g.push(`<path d="${p.svgPath}" fill="${(pf && hexFill(pf)) || fill || "none"}"${opacity}/>`);
           }
           for (const p of paths.stroke) {
             if (!p.svgPath) continue;
-            body.push(`<g transform="${toMatrixAttr(abs)}"${opacity}><path d="${p.svgPath}" fill="none" stroke="${fill ?? "#000"}" stroke-width="${r(n.strokeWeight ?? 1)}"/></g>`);
+            g.push(`<path d="${p.svgPath}" fill="none" stroke="${fill ?? "#000"}" stroke-width="${r(n.strokeWeight ?? 1)}"${opacity}/>`);
           }
+          if (g.length) return g.join("");
         } catch (e) {
           warnings.push(`vector ${guidStr(n.guid)}: ${e instanceof Error ? e.message : String(e)}`);
         }
-        break;
+        return "";
       }
       case "TEXT": {
         const fs = n.fontSize ?? 14;
-        const tf = fill ?? "#1a152b";
+        const chars = n.textData?.characters ?? "";
+        if (!chars) return "";
         const family = n.fontName?.family ?? "Inter";
         const align = n.textAlignHorizontal === "CENTER" ? ' text-anchor="middle"' : n.textAlignHorizontal === "RIGHT" ? ' text-anchor="end"' : "";
-        const chars = n.textData?.characters ?? "";
-        const bx = abs.e + (n.textAlignHorizontal === "CENTER" ? w / 2 : n.textAlignHorizontal === "RIGHT" ? w : 0);
-        const by = abs.f + Math.round(fs * 0.8);
-        if (chars) body.push(`<text x="${r(bx)}" y="${r(by)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${tf}"${align}>${esc(chars)}</text>`);
-        break;
+        const x = n.textAlignHorizontal === "CENTER" ? w / 2 : n.textAlignHorizontal === "RIGHT" ? w : 0;
+        const y = r(fs * 0.8);
+        const tf2 = fill ?? "#1a152b";
+        return `<text x="${r(x)}" y="${y}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${tf2}"${align}>${esc(chars)}</text>`;
       }
       default:
-        break;
+        return childrenSvg; // unknown type — still render resolved children
     }
-
-    if (openTag) body.push(openTag);
-
-    // image fill (paint-level) drawn over the container background
-    if (imageHash && container && w > 0 && h > 0) {
-      const bytes = images.get(imageHash);
-      if (bytes) {
-        const uri = `data:${sniffImageMime(bytes)};base64,${Buffer.from(bytes).toString("base64")}`;
-        body.push(`<image x="0" y="0" width="${w}" height="${h}" href="${uri}" preserveAspectRatio="xMidYMid slice"${clipAttr}/>`);
-      } else {
-        warnings.push(`image ${imageHash} not found in doc.images`);
-      }
-    }
-
-    // children (instance internals resolve through the component)
-    let childIds = fig.kidsOf.get(id) ?? [];
-    if (n.type === "INSTANCE" && childIds.length === 0) {
-      // instance internals are not materialized — render the component's own
-      // subtree under the instance transform (default texts; overrides later)
-      const symId = guidStr(n.symbolData?.symbolID);
-      if (symId) childIds = fig.kidsOf.get(symId) ?? [];
-    }
-    for (const kid of childIds) walk(kid, abs, depth + 1);
-
-    if (closeTag) body.push(closeTag);
   };
 
-  const strokeAttrs = (n: RawChange): { s: string | null; w: number } => {
-    const sp = Array.isArray(n.strokePaints) ? n.strokePaints.find((p: any) => p?.visible !== false && p?.type === "SOLID") : null;
-    return { s: sp ? hexFill(sp) : null, w: n.strokeWeight ?? 0 };
-  };
-  const strokeAttrsToText = (st: { s: string | null; w: number }): string =>
-    st.s && st.w > 0 ? ` stroke="${st.s}" stroke-width="${r(st.w)}"` : "";
+  function clipsContent(n: RawChange): boolean {
+    return n.type === "FRAME" && (n.clipsContent === undefined ? true : n.clipsContent === true);
+  }
 
-  walk(rootId, IDENTITY, 0);
+  const inner = walk(rootId, 0);
 
   const svg =
     `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">\n` +
+    (defs.length ? `<defs>${defs.join("")}</defs>\n` : "") +
     `<rect width="${W}" height="${H}" fill="#ffffff"/>\n` +
-    body.join("\n") +
+    inner +
     `\n</svg>\n`;
 
   return { svg, width: W, height: H, warnings, nodeCount };
