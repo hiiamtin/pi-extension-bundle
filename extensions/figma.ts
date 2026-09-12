@@ -75,7 +75,10 @@ type Ui = { notify: (msg: string, level: string) => void };
 
 type ToolContent =
   | { type: "text"; text: string }
-  | { type: "image"; source: { type: "base64"; mediaType: string; data: string } };
+  // NOTE: pi-ai ImageContent is FLAT (data + mimeType) — the Anthropic-style
+  // nested `source` shape makes pi's image normalization crash with
+  // Buffer.from(undefined) and the tool result gets discarded.
+  | { type: "image"; data: string; mimeType: string };
 
 type ToolResult = { content: ToolContent[]; details: Record<string, unknown> };
 
@@ -213,11 +216,8 @@ function embedImage(st: BridgeState, rec: SavedExport, embed: boolean): ToolCont
       text,
       {
         type: "image",
-        source: {
-          type: "base64",
-          mediaType: rec.format === "svg" ? "image/svg+xml" : rec.format === "jpg" ? "image/jpeg" : "image/png",
-          data,
-        },
+        data,
+        mimeType: rec.format === "svg" ? "image/svg+xml" : rec.format === "jpg" ? "image/jpeg" : "image/png",
       },
     ];
   } catch {
@@ -542,7 +542,8 @@ async function runParseLocalFig(args: unknown[], cwd = process.cwd()): Promise<T
   if (embed && doc.thumbnail && doc.thumbnail.byteLength <= MAX_EMBED_BYTES) {
     content.push({
       type: "image",
-      source: { type: "base64", mediaType: "image/png", data: Buffer.from(doc.thumbnail).toString("base64") },
+      data: Buffer.from(doc.thumbnail).toString("base64"),
+      mimeType: "image/png",
     });
   }
   return {
