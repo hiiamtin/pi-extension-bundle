@@ -34,6 +34,22 @@ function r(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
+/** SCBX-Looped-ish width estimate for a string at fontSize fs — used to
+ * size prop-text buttons and to compress fallback-font <text> runs
+ * (textLength) toward the real font's metrics */
+function textWidthEst(s: string, fs: number): number {
+  let units = 0;
+  for (const ch of s) {
+    if ("iljtfr.,;:!|I()[]{}'`".includes(ch)) units += 0.5;
+    else if ("mwMW@&".includes(ch)) units += 1.6;
+    else if (ch === " ") units += 0.35;
+    else if (ch >= "A" && ch <= "Z") units += 1.15;
+    else if (ch >= "0" && ch <= "9") units += 1.0;
+    else units += 1.0;
+  }
+  return units * fs * 0.58;
+}
+
 function esc(s: string): string {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
@@ -324,6 +340,23 @@ const swInset = (n: any): number => {
   const sw = n?.strokeWeight;
   return typeof sw === "number" ? sw : 1;
 };
+/** Figma stores per-corner radii as 4 scalar fields; cornerRadius is often
+ * absent in .fig exports. Falls back to the resolved component's radius so
+ * instance pills keep their library rounding. */
+const radiusOf = (n: any, compNode?: any): number => {
+  const tl = n?.rectangleTopLeftCornerRadius;
+  const tr = n?.rectangleTopRightCornerRadius;
+  const bl = n?.rectangleBottomLeftCornerRadius;
+  const br = n?.rectangleBottomRightCornerRadius;
+  if (tl !== undefined || tr !== undefined || bl !== undefined || br !== undefined) {
+    return Math.min(tl ?? 0, tr ?? 0, bl ?? 0, br ?? 0) || 0;
+  }
+  if (n?.cornerRadius !== undefined) return n.cornerRadius ?? 0;
+  const c = compNode ?? n;
+  const ctl = c?.rectangleTopLeftCornerRadius;
+  if (ctl !== undefined) return Math.min(ctl ?? 0, c?.rectangleTopRightCornerRadius ?? 0, c?.rectangleBottomLeftCornerRadius ?? 0, c?.rectangleBottomRightCornerRadius ?? 0) || 0;
+  return c?.cornerRadius ?? 0;
+};
 
 function xf(v: number): string {
   const r = Math.round(v * 1000) / 1000;
@@ -443,12 +476,33 @@ export function renderNodeSVG(
   const W = Math.max(1, Math.round(size.x));
   const H = Math.max(1, Math.round(size.y));
 
-  const strokeText = (n: RawChange): string => {
-    const sp = Array.isArray(n.strokePaints)
-      ? n.strokePaints.find((p: any) => p?.visible !== false && p?.type === "SOLID")
+  // pristine size/transform of every node — component subtrees are shared
+  // between sibling instances, so any layout mutation made while rendering
+  // one instance must be rolled back before the next one walks the same
+  // component (else row 3 inherits row 2's re-flowed positions)
+  const pristine = new Map<string, { size: any; transform: any }>();
+  for (const [id, n] of fig.nodes) pristine.set(id, { size: n.size, transform: n.transform });
+  const restoreSubtree = (rootId: string): void => {
+    const stack = [rootId];
+    while (stack.length) {
+      const id = stack.pop()!;
+      const p = pristine.get(id);
+      const n = fig.nodes.get(id);
+      if (p && n) {
+        n.size = p.size;
+        n.transform = p.transform;
+      }
+      for (const k of fig.kidsOf.get(id) ?? []) stack.push(k);
+    }
+  };
+
+  const strokeText = (n: RawChange, compNode?: any): string => {
+    const src = Array.isArray(n.strokePaints) && n.strokePaints.length ? n : compNode;
+    const sp = Array.isArray(src?.strokePaints)
+      ? src.strokePaints.find((p: any) => p?.visible !== false && p?.type === "SOLID")
       : null;
     const s = sp ? hexFill(sp) : null;
-    const w = n.strokeWeight ?? 0;
+    const w = src?.strokeWeight ?? 0;
     return s && w > 0 ? ` stroke="${s}" stroke-width="${r(w)}"` : "";
   };
 
@@ -753,7 +807,7 @@ export function renderNodeSVG(
       for (const b of map2.values()) {
         if (!b || b.hidden) continue;
         for (const gg of b.glyphs ?? []) ext = Math.max(ext, (gg.position?.x ?? 0) + (gg.fontSize ?? 16) * 0.62);
-        if (b.propText) propCap = Math.min(propCap, b.propText.length * 7 + 32);
+        if (b.propText) propCap = Math.min(propCap, textWidthEst(b.propText, b.glyphs?.[0]?.fontSize ?? 16) + 44);
       }
       // glyph runs inherited from an ancestor scope can carry that scope's
       // positions; the prop text length is a safe upper bound on the true
@@ -826,20 +880,22 @@ export function renderNodeSVG(
       const t = it.cn.transform;
       if (!t) return;
       const last = i === items.length - 1;
-      // only re-anchor items that ACTUALLY outgrew their baked box (or the
-      // pinned pair ends); baked labels/buttons keep their snapshot position
+      // items that did not grow keep their baked position, but p still
+      // advances past them (else a later grown item lands ON TOP of an
+      // untouched sibling — the footer Save-on-Cancel collapse)
       const grew = it.w > it.bakedW + 2;
-      if (!grew && !(between && (i === 0 || last))) return;
       const pos = between && (i === 0 || last)
         ? last
           ? main - padMain - it.w
           : padMain
-        : p;
+        : grew
+          ? p
+          : (horiz ? (t.m02 ?? p) : (t.m12 ?? p));
       const cross = horiz ? (H - it.h) / 2 : (W - it.w) / 2;
       // header stacks (Title … icon button): the leading Title keeps its
       // component x — the real exporter renders it at the stack padding,
       // not counter-centered on the grown title box
-      const keepX = horiz && between && i === 0 && /Trailing content=.*icon button/i.test(comp?.name ?? "") ? (it.cn.transform?.m02 ?? padMain) : pos;
+      const keepX = horiz && between && i === 0 && /Trailing content=.*icon button/i.test(comp?.name ?? "") ? (t.m02 ?? padMain) : pos;
       it.cn.transform = horiz ? { ...t, m02: keepX, m12: cross } : { ...t, m12: pos, m02: cross };
       if (grew && it.cn.size) it.cn.size = { ...it.cn.size, x: it.w };
       p = pos + it.w + spacing;
@@ -871,6 +927,16 @@ export function renderNodeSVG(
 
     /** exact fill geometry of this node transformed to absolute space */
     const geomAbs = (): string | null => {
+      // instance/frame boxes re-flow (stack layout, stretch, swap compress)
+      // so their BAKED vector geometry goes stale — synthesize from the
+      // CURRENT size + resolved radius instead
+      if (n.type === "INSTANCE" || n.type === "FRAME" || n.type === "RECTANGLE" || n.type === "ROUNDED_RECTANGLE") {
+        const rad = radiusOf(n);
+        if (w > 0 && h > 0) {
+          return roundedRectPath(mat[4], mat[5], w, h, rad);
+        }
+        return null;
+      }
       try {
         const paths = resolveVectorNodePaths(doc, n as any);
         const parts: string[] = [];
@@ -880,11 +946,6 @@ export function renderNodeSVG(
         }
         if (parts.length) return parts.join("");
       } catch { /* fall through */ }
-      if (n.type === "RECTANGLE" || n.type === "ROUNDED_RECTANGLE" || n.type === "FRAME" || n.type === "INSTANCE") {
-        const rad = n.cornerRadius ?? 0;
-        if (rad > 0) return roundedRectPath(mat[4], mat[5], w, h, rad);
-        return null;
-      }
       return null;
     };
 
@@ -902,9 +963,20 @@ export function renderNodeSVG(
         if (glyphs && glyphs.length) {
           const lines = new Map<number, string[]>();
           const fs0 = n.fontSize ?? 14;
+          // single-line node box: derived runs can carry a wrapped 2nd line
+          // (e.g. sidebar "Citizen ID…"); Figma truncates to the box — keep
+          // only the first baseline when the box fits exactly one line
+          const boxH = n.size?.y ?? 0;
+          const oneLineOnly = boxH > 0 && boxH < fs0 * 1.6;
+          let firstLineY: number | null = null;
+          for (const g of glyphs) {
+            const gy0 = g.position?.y ?? 0;
+            if (firstLineY === null || gy0 < firstLineY) firstLineY = gy0;
+          }
           for (const g of glyphs) {
             const gx = g.position?.x ?? 0;
             const gy = g.position?.y ?? 0;
+            if (oneLineOnly && firstLineY !== null && gy > firstLineY + fs0 * 0.5) continue;
             const fs = g.fontSize ?? fs0;
             const d = glyphPathD(doc, g.commandsBlob);
             if (!d) continue;
@@ -942,9 +1014,13 @@ export function renderNodeSVG(
           const charW = fs * 0.58; // SCBX Looped average advance
           const maxChars = Math.max(1, Math.floor((boxW - 2) / charW));
           const shown = chars.length > maxChars ? chars.slice(0, maxChars).replace(/[\s,]+$/, "") + "…" : chars;
-          return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${opacity}>${esc(shown)}</text>`;
+          const tl1 = propText ? ` textLength="${r(textWidthEst(chars, fs))}" lengthAdjust="spacingAndGlyphs"` : "";
+          return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${tl1}${opacity}>${esc(shown)}</text>`;
         }
-        return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${opacity}>${esc(chars)}</text>`;
+        // fallback-font runs are wider than SCBX Looped; force the reference
+        // metrics so button labels stop overflowing their pills
+        const tl = propText ? ` textLength="${r(textWidthEst(chars, fs))}" lengthAdjust="spacingAndGlyphs"` : "";
+        return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${tl}${opacity}>${esc(chars)}</text>`;
       }
       case "FRAME":
       case "SECTION":
@@ -957,6 +1033,10 @@ export function renderNodeSVG(
         let swapApplied: { newSym: string } | undefined;
         let childDir: DirNode | undefined;
         if (n.type === "INSTANCE") {
+          // VISIBLE prop assigned false anywhere in the ancestor chain
+          // (e.g. stale clear ✕ inside non-clearable variants) → hidden
+          const visRefs = nodeVisibleRefs(n);
+          if (visRefs.some((r) => dir?.assigns.get(r)?.bool === false)) return "";
           const okey = okeyOf(n);
           const ancNode = dir?.children.get(okey ?? "");
           const ownTree = buildDirectiveTree(n);
@@ -983,6 +1063,18 @@ export function renderNodeSVG(
           // stale icon remap: outdated circle-✕ instances render the real
           // glyph component (trash / plus / bare ✕) declared by the context
           const resolvedName0 = symId ? fig.nodes.get(symId)?.name ?? "" : "";
+          if (resolvedName0 === "Dismiss Circle" && w > 0 && w <= 32) {
+            // clearable input ✕: Figma's "clear circle" = 1px ring + small ✕,
+            // drawn procedurally (the baked instance geometry is stale/mangled)
+            const cx = mat[4] + w / 2;
+            const cy = mat[5] + h / 2;
+            const ring = ellipsePath(cx, cy, 6.67, 6.67);
+            const k = 2.9;
+            const cross = `M${xf(cx - k)} ${xf(cy - k)}L${xf(cx + k)} ${xf(cy + k)}M${xf(cx + k)} ${xf(cy - k)}L${xf(cx - k)} ${xf(cy + k)}`;
+            const col = hint?.color ?? "#1A152B";
+            return `<path d="${ring}" fill="none" stroke="${col}" stroke-width="1.1"/>` +
+              `<path d="${cross}" fill="none" stroke="${col}" stroke-width="1.2" stroke-linecap="round"/>`;
+          }
           if ((resolvedName0 === "Dismiss Circle" || resolvedName0 === "Dismiss") && hint?.kind) {
             const mapped = iconIndexFor()[hint.kind];
             if (mapped) {
@@ -1031,7 +1123,7 @@ export function renderNodeSVG(
           // stretched selects: grow the inner "input" pill, right-pin its icon
           const compNode0 = symId ? fig.nodes.get(symId) : undefined;
           const compW0 = compNode0?.size?.x ?? 0;
-          if (compNode0 && w > compW0 + 2 && /input\.(select|textfield)|Filled\?=|Clearable/.test(compNode0.name ?? "")) {
+          if (compNode0 && Math.abs(w - compW0) > 2 && /input\.(select|textfield)|Filled\?=|Clearable/.test(compNode0.name ?? "")) {
             for (const k of fig.kidsOf.get(symId) ?? []) {
               const kn = fig.nodes.get(k);
               if (kn?.type === "FRAME" && kn.name === "input" && kn.size) {
@@ -1100,23 +1192,26 @@ export function renderNodeSVG(
           if (ci?.fill) paint = ci.fill;
         }
         const fo2 = fill && fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : "";
-        const st = strokeText(n);
+        const compForVis = n.type === "INSTANCE" ? fig.nodes.get(swapApplied?.newSym ?? symId0Of(n) ?? "") : undefined;
+        const st = strokeText(n, compForVis);
         const swI = st ? swInset(n) / 2 : 0;
         if (paint) {
           // segmented-radio instance: Figma paints the OPTION containers, not
           // the root box; reflowed halves would paint a wrong white slab
           const isRadio = n.type === "INSTANCE" && /Amount=\d+/.test(fig.nodes.get(swapApplied?.newSym ?? symId0Of(n) ?? "")?.name ?? "");
           // fill = the stroke-inset shape when an inside stroke surrounds it
+          const compForRad = n.type === "INSTANCE" ? fig.nodes.get(swapApplied?.newSym ?? symId0Of(n) ?? "") : undefined;
           const fillD = geomD ?? (w > 0 && h > 0 && !isRadio
-            ? roundedRectPath(mat[4] + swI, mat[5] + swI, Math.max(0, w - swI * 2), Math.max(0, h - swI * 2), Math.max(0, (n.cornerRadius ?? 0) - swI))
+            ? roundedRectPath(mat[4] + swI, mat[5] + swI, Math.max(0, w - swI * 2), Math.max(0, h - swI * 2), Math.max(0, radiusOf(n, compForRad) - swI))
             : null);
           if (fillD) {
             shapeSvg = `<path d="${fillD}" fill="${paint}"${fo2}${opacity}/>`;
             if (st) shapeSvg += `<path d="${fillD}" fill="none"${st}${opacity}/>`;
           }
-          // reflowed radio halves: selected (last-painted purple label)
-          // option = white pill + purple r=8 outline; unselected = bare
-          if (isRadio && !geomD && w > 0 && h > 0) {
+          // segmented radio: the selected option = white half-pill with a
+          // purple 1px outline (outer corners r=8, inner edge flat);
+          // unselected options stay bare like Figma's exporter
+          if (isRadio && w > 0 && h > 0) {
             const name = String(fig.nodes.get(swapApplied?.newSym ?? symId0Of(n) ?? "")?.name ?? "");
             const selOpt = /Selected=Opt\s*(\d+)/.exec(name);
             if (selOpt) {
@@ -1124,7 +1219,16 @@ export function renderNodeSVG(
               const optW = w / nOpt;
               const oi = Math.min(nOpt, Math.max(1, parseInt(selOpt[1], 10))) - 1;
               const ox = mat[4] + oi * optW;
-              const pillD = roundedRectPath(ox, mat[5], optW, h, 8);
+              const rOut = 8;
+              const x1 = ox, x2 = ox + optW, y1 = mat[5], y2 = mat[5] + h;
+              const kc = rOut * 0.5522847498;
+              // left option: round left corners; right option: round right
+              let pillD: string;
+              if (oi === 0) {
+                pillD = `M${xf(x1 + rOut)} ${xf(y1)}H${xf(x2)}V${xf(y2)}H${xf(x1 + rOut)}C${xf(x1 + rOut - kc)} ${xf(y2)} ${xf(x1)} ${xf(y2 - rOut + kc)} ${xf(x1)} ${xf(y2 - rOut)}V${xf(y1 + rOut)}C${xf(x1)} ${xf(y1 + rOut - kc)} ${xf(x1 + rOut - kc)} ${xf(y1)} ${xf(x1 + rOut)} ${xf(y1)}Z`;
+              } else {
+                pillD = `M${xf(x2 - rOut)} ${xf(y1)}H${xf(x1)}V${xf(y2)}H${xf(x2 - rOut)}C${xf(x2 - rOut + kc)} ${xf(y2)} ${xf(x2)} ${xf(y2 - rOut + kc)} ${xf(x2)} ${xf(y2 - rOut)}V${xf(y1 + rOut)}C${xf(x2)} ${xf(y1 + rOut - kc)} ${xf(x2 - rOut + kc)} ${xf(y1)} ${xf(x2 - rOut)} ${xf(y1)}Z`;
+              }
               shapeSvg += `<path d="${pillD}" fill="white"/><path d="${pillD}" fill="none" stroke="#6a41c9" stroke-width="1"/>`;
             }
           }
@@ -1139,13 +1243,20 @@ export function renderNodeSVG(
           }
         }
 
+        // roll back component-subtree mutations before the next sibling
+        // instance walks the same shared component
+        if (n.type === "INSTANCE") {
+          const symIdR = swapApplied?.newSym ?? symId0Of(n);
+          if (symIdR) restoreSubtree(symIdR);
+        }
+
         // clip children to the instance/frame box
         const clips = n.type === "INSTANCE" || (n.type === "FRAME" && n.clipsContent === true);
         let out = `${shapeSvg}${img}${childrenSvg}`;
         if (clips && childrenSvg && w > 0 && h > 0) {
           const cid = `clip${clipSeq + 1}_${frameTag}`;
           clipSeq++;
-          const clipGeom = roundedRectPath(mat[4], mat[5], w, h, n.cornerRadius ?? 0);
+          const clipGeom = roundedRectPath(mat[4], mat[5], w, h, radiusOf(n));
           defs.push(`<clipPath id="${cid}"><path d="${clipGeom}"/></clipPath>`);
           out = `<g clip-path="url(#${cid})">${out}</g>`;
         }
@@ -1153,7 +1264,7 @@ export function renderNodeSVG(
       }
       case "RECTANGLE":
       case "ROUNDED_RECTANGLE": {
-        const rad = n.cornerRadius ?? 0;
+        const rad = radiusOf(n);
         const paint = fill || "none";
         const fo = fill && fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : "";
         if (rad > 0) {
