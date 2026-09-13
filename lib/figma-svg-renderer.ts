@@ -692,13 +692,7 @@ export function renderNodeSVG(
             if (!d) continue;
             runs += `<g transform="translate(${r(g.position?.x ?? 0)},${r(g.position?.y ?? 0)}) scale(${r(g.fontSize ?? 14)},${-r(g.fontSize ?? 14)})"><path d="${d}" fill="${fillHere}"/></g>`;
           }
-          if (runs) {
-            // fixed-size text clips overflow lines (Figma auto-height boxes
-            // bake their full height, so this only trims genuine overflow)
-            const clipId = `tclip${clipSeq++}`;
-            defs.push(`<clipPath id="${clipId}"><rect x="0" y="0" width="99999" height="${Math.max(h, 1)}"/></clipPath>`);
-            return `<g${tf}><g clip-path="url(#${clipId})">${runs}</g></g>`;
-          }
+          if (runs) return `<g${tf}>${runs}</g>`;
         }
         const propText = bound?.propText;
         if (propText) {
@@ -756,6 +750,34 @@ export function renderNodeSVG(
             if (node) childDir = node;
             applyStackLayout(symId, n, node);
           }
+          // segmented radios ("Amount=N"): reflow each option container into
+          // the instance width (option width = instW/N) and re-center its
+          // texts, so labels keep full size instead of being scaled down
+          const radioComp = symId ? fig.nodes.get(symId) : undefined;
+          const radioMatch = /Amount=(\d+)/.exec(radioComp?.name ?? "");
+          if (radioMatch && w > 0 && (radioComp?.size?.x ?? 0) > w + 2) {
+            const nOpt = Math.max(1, parseInt(radioMatch[1], 10));
+            const newOptW = w / nOpt;
+            let idx = 0;
+            for (const k of fig.kidsOf.get(symId) ?? []) {
+              const kn = fig.nodes.get(k);
+              if (!kn || kn.visible === false) continue;
+              if (kn.transform) kn.transform = { ...kn.transform, m02: idx * newOptW };
+              if (kn.size) kn.size = { ...kn.size, x: newOptW };
+              const recenter = (nid: string): void => {
+                for (const k2 of fig.kidsOf.get(nid) ?? []) {
+                  const k2n = fig.nodes.get(k2);
+                  if (!k2n) continue;
+                  if (k2n.type === "TEXT" && k2n.size) {
+                    k2n.transform = { ...k2n.transform, m02: (newOptW - k2n.size.x) / 2 };
+                  }
+                  recenter(k2);
+                }
+              };
+              recenter(k);
+              idx++;
+            }
+          }
           // Figma constraints emulation. The snapshot bakes select/textfield
           // contents at the component's hug width while the live instance is
           // stretched: grow the inner "input" pill frame to the instance
@@ -812,13 +834,12 @@ export function renderNodeSVG(
         let inner = childrenSvg;
         // component content wider than the instance box: small overflows are
         // centered (icon glyphs keep full size), large ones compressed
-        // (segmented radios / wide variants — Figma layout constraints)
         {
           const scId = swapApplied?.newSym ?? symId0Of(n);
           const sc = scId ? fig.nodes.get(scId) : undefined;
           const cw = sc?.size?.x ?? 0;
           const ch = sc?.size?.y ?? 0;
-          if (cw > w + 2 && cw > 0) {
+          if (cw > w + 2 && cw > 0 && !/Amount=\d/.test(sc?.name ?? "")) {
             const diff = cw - w;
             if (diff <= 16) {
               inner = `<g transform="translate(${r(-diff / 2)},${r(-Math.max(0, ch - h) / 2)})">${inner}</g>`;
