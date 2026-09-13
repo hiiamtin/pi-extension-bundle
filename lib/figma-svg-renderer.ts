@@ -40,6 +40,8 @@ function esc(s: string): string {
 
 function hexFill(paint: any): string | null {
   if (!paint?.color || typeof paint.color !== "object") return undefined;
+  // Figma's serializer emits pure white as the keyword "white"
+  if (Number(paint.color.r) === 1 && Number(paint.color.g) === 1 && Number(paint.color.b) === 1) return "white";
   const b = (v: number) => Math.round(Math.max(0, Math.min(1, Number(v) || 0)) * 255).toString(16).padStart(2, "0");
   return `#${b(paint.color.r)}${b(paint.color.g)}${b(paint.color.b)}`;
 }
@@ -299,6 +301,10 @@ const nodeMat = (n: any): Mat => {
 };
 const scaleM = (sx: number, sy: number): Mat => [sx, 0, 0, sy, 0, 0];
 const transM = (x: number, y: number): Mat => [1, 0, 0, 1, x, y];
+const swInset = (n: any): number => {
+  const sw = n?.strokeWeight;
+  return typeof sw === "number" ? sw : 1;
+};
 
 function xf(v: number): string {
   const r = Math.round(v * 1000) / 1000;
@@ -370,7 +376,7 @@ function xfPath(d: string, m: Mat): string {
 /** synthesize a rounded-rect path (Figma kappa 0.5177 corner curves) */
 function roundedRectPath(x: number, y: number, w: number, h: number, r: number): string {
   const rr = Math.min(r, w / 2, h / 2);
-  const k = rr * 0.5177;
+  const k = rr * 0.5522847498;
   const x2 = x + w, y2 = y + h;
   return (
     `M${xf(x + rr)} ${xf(y)}H${xf(x2 - rr)}C${xf(x2 - rr + k)} ${xf(y)} ${xf(x2)} ${xf(y + rr - k)} ${xf(x2)} ${xf(y + rr)}` +
@@ -986,10 +992,10 @@ export function renderNodeSVG(
           }
         }
 
-        // node background (absolute geometry)
+        // node background + border (Figma splits fill and stroke into two
+        // paths; inside-aligned strokes are inset by weight/2)
         let shapeSvg = "";
         const geomD = geomAbs();
-        const hasRad = (n.cornerRadius ?? 0) > 0;
         let paint = fill && n.type !== "GROUP" ? fill : undefined;
         if (swapApplied) {
           const comp = fig.nodes.get(swapApplied.newSym);
@@ -997,12 +1003,15 @@ export function renderNodeSVG(
           if (ci?.fill) paint = ci.fill;
         }
         const fo2 = fill && fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : "";
-        if (paint || strokeText(n)) {
-          if (geomD) {
-            shapeSvg = `<path d="${geomD}" fill="${paint ?? "none"}"${fo2}${strokeText(n)}${opacity}/>`;
-          } else {
-            shapeSvg = `<rect x="${xf(mat[4])}" y="${xf(mat[5])}" width="${w}" height="${h}" fill="${paint ?? "none"}"${fo2}${opacity}/>`;
-          }
+        const st = strokeText(n);
+        const swI = st ? swInset(n) / 2 : 0;
+        if (paint) {
+          // fill = the stroke-inset shape when an inside stroke surrounds it
+          const fillD = geomD ?? (w > 0 && h > 0
+            ? roundedRectPath(mat[4] + swI, mat[5] + swI, Math.max(0, w - swI * 2), Math.max(0, h - swI * 2), Math.max(0, (n.cornerRadius ?? 0) - swI))
+            : null);
+          shapeSvg = `<path d="${fillD}" fill="${paint}"${fo2}${opacity}/>`;
+          if (st) shapeSvg += `<path d="${fillD}" fill="none"${st}${opacity}/>`;
         }
 
         let img = "";
@@ -1020,7 +1029,7 @@ export function renderNodeSVG(
         if (clips && childrenSvg && w > 0 && h > 0) {
           const cid = `clip${clipSeq + 1}_${frameTag}`;
           clipSeq++;
-          const clipGeom = roundedRectPath(mat[4], mat[5], w, h, hasRad ? (n.cornerRadius ?? 0) : 0);
+          const clipGeom = roundedRectPath(mat[4], mat[5], w, h, n.cornerRadius ?? 0);
           defs.push(`<clipPath id="${cid}"><path d="${clipGeom}"/></clipPath>`);
           out = `<g clip-path="url(#${cid})">${out}</g>`;
         }
@@ -1083,7 +1092,7 @@ export function renderNodeSVG(
     `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" fill="none">\n` +
     `<defs>${defs.join("")}</defs>\n` +
     `<g clip-path="url(#clip0_${frameTag})">\n` +
-    `<rect width="${W}" height="${H}" fill="#ffffff"/>\n` +
+    `<rect width="${W}" height="${H}" fill="white"/>\n` +
     inner +
     `\n</g>\n</svg>\n`;
 
