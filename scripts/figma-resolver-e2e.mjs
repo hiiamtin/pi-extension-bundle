@@ -121,7 +121,7 @@ const svgRes = renderNodeSVG(stubDoc, doc, "470:25675");
 assert(!!svgRes && svgRes.svg.startsWith("<svg"), "renderer produces SVG");
 assert(svgRes.svg.includes('width="600"'), "root size drives viewBox", svgRes.svg.slice(0, 120));
 assert(svgRes.svg.includes("Full screen modal"), "instance component default text rendered");
-assert(svgRes.svg.includes('fill="#ffffff"'), "solid fills rendered");
+assert(svgRes.svg.includes('fill="white"'), "solid fills rendered");
 assert(svgRes.nodeCount >= 3, "renderer walked the subtree", String(svgRes.nodeCount));
 
 // ---------- summary ----------
