@@ -158,6 +158,7 @@ type SlotBinding = {
   hidden?: boolean;
   propText?: string;
   upgraded?: boolean;
+  boundW?: number;
 };
 
 const newDirNode = (): DirNode => ({ assigns: new Map(), textByKey: new Map(), children: new Map() });
@@ -325,6 +326,7 @@ export function renderNodeSVG(
     const map = new Map<string, SlotBinding>();
     const instW = instance.size?.x ?? Infinity;
     const instH = instance.size?.y ?? Infinity;
+    const compW = fig.nodes.get(symId)?.size?.x ?? 0;
     const dir = opts?.dir ?? newDirNode();
 
     type Slot = { id: string; fs: number; fill: string | undefined; chars: string; parentId: string; nodeX: number; bottom: number; order: number; okey: string | null; textRef: string | null; visRefs: string[] };
@@ -434,7 +436,9 @@ export function renderNodeSVG(
       if (!prop) continue;
       const bound = boundBySlot.get(sl.id);
       if (bound && (bound.upgraded || bound.glyphs.length === prop.length)) continue;
-      boundBySlot.set(sl.id, { fill: sl.fill, propText: prop, upgraded: !!bound });
+      // an instance that grew past its component re-centers its label
+      const grownSwap = instW > compW + 2 ? instW : undefined;
+      boundBySlot.set(sl.id, { fill: sl.fill, propText: prop, upgraded: !!bound, boundW: grownSwap });
     }
     for (const sl of slots) {
       if (map.has(sl.id)) continue;
@@ -446,6 +450,77 @@ export function renderNodeSVG(
     for (const [id, v] of boundBySlot) map.set(id, v);
     return map;
   }
+
+  // Stale-icon remediation: .fig snapshots bake icon-button contents from the
+  // published library at snapshot time, so instances can show an outdated
+  // glyph (circle-✕ instead of trash / plus / bare-✕). The real icon
+  // components ship in the same file — index them by exact name.
+  type IconKind = "Delete" | "Dismiss" | "Add";
+  type IconHint = { kind?: IconKind; color?: string; listCtx?: boolean };
+  let iconIndex: Partial<Record<IconKind, string>> | undefined;
+  const iconIndexFor = (): Partial<Record<IconKind, string>> => {
+    if (!iconIndex) {
+      iconIndex = {};
+      for (const [id, n] of fig.nodes) {
+        if (n.type !== "SYMBOL" && n.type !== "COMPONENT") continue;
+        if (n.name === "Delete" || n.name === "Dismiss" || n.name === "Add") {
+          const key = n.name as IconKind;
+          if (!iconIndex[key]) iconIndex[key] = id;
+        }
+      }
+    }
+    return iconIndex;
+  };
+  // render an icon component's vectors in a solid color, normalized to the
+  // component's 24-unit box (optionally scaled to the host instance size)
+  const emitIcon = (compId: string, color: string, tf: string, opacity: string, instW: number): string => {
+    const comp = fig.nodes.get(compId);
+    if (!comp) return "";
+    const parts: string[] = [];
+    const emit = (nid: string, depth: number): void => {
+      const cn = fig.nodes.get(nid);
+      if (!cn || cn.visible === false) return;
+      if (cn.type === "VECTOR") {
+        try {
+          const paths = resolveVectorNodePaths(doc, cn as any);
+          const t2 = cn.transform ?? { m02: 0, m12: 0 };
+          const tf2 = ` transform="translate(${r(t2.m02 ?? 0)},${r(t2.m12 ?? 0)})"`;
+          for (const p of paths.fill) {
+            if (!p.svgPath) continue;
+            parts.push(`<g${tf2}><path d="${p.svgPath}" fill="${color}"/></g>`);
+          }
+        } catch { /* undecodable vector — skip */ }
+        return;
+      }
+      for (const k of fig.kidsOf.get(nid) ?? []) emit(k, depth + 1);
+    };
+    for (const k of fig.kidsOf.get(compId) ?? []) emit(k, 1);
+    const compW = comp.size?.x ?? 24;
+    const scale = instW > 0 && compW > 0 && instW !== 24 ? instW / compW : 1;
+    const wrap = scale !== 1 ? `<g transform="scale(${r(scale)})">${parts.join("")}</g>` : parts.join("");
+    return `<g${tf}${opacity}>${wrap}</g>`;
+  };
+  // contextual icon kind/color for stale Dismiss-Circle instances, derived
+  // from the nearest icon-button variant component (matches Figma's library):
+  // Danger→red trash, Tertiary→white bare ✕, Secondary-M→gray trash,
+  // Secondary-S→gray plus, labeled Secondary button→plus in the label color
+  const iconHintFor = (compId: string | undefined, nodeName: string | undefined, hint?: IconHint): IconHint | undefined => {
+    const cname = (compId ? fig.nodes.get(compId)?.name : undefined) ?? nodeName;
+    if (!cname) return undefined;
+    if (/Type=Danger/.test(cname)) return { kind: "Delete", color: "#E83F4F", listCtx: hint?.listCtx };
+    if (/Type=Tertiary/.test(cname)) return { kind: "Dismiss", color: "#FFFFFF", listCtx: hint?.listCtx };
+    if (/Type=Secondary/.test(cname)) {
+      // small secondary icon buttons are select-clear ✕ circles — correct baked
+      if (/Size=S/.test(cname)) return hint?.listCtx ? { kind: "Add", color: "#6A7187", listCtx: true } : undefined;
+      const sibText = (fig.kidsOf.get(compId ?? "") ?? [])
+        .map((k) => fig.nodes.get(k))
+        .find((k) => k?.type === "TEXT");
+      if (sibText) return { kind: "Add", color: paintInfo(sibText.fillPaints).fill ?? "#6A7187", listCtx: hint?.listCtx };
+      return { kind: hint?.listCtx ? "Add" : "Delete", color: "#6A7187", listCtx: hint?.listCtx };
+    }
+    if (/Add condition/i.test(cname)) return { kind: "Add", color: "#6A41C9" };
+    return undefined;
+  };
 
   /**
    * Minimal auto-layout for instances whose resolved component is a Figma
@@ -546,7 +621,10 @@ export function renderNodeSVG(
     const total = items.reduce((a, it) => a + it.w, 0) + spacing * (items.length - 1);
     const t1 = items[1].cn.transform;
     const bakedGap = t1 ? (horiz ? t1.m02 : t1.m12) - (horiz ? items[0].cn.transform?.m02 ?? 0 : items[0].cn.transform?.m12 ?? 0) - items[0].bakedW : 0;
-    const between = total < main - 2 * padMain - 12 && bakedGap > spacing * 3 + 8;
+    const between = (total < main - 2 * padMain - 12 && bakedGap > spacing * 3 + 8)
+      // "Leading content … Trailing content=N icon button" headers pin the
+      // trailing button to the right edge regardless of baked positions
+      || (horiz && items.length === 2 && /Trailing content=.*icon button/i.test(comp?.name ?? ""));
     const overflow = items.some((it) => it.w > it.bakedW + 2);
     if (!(overflow || (between && items.length === 2))) return;
     let p = padMain;
@@ -573,6 +651,7 @@ export function renderNodeSVG(
     overrideMap?: Map<string, SlotBinding>,
     dir?: DirNode,
     parentW?: number,
+    hint?: IconHint,
   ): string => {
     if (depth > maxDepth || nodeCount >= maxNodes) return "";
     const n = fig.nodes.get(id);
@@ -620,7 +699,13 @@ export function renderNodeSVG(
           const fs = n.fontSize ?? 14;
           const family = n.fontName?.family ?? "Inter";
           const align = n.textAlignHorizontal === "CENTER" ? ' text-anchor="middle"' : n.textAlignHorizontal === "RIGHT" ? ' text-anchor="end"' : "";
-          const x = n.textAlignHorizontal === "CENTER" ? w / 2 : n.textAlignHorizontal === "RIGHT" ? w : 0;
+          // a grown swapped instance re-centers its CENTERED label across the
+          // full width; left/right-aligned texts keep their baked anchor
+          const x = bound?.boundW && n.textAlignHorizontal === "CENTER"
+            ? Math.max(0, bound.boundW / 2 - (n.transform?.m02 ?? 0))
+            : n.textAlignHorizontal === "CENTER"
+              ? w / 2
+              : n.textAlignHorizontal === "RIGHT" ? w : 0;
           return `<text${tf} x="${r(x)}" y="${r(fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillHere}"${align}>${esc(propText)}</text>`;
         }
         if (noText) return "";
@@ -653,6 +738,13 @@ export function renderNodeSVG(
             swapApplied = { newSym: node.swapSym };
             symId = node.swapSym;
           }
+          // stale icon remap: this instance resolves to an outdated circle-✕
+          // while an enclosing icon button declares the real glyph
+          const resolvedName = symId ? fig.nodes.get(symId)?.name ?? "" : "";
+          if ((resolvedName === "Dismiss Circle" || resolvedName === "Dismiss") && hint) {
+            const mapped = iconIndexFor()[hint.kind];
+            if (mapped) return emitIcon(mapped, hint.color, tf, opacity, w);
+          }
           if (symId) {
             childOverrideMap = buildSlotMap(n, symId, { dir: node, inheritedAssigns: new Map([...(dir?.assigns ?? [])]) });
             if (node) childDir = node;
@@ -668,6 +760,16 @@ export function renderNodeSVG(
           for (const [k2, v2] of overrideMap) merged.set(k2, v2);
           childOverrideMap = merged;
         }
+        // contextual icon hints for stale icon instances in this subtree
+        let childHint = hint;
+        {
+          const resId = n.type === "INSTANCE" ? (swapApplied?.newSym ?? symId0Of(n)) ?? undefined : undefined;
+          const cname = resId ? fig.nodes.get(resId)?.name : n.name;
+          const nameHere = `${n.name ?? ""} ${cname ?? ""}`;
+          const listCtx = !!hint?.listCtx || /fieldselection|Available fields/i.test(nameHere);
+          const own = iconHintFor(resId, n.type === "INSTANCE" ? undefined : n.name, hint);
+          childHint = own ? { ...own, listCtx } : listCtx ? { ...(hint ?? {}), listCtx: true } : hint;
+        }
         if (depth < maxDepth && nodeCount < maxNodes) {
           let childIds = fig.kidsOf.get(id) ?? [];
           if (n.type === "INSTANCE" && childIds.length === 0) {
@@ -676,11 +778,21 @@ export function renderNodeSVG(
           }
           const kidDir = n.type === "INSTANCE" ? (childDir ?? dir) : dir;
           for (const kid of childIds) {
-            childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w);
+            childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w, childHint);
           }
         }
 
         let inner = childrenSvg;
+        // segmented radios ("Amount=N"): the variant content is wider than the
+        // baked instance box — Figma's constraints compress it back to fit
+        {
+          const scId = swapApplied?.newSym ?? symId0Of(n);
+          const sc = scId ? fig.nodes.get(scId) : undefined;
+          const cw = sc?.size?.x ?? 0;
+          if (/Amount=\d/.test(sc?.name ?? "") && cw > w + 2 && cw > 0) {
+            inner = `<g transform="scale(${r(w / cw)},1)">${inner}</g>`;
+          }
+        }
         // instances ALWAYS clip: component subtrees carry variant sections
         // outside the instance box that the live design never draws
         const clips = n.type === "INSTANCE" || (n.type === "FRAME" && n.clipsContent === true);
