@@ -692,7 +692,13 @@ export function renderNodeSVG(
             if (!d) continue;
             runs += `<g transform="translate(${r(g.position?.x ?? 0)},${r(g.position?.y ?? 0)}) scale(${r(g.fontSize ?? 14)},${-r(g.fontSize ?? 14)})"><path d="${d}" fill="${fillHere}"/></g>`;
           }
-          if (runs) return `<g${tf}>${runs}</g>`;
+          if (runs) {
+            // fixed-size text clips overflow lines (Figma auto-height boxes
+            // bake their full height, so this only trims genuine overflow)
+            const clipId = `tclip${clipSeq++}`;
+            defs.push(`<clipPath id="${clipId}"><rect x="0" y="0" width="99999" height="${Math.max(h, 1)}"/></clipPath>`);
+            return `<g${tf}><g clip-path="url(#${clipId})">${runs}</g></g>`;
+          }
         }
         const propText = bound?.propText;
         if (propText) {
