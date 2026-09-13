@@ -750,6 +750,27 @@ export function renderNodeSVG(
             if (node) childDir = node;
             applyStackLayout(symId, n, node);
           }
+          // Figma constraints emulation. The snapshot bakes select/textfield
+          // contents at the component's hug width while the live instance is
+          // stretched: grow the inner "input" pill frame to the instance
+          // width and pin its trailing icon button to the right edge.
+          const compNode0 = symId ? fig.nodes.get(symId) : undefined;
+          const compW0 = compNode0?.size?.x ?? 0;
+          if (compNode0 && w > compW0 + 2 && /input\.(select|textfield)|Filled\?=|Clearable/.test(compNode0.name ?? "")) {
+            for (const k of fig.kidsOf.get(symId) ?? []) {
+              const kn = fig.nodes.get(k);
+              if (kn?.type === "FRAME" && kn.name === "input" && kn.size) {
+                kn.size = { ...kn.size, x: w };
+                for (const k2 of fig.kidsOf.get(k) ?? []) {
+                  const k2n = fig.nodes.get(k2);
+                  if (k2n?.type === "INSTANCE" && k2n.transform) {
+                    const iw = k2n.size?.x ?? 24;
+                    k2n.transform = { ...k2n.transform, m02: w - iw - 12 };
+                  }
+                }
+              }
+            }
+          }
         } else if (n.stackMode && dir) {
           // frames inside an instance's component subtree only — doc-level
           // stacks carry correct baked positions already
@@ -783,14 +804,21 @@ export function renderNodeSVG(
         }
 
         let inner = childrenSvg;
-        // segmented radios ("Amount=N"): the variant content is wider than the
-        // baked instance box — Figma's constraints compress it back to fit
+        // component content wider than the instance box: small overflows are
+        // centered (icon glyphs keep full size), large ones compressed
+        // (segmented radios / wide variants — Figma layout constraints)
         {
           const scId = swapApplied?.newSym ?? symId0Of(n);
           const sc = scId ? fig.nodes.get(scId) : undefined;
           const cw = sc?.size?.x ?? 0;
-          if (/Amount=\d/.test(sc?.name ?? "") && cw > w + 2 && cw > 0) {
-            inner = `<g transform="scale(${r(w / cw)},1)">${inner}</g>`;
+          const ch = sc?.size?.y ?? 0;
+          if (cw > w + 2 && cw > 0) {
+            const diff = cw - w;
+            if (diff <= 16) {
+              inner = `<g transform="translate(${r(-diff / 2)},${r(-Math.max(0, ch - h) / 2)})">${inner}</g>`;
+            } else {
+              inner = `<g transform="scale(${r(w / cw)},1)">${inner}</g>`;
+            }
           }
         }
         // instances ALWAYS clip: component subtrees carry variant sections
