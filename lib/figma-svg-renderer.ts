@@ -277,6 +277,120 @@ function mergeDirChildren(anc: Map<string, DirNode>, own: Map<string, DirNode>):
   return out;
 }
 
+
+// ─── Absolute (Figma-export-style) serialization ────────────────────────────
+// Figma's Copy-as-SVG flattens the document to absolute-coordinate paths:
+// text becomes glyph outline paths (one per line), frames become their exact
+// fill geometry, clips become clipPaths. All numbers = frame-space. This
+// mirrors that serialization using the geometry baked into the .fig.
+
+type Mat = [number, number, number, number, number, number];
+const M_ID: Mat = [1, 0, 0, 1, 0, 0];
+const mulM = (m: Mat, n: Mat): Mat => [
+  m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],
+  m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
+  m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5],
+];
+const nodeMat = (n: any): Mat => {
+  const t = n.transform;
+  // Figma [[m00,m01,m02],[m10,m11,m12]] → SVG matrix(a,b,c,d,e,f) =
+  // [m00, m10, m01, m11, m02, m12]
+  return t ? [t.m00, t.m10, t.m01, t.m11, t.m02, t.m12] : M_ID;
+};
+const scaleM = (sx: number, sy: number): Mat => [sx, 0, 0, sy, 0, 0];
+const transM = (x: number, y: number): Mat => [1, 0, 0, 1, x, y];
+
+function xf(v: number): string {
+  const r = Math.round(v * 1000) / 1000;
+  return (Object.is(r, -0) ? 0 : r).toString();
+}
+
+/** apply a 2x3 matrix to an absolute-command SVG path, Figma-style output */
+function xfPath(d: string, m: Mat): string {
+  if (m[0] === 1 && m[1] === 0 && m[2] === 0 && m[3] === 1 && m[4] === 0 && m[5] === 0) return d;
+  const dbg = process.env.FIGMA_DEBUG_SLOTS === "1";
+  const toks = d.match(/[MmLlHhVvCcSsQqTtAaZz]|-?\d*\.?\d+(?:e[-+]?\d+)?/g) ?? [];
+  let out = "";
+  let cmd = "";
+  const nums: number[] = [];
+  let cx = 0, cy = 0;      // current point (source space)
+  let px = NaN, py = NaN;  // last emitted point (dest space)
+  const flush = (): void => {
+    if (!cmd || nums.length === 0) { nums.length = 0; return; }
+    const p = nums;
+    const tp = (x: number, y: number): number[] => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+    let seg = "";
+    if (cmd === "M" || cmd === "L") {
+      const [X, Y] = tp(p[0], p[1]);
+      seg = !isNaN(px) && Math.abs(Y - py) < 5e-4 && (cmd === "L") ? `H${xf(X)}` : `${cmd}${xf(X)} ${xf(Y)}`;
+      px = X; py = Y;
+    } else if (cmd === "C") {
+      const q = [...tp(p[0], p[1]), ...tp(p[2], p[3]), ...tp(p[4], p[5])].map(xf);
+      seg = `C${q.join(" ")}`;
+      px = Number(q[4]); py = Number(q[5]);
+    } else if (cmd === "Q") {
+      const q = [...tp(p[0], p[1]), ...tp(p[2], p[3])].map(xf);
+      seg = `Q${q.join(" ")}`;
+      px = Number(q[2]); py = Number(q[3]);
+    } else if (cmd === "Z") {
+      seg = "Z";
+      px = NaN; py = NaN;
+    }
+    out += seg;
+    nums.length = 0;
+  };
+  for (const tk of toks) {
+    if (/[a-zA-Z]/.test(tk)) {
+      flush();
+      const up = tk.toUpperCase();
+      if (up === "M") { /* close prev subpath implicitly */ }
+      cmd = up === "M" ? "M" : up;
+      if (up === "Z") { flush(); out += "Z"; cmd = ""; }
+      if (up === "M") { /* new subpath start tracked on coords */ }
+      continue;
+    }
+    const v = parseFloat(tk);
+    if (Number.isNaN(v)) continue;
+    nums.push(v);
+    const need: Record<string, number> = { M: 2, L: 2, H: 1, V: 1, C: 6, S: 4, Q: 4, T: 2, A: 7 };
+    if (cmd && nums.length >= (need[cmd] ?? 99)) {
+      if (cmd === "H") { cx = nums[0]; const [X, Y] = [m[0]*cx+m[2]*cy+m[4], m[1]*cx+m[3]*cy+m[5]]; out += `H${xf(X)}`; px = X; py = Y; nums.length = 0; cmd = "L"; continue; }
+      if (cmd === "V") { cy = nums[0]; const [X, Y] = [m[0]*cx+m[2]*cy+m[4], m[1]*cx+m[3]*cy+m[5]]; out += `V${xf(Y)}`; px = X; py = Y; nums.length = 0; cmd = "L"; continue; }
+      if (cmd === "M" || cmd === "L") { cx = nums[0]; cy = nums[1]; }
+      else if (cmd === "C") { cx = nums[4]; cy = nums[5]; }
+      else if (cmd === "Q") { cx = nums[2]; cy = nums[3]; }
+      flush();
+    }
+  }
+  flush();
+  if (dbg && out.includes("NaN")) console.error(`[xfNaN] in="${d.slice(0, 120)}" mat=[${m.map(r)}] out="${out.slice(0, 120)}"`);
+  return out;
+}
+
+/** synthesize a rounded-rect path (Figma kappa 0.5177 corner curves) */
+function roundedRectPath(x: number, y: number, w: number, h: number, r: number): string {
+  const rr = Math.min(r, w / 2, h / 2);
+  const k = rr * 0.5177;
+  const x2 = x + w, y2 = y + h;
+  return (
+    `M${xf(x + rr)} ${xf(y)}H${xf(x2 - rr)}C${xf(x2 - rr + k)} ${xf(y)} ${xf(x2)} ${xf(y + rr - k)} ${xf(x2)} ${xf(y + rr)}` +
+    `V${xf(y2 - rr)}C${xf(x2)} ${xf(y2 - rr + k)} ${xf(x2 - rr + k)} ${xf(y2)} ${xf(x2 - rr)} ${xf(y2)}` +
+    `H${xf(x + rr)}C${xf(x + rr - k)} ${xf(y2)} ${xf(x)} ${xf(y2 - rr + k)} ${xf(x)} ${xf(y2 - rr)}` +
+    `V${xf(y + rr)}C${xf(x)} ${xf(y + rr - k)} ${xf(x + rr - k)} ${xf(y)} ${xf(x + rr)} ${xf(y)}Z`
+  );
+}
+
+/** synthesize an ellipse path (4 kappa cubics) */
+function ellipsePath(cx: number, cy: number, rx: number, ry: number): string {
+  const kx = rx * 0.5522847498, ky = ry * 0.5522847498;
+  return (
+    `M${xf(cx)} ${xf(cy - ry)}C${xf(cx + kx)} ${xf(cy - ry)} ${xf(cx + rx)} ${xf(cy - ky)} ${xf(cx + rx)} ${xf(cy)}` +
+    `C${xf(cx + rx)} ${xf(cy + ky)} ${xf(cx + kx)} ${xf(cy + ry)} ${xf(cx)} ${xf(cy + ry)}` +
+    `C${xf(cx - kx)} ${xf(cy + ry)} ${xf(cx - rx)} ${xf(cy + ky)} ${xf(cx - rx)} ${xf(cy)}` +
+    `C${xf(cx - rx)} ${xf(cy - ky)} ${xf(cx - kx)} ${xf(cy - ry)} ${xf(cx)} ${xf(cy - ry)}Z`
+  );
+}
+
 export function renderNodeSVG(
   doc: any,
   fig: MergedFig,
@@ -652,71 +766,84 @@ export function renderNodeSVG(
     dir?: DirNode,
     parentW?: number,
     hint?: IconHint,
+    mat: Mat = M_ID,
   ): string => {
     if (depth > maxDepth || nodeCount >= maxNodes) return "";
     const n = fig.nodes.get(id);
     if (!n || n.visible === false) return "";
     nodeCount++;
 
-    const t = n.transform ?? { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0 };
-    const tf = depth === 0 ? "" : ` transform="matrix(${r(t.m00)},${r(t.m10)},${r(t.m01)},${r(t.m11)},${r(t.m02)},${r(t.m12)})"`;
     const opacity = typeof n.opacity === "number" && n.opacity < 1 ? ` opacity="${r(n.opacity)}"` : "";
+
     const { fill, fillOpacity, imageHash, stops } = paintInfo(n.fillPaints);
-    let gradient = "";
-    if (stops) {
-      const gid = `grad${gradSeq++}`;
-      defs.push(
-        `<linearGradient id="${gid}" x1="0" y1="0" x2="1" y2="0">` +
-          stops
-            .map((s: any) => `<stop offset="${r((Number(s.position) || 0) * 100)}%" stop-color="${hexFill(s) ?? "#000"}"/>`)
-            .join("") +
-          `</linearGradient>`,
-      );
-      gradient = `url(#${gid})`;
-    }
+    const fillHere = fill && fillOpacity > 0.001 ? fill : undefined;
     let w = n.size ? Math.round(n.size.x) : 0;
     let h = n.size ? Math.round(n.size.y) : 0;
+    const fo = fill && fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : "";
+
+    /** exact fill geometry of this node transformed to absolute space */
+    const geomAbs = (): string | null => {
+      try {
+        const paths = resolveVectorNodePaths(doc, n as any);
+        const parts: string[] = [];
+        for (const p of paths.fill) {
+          if (!p.svgPath) continue;
+          parts.push(xfPath(p.svgPath, mat));
+        }
+        if (parts.length) return parts.join("");
+      } catch { /* fall through */ }
+      if (n.type === "RECTANGLE" || n.type === "ROUNDED_RECTANGLE" || n.type === "FRAME" || n.type === "INSTANCE") {
+        const rad = n.cornerRadius ?? 0;
+        if (rad > 0) return roundedRectPath(mat[4], mat[5], w, h, rad);
+        return null;
+      }
+      return null;
+    };
 
     switch (n.type) {
       case "TEXT": {
         const bound = overrideMap?.get(id);
         if (bound?.hidden) return "";
-        const fillHere = bound?.fill ?? fill ?? "#1a152b";
-        // a resolved binding (even glyph-less, e.g. prop-text) suppresses the
-        // node's own stale cached run
-        const glyphs = bound ? bound.glyphs : noText ? null : n.derivedTextData?.glyphs;
+        const fillC = bound?.fill ?? fill ?? "#1a152b";
+        // a resolved binding owns the text: use ONLY its glyph runs (a
+        // prop-text binding without runs falls through to the <text> branch);
+        // unbound nodes fall back to their own cached derived runs
+        const glyphs = bound
+          ? (bound.glyphs?.length ? bound.glyphs : undefined)
+          : (noText ? undefined : n.derivedTextData?.glyphs);
         if (glyphs && glyphs.length) {
-          let runs = "";
+          const lines = new Map<number, string[]>();
+          const fs0 = n.fontSize ?? 14;
           for (const g of glyphs) {
+            const gx = g.position?.x ?? 0;
+            const gy = g.position?.y ?? 0;
+            const fs = g.fontSize ?? fs0;
             const d = glyphPathD(doc, g.commandsBlob);
             if (!d) continue;
-            runs += `<g transform="translate(${r(g.position?.x ?? 0)},${r(g.position?.y ?? 0)}) scale(${r(g.fontSize ?? 14)},${-r(g.fontSize ?? 14)})"><path d="${d}" fill="${fillHere}"/></g>`;
+            const gm = mulM(mat, [fs, 0, 0, -fs, gx, gy]);
+            const dd = xfPath(d, gm);
+            const key = Math.round(gy * 10);
+            if (!lines.has(key)) lines.set(key, []);
+            lines.get(key)!.push(dd);
           }
-          if (runs) return `<g${tf}>${runs}</g>`;
-        }
-        const propText = bound?.propText;
-        if (propText) {
-          const fs = n.fontSize ?? 14;
-          const family = n.fontName?.family ?? "Inter";
-          const align = n.textAlignHorizontal === "CENTER" ? ' text-anchor="middle"' : n.textAlignHorizontal === "RIGHT" ? ' text-anchor="end"' : "";
-          // a grown swapped instance re-centers its CENTERED label across the
-          // full width; left/right-aligned texts keep their baked anchor
-          const x = bound?.boundW && n.textAlignHorizontal === "CENTER"
-            ? Math.max(0, bound.boundW / 2 - (n.transform?.m02 ?? 0))
-            : n.textAlignHorizontal === "CENTER"
-              ? w / 2
-              : n.textAlignHorizontal === "RIGHT" ? w : 0;
-          return `<text${tf} x="${r(x)}" y="${r(fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillHere}"${align}>${esc(propText)}</text>`;
+          let merged = "";
+          for (const parts of [...lines.values()].sort((a, b) => a[0].localeCompare(b[0]))) merged += parts.join("");
+          if (merged) return `<path d="${merged}" fill="${fillC}"${opacity}/>`;
         }
         if (noText) return "";
+        const propText = bound?.propText;
         const fs = n.fontSize ?? 14;
-        const chars = n.textData?.characters ?? "";
-        if (!chars) return "";
         const family = n.fontName?.family ?? "Inter";
         const align = n.textAlignHorizontal === "CENTER" ? ' text-anchor="middle"' : n.textAlignHorizontal === "RIGHT" ? ' text-anchor="end"' : "";
-        const x = n.textAlignHorizontal === "CENTER" ? w / 2 : n.textAlignHorizontal === "RIGHT" ? w : 0;
-        const y = r(fs * 0.8);
-        return `<text${tf} x="${r(x)}" y="${y}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillHere}"${align}>${esc(chars)}</text>`;
+        const anchorX = bound?.boundW && n.textAlignHorizontal === "CENTER"
+          ? Math.max(0, bound.boundW / 2 - (n.transform?.m02 ?? 0))
+          : n.textAlignHorizontal === "CENTER" ? w / 2 : n.textAlignHorizontal === "RIGHT" ? w : 0;
+        const chars = propText ?? n.textData?.characters ?? "";
+        if (!chars) return "";
+        const t = n.transform ?? { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0 };
+        const ax = mat[0] * (t.m02 ?? 0) + mat[2] * (t.m12 ?? 0) + mat[4];
+        const ay = mat[1] * (t.m02 ?? 0) + mat[3] * (t.m12 ?? 0) + mat[5];
+        return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${opacity}>${esc(chars)}</text>`;
       }
       case "FRAME":
       case "SECTION":
@@ -738,21 +865,41 @@ export function renderNodeSVG(
             swapApplied = { newSym: node.swapSym };
             symId = node.swapSym;
           }
-          // stale icon remap: this instance resolves to an outdated circle-✕
-          // while an enclosing icon button declares the real glyph
-          const resolvedName = symId ? fig.nodes.get(symId)?.name ?? "" : "";
-          if ((resolvedName === "Dismiss Circle" || resolvedName === "Dismiss") && hint) {
-            const mapped = iconIndexFor()[hint.kind];
-            if (mapped) return emitIcon(mapped, hint.color, tf, opacity, w);
-          }
           if (symId) {
             childOverrideMap = buildSlotMap(n, symId, { dir: node, inheritedAssigns: new Map([...(dir?.assigns ?? [])]) });
             if (node) childDir = node;
             applyStackLayout(symId, n, node);
           }
-          // segmented radios ("Amount=N"): reflow each option container into
-          // the instance width (option width = instW/N) and re-center its
-          // texts, so labels keep full size instead of being scaled down
+          // stale icon remap: outdated circle-✕ instances render the real
+          // glyph component (trash / plus / bare ✕) declared by the context
+          const resolvedName0 = symId ? fig.nodes.get(symId)?.name ?? "" : "";
+          if ((resolvedName0 === "Dismiss Circle" || resolvedName0 === "Dismiss") && hint?.kind) {
+            const mapped = iconIndexFor()[hint.kind];
+            if (mapped) {
+              const color = hint.color ?? "#6A7187";
+              const parts: string[] = [];
+              const emitV = (nid: string): void => {
+                const cn = fig.nodes.get(nid);
+                if (!cn || cn.visible === false) return;
+                if (cn.type === "VECTOR") {
+                  try {
+                    const paths = resolveVectorNodePaths(doc, cn as any);
+                    const vm = mulM(mat, nodeMat(cn));
+                    for (const p of paths.fill) {
+                      if (!p.svgPath) continue;
+                      parts.push(`<path d="${xfPath(p.svgPath, vm)}" fill="${color}"/>`);
+                    }
+                  } catch { /* skip */ }
+                  return;
+                }
+                for (const k of fig.kidsOf.get(nid) ?? []) emitV(k);
+              };
+              for (const k of fig.kidsOf.get(mapped) ?? []) emitV(k);
+              if (parts.length) return parts.join("");
+            }
+          }
+          // segmented radios ("Amount=N"): reflow option containers into the
+          // instance width and re-center their texts
           const radioComp = symId ? fig.nodes.get(symId) : undefined;
           const radioMatch = /Amount=(\d+)/.exec(radioComp?.name ?? "");
           if (radioMatch && w > 0 && (radioComp?.size?.x ?? 0) > w + 2) {
@@ -778,10 +925,7 @@ export function renderNodeSVG(
               idx++;
             }
           }
-          // Figma constraints emulation. The snapshot bakes select/textfield
-          // contents at the component's hug width while the live instance is
-          // stretched: grow the inner "input" pill frame to the instance
-          // width and pin its trailing icon button to the right edge.
+          // stretched selects: grow the inner "input" pill, right-pin its icon
           const compNode0 = symId ? fig.nodes.get(symId) : undefined;
           const compW0 = compNode0?.size?.x ?? 0;
           if (compNode0 && w > compW0 + 2 && /input\.(select|textfield)|Filled\?=|Clearable/.test(compNode0.name ?? "")) {
@@ -800,8 +944,6 @@ export function renderNodeSVG(
             }
           }
         } else if (n.stackMode && dir) {
-          // frames inside an instance's component subtree only — doc-level
-          // stacks carry correct baked positions already
           applyStackLayout(id, n, dir);
         }
         if (childOverrideMap && overrideMap && overrideMap.size) {
@@ -809,6 +951,7 @@ export function renderNodeSVG(
           for (const [k2, v2] of overrideMap) merged.set(k2, v2);
           childOverrideMap = merged;
         }
+
         // contextual icon hints for stale icon instances in this subtree
         let childHint = hint;
         {
@@ -819,6 +962,7 @@ export function renderNodeSVG(
           const own = iconHintFor(resId, n.type === "INSTANCE" ? undefined : n.name, hint);
           childHint = own ? { ...own, listCtx } : listCtx ? { ...(hint ?? {}), listCtx: true } : hint;
         }
+
         if (depth < maxDepth && nodeCount < maxNodes) {
           let childIds = fig.kidsOf.get(id) ?? [];
           if (n.type === "INSTANCE" && childIds.length === 0) {
@@ -827,72 +971,77 @@ export function renderNodeSVG(
           }
           const kidDir = n.type === "INSTANCE" ? (childDir ?? dir) : dir;
           for (const kid of childIds) {
-            childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w, childHint);
+            const kn = fig.nodes.get(kid);
+            childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w, childHint, mulM(mat, nodeMat(kn ?? {})));
           }
         }
 
-        let inner = childrenSvg;
-        // component content wider than the instance box: small overflows are
-        // centered (icon glyphs keep full size), large ones compressed
-        {
-          const scId = swapApplied?.newSym ?? symId0Of(n);
-          const sc = scId ? fig.nodes.get(scId) : undefined;
+        // variant content wider than the instance compresses into it
+        // (segmented radios reflow per-option instead — see above)
+        if (swapApplied) {
+          const sc = fig.nodes.get(swapApplied.newSym);
           const cw = sc?.size?.x ?? 0;
-          const ch = sc?.size?.y ?? 0;
           if (cw > w + 2 && cw > 0 && !/Amount=\d/.test(sc?.name ?? "")) {
-            const diff = cw - w;
-            if (diff <= 16) {
-              inner = `<g transform="translate(${r(-diff / 2)},${r(-Math.max(0, ch - h) / 2)})">${inner}</g>`;
-            } else {
-              inner = `<g transform="scale(${r(w / cw)},1)">${inner}</g>`;
-            }
+            childrenSvg = `<g transform="scale(${r(w / cw)},1)">${childrenSvg}</g>`;
           }
         }
-        // instances ALWAYS clip: component subtrees carry variant sections
-        // outside the instance box that the live design never draws
-        const clips = n.type === "INSTANCE" || (n.type === "FRAME" && n.clipsContent === true);
-        if (clips && inner && w > 0 && h > 0) {
-          const cid = `clip${clipSeq++}`;
-          defs.push(`<clipPath id="${cid}"><rect x="0" y="0" width="${w}" height="${h}"/></clipPath>`);
-          inner = `<g clip-path="url(#${cid})">${inner}</g>`;
-        }
-        let bg = "";
-        let paint = gradient || (fill && n.type !== "GROUP" ? fill : undefined);
+
+        // node background (absolute geometry)
+        let shapeSvg = "";
+        const geomD = geomAbs();
+        const hasRad = (n.cornerRadius ?? 0) > 0;
+        let paint = fill && n.type !== "GROUP" ? fill : undefined;
         if (swapApplied) {
-          // the variant component carries the visual identity (e.g. danger red)
           const comp = fig.nodes.get(swapApplied.newSym);
           const ci = comp ? paintInfo(comp.fillPaints) : null;
           if (ci?.fill) paint = ci.fill;
         }
-        const bgFo = fill && fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : "";
-        const rad = n.cornerRadius ?? n.rectangleTopLeftCornerRadius ?? 0;
-        const rxAttr = rad ? ` rx="${r(rad)}"` : "";
-        if (paint || strokeText(n) || (rad && n.type !== "GROUP")) {
-          bg = `<rect x="0" y="0" width="${w}" height="${h}" fill="${paint ?? "none"}"${bgFo}${rxAttr}${strokeText(n)}/>`;
+        const fo2 = fill && fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : "";
+        if (paint || strokeText(n)) {
+          if (geomD) {
+            shapeSvg = `<path d="${geomD}" fill="${paint ?? "none"}"${fo2}${strokeText(n)}${opacity}/>`;
+          } else {
+            shapeSvg = `<rect x="${xf(mat[4])}" y="${xf(mat[5])}" width="${w}" height="${h}" fill="${paint ?? "none"}"${fo2}${opacity}/>`;
+          }
         }
+
         let img = "";
         if (imageHash && w > 0 && h > 0) {
           const bytes = images.get(imageHash);
           if (bytes) {
             const uri = `data:${sniffImageMime(bytes)};base64,${Buffer.from(bytes).toString("base64")}`;
-            img = `<image x="0" y="0" width="${w}" height="${h}" href="${uri}" preserveAspectRatio="xMidYMid slice"/>`;
-          } else {
-            warnings.push(`image ${imageHash} not found in doc.images`);
+            img = `<image x="${xf(mat[4])}" y="${xf(mat[5])}" width="${w}" height="${h}" href="${uri}" preserveAspectRatio="xMidYMid slice"/>`;
           }
         }
-        return `<g${tf}${opacity}>${bg}${img}${inner}</g>`;
+
+        // clip children to the instance/frame box
+        const clips = n.type === "INSTANCE" || (n.type === "FRAME" && n.clipsContent === true);
+        let out = `${shapeSvg}${img}${childrenSvg}`;
+        if (clips && childrenSvg && w > 0 && h > 0) {
+          const cid = `clip${clipSeq + 1}_${frameTag}`;
+          clipSeq++;
+          const clipGeom = roundedRectPath(mat[4], mat[5], w, h, hasRad ? (n.cornerRadius ?? 0) : 0);
+          defs.push(`<clipPath id="${cid}"><path d="${clipGeom}"/></clipPath>`);
+          out = `<g clip-path="url(#${cid})">${out}</g>`;
+        }
+        return out;
       }
       case "RECTANGLE":
       case "ROUNDED_RECTANGLE": {
-        const rx = n.cornerRadius ? ` rx="${r(n.cornerRadius)}"` : "";
-        const paint = gradient || fill || "none";
+        const rad = n.cornerRadius ?? 0;
+        const paint = fill || "none";
         const fo = fill && fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : "";
-        return `<rect x="0" y="0" width="${w}" height="${h}"${rx} fill="${paint}"${fo}${strokeText(n)}${opacity}/>`;
+        if (rad > 0) {
+          const d = roundedRectPath(0, 0, w, h, rad);
+          return `<path d="${xfPath(d, mat)}" fill="${paint}"${fo}${strokeText(n)}${opacity}/>`;
+        }
+        return `<rect x="${xf(mat[4])}" y="${xf(mat[5])}" width="${w}" height="${h}" fill="${paint}"${fo}${strokeText(n)}${opacity}/>`;
       }
       case "ELLIPSE": {
-        const paint = gradient || fill || "none";
+        const paint = fill || "none";
         const fo = fill && fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : "";
-        return `<ellipse cx="${r(w / 2)}" cy="${r(h / 2)}" rx="${r(w / 2)}" ry="${r(h / 2)}" fill="${paint}"${fo}${opacity}/>`;
+        const d = ellipsePath(w / 2, h / 2, w / 2, h / 2);
+        return `<path d="${xfPath(d, mat)}" fill="${paint}"${fo}${strokeText(n)}${opacity}/>`;
       }
       case "VECTOR":
       case "BOOLEAN_OPERATION":
@@ -905,11 +1054,11 @@ export function renderNodeSVG(
           for (const p of paths.fill) {
             if (!p.svgPath) continue;
             const pf = p.paints?.find((pp: any) => pp?.type === "SOLID");
-            g.push(`<path d="${p.svgPath}" fill="${(pf && hexFill(pf)) || fill || "none"}"${opacity}/>`);
+            g.push(`<path d="${xfPath(p.svgPath, mat)}" fill="${(pf && hexFill(pf)) || fill || "none"}"${opacity}/>`);
           }
           for (const p of paths.stroke) {
             if (!p.svgPath) continue;
-            g.push(`<path d="${p.svgPath}" fill="none" stroke="${fill ?? "#000"}" stroke-width="${r(n.strokeWeight ?? 1)}"${opacity}/>`);
+            g.push(`<path d="${xfPath(p.svgPath, mat)}" fill="none" stroke="${fill ?? "#000"}" stroke-width="${r(n.strokeWeight ?? 1)}"${opacity}/>`);
           }
           if (g.length) return g.join("");
         } catch (e) {
@@ -926,14 +1075,17 @@ export function renderNodeSVG(
     return guidStr(n.symbolData?.symbolID);
   }
 
-  const inner = walk(rootId, 0, false);
+  const frameTag = rootId.replace(/[^0-9A-Za-z]/g, "_");
+  defs.push(`<clipPath id="clip0_${frameTag}"><rect width="${W}" height="${H}"/></clipPath>`);
+  const inner = walk(rootId, 0, false, undefined, undefined, undefined, undefined, M_ID);
 
   const svg =
-    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">\n` +
-    (defs.length ? `<defs>${defs.join("")}</defs>\n` : "") +
+    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" fill="none">\n` +
+    `<defs>${defs.join("")}</defs>\n` +
+    `<g clip-path="url(#clip0_${frameTag})">\n` +
     `<rect width="${W}" height="${H}" fill="#ffffff"/>\n` +
     inner +
-    `\n</svg>\n`;
+    `\n</g>\n</svg>\n`;
 
   return { svg, width: W, height: H, warnings, nodeCount };
 }
