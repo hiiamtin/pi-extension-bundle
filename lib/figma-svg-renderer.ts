@@ -228,10 +228,14 @@ function buildDirectiveTree(instance: RawChange): DirNode {
     if (!glyphs.length) continue;
     const path = guidPathOf(d);
     if (!path.length) continue;
+    // store the run under EVERY ancestor key of the chain (not just the
+    // last): a slot anywhere along the chain binds by its own overrideKey,
+    // and the walk may consume levels from either end
     const node = ensure(path);
-    const last = path[path.length - 1];
-    const prev = node.textByKey.get(last);
-    if (!prev || glyphs.length > prev.length) node.textByKey.set(last, glyphs);
+    for (const k of path) {
+      const prev = node.textByKey.get(k);
+      if (!prev || glyphs.length > prev.length) node.textByKey.set(k, glyphs);
+    }
   }
   return root;
 }
@@ -240,16 +244,29 @@ function buildDirectiveTree(instance: RawChange): DirNode {
  * children merge recursively; text runs keep the LONGER (more composed) */
 function mergeDir(anc: DirNode | undefined, own: DirNode): DirNode {
   if (!anc) return own;
-  const out: DirNode = { swapSym: anc.swapSym ?? own.swapSym, assigns: new Map([...own.assigns, ...anc.assigns]), textByKey: new Map(own.textByKey), children: new Map() };
+  // ancestor text runs must SURVIVE the merge: the walk drops one tree level
+  // per nesting, and a run keyed at the ancestor level (e.g. the card title)
+  // addresses a slot inside the merged subtree by its overrideKey.
+  // The ANCESTOR run wins when both exist: instance-level derived data is
+  // rendered from the live instance (e.g. "Lead name"), while the deeper
+  // component-baked run can be the stale library default ("Field name").
+  const textByKey = new Map(own.textByKey);
+  for (const [gk, gv] of anc.textByKey) {
+    const prev = textByKey.get(gk);
+    if (!prev || gv.length > prev.length) textByKey.set(gk, gv);
+  }
+  const out: DirNode = { swapSym: anc.swapSym ?? own.swapSym, assigns: new Map([...own.assigns, ...anc.assigns]), textByKey, children: new Map() };
   const keys = new Set([...own.children.keys(), ...anc.children.keys()]);
   for (const k of keys) {
     const o = own.children.get(k);
     const a = anc.children.get(k);
     if (o && a) {
-      const textByKey = new Map(o.textByKey);
-      for (const [gk, gv] of a.textByKey) {
-        const prev = textByKey.get(gk);
-        if (!prev || gv.length > prev.length) textByKey.set(gk, gv);
+      // ANCESTOR (instance-level) runs win over the deeper component-baked
+      // ones — the instance derived data reflects the live document text,
+      // while the deeper run can be the stale library default
+      const textByKey = new Map(a.textByKey);
+      for (const [gk, gv] of o.textByKey) {
+        if (!textByKey.has(gk)) textByKey.set(gk, gv);
       }
       out.children.set(k, { swapSym: a.swapSym ?? o.swapSym, assigns: new Map([...o.assigns, ...a.assigns]), textByKey, children: mergeDirChildren(a.children, o.children) });
     } else {
@@ -266,10 +283,12 @@ function mergeDirChildren(anc: Map<string, DirNode>, own: Map<string, DirNode>):
     const o = own.get(k);
     const a = anc.get(k);
     if (o && a) {
-      const textByKey = new Map(o.textByKey);
-      for (const [gk, gv] of a.textByKey) {
-        const prev = textByKey.get(gk);
-        if (!prev || gv.length > prev.length) textByKey.set(gk, gv);
+      // ANCESTOR (instance-level) runs win over the deeper component-baked
+      // ones — the instance derived data reflects the live document text,
+      // while the deeper run can be the stale library default
+      const textByKey = new Map(a.textByKey);
+      for (const [gk, gv] of o.textByKey) {
+        if (!textByKey.has(gk)) textByKey.set(gk, gv);
       }
       out.set(k, { swapSym: a.swapSym ?? o.swapSym, assigns: new Map([...o.assigns, ...a.assigns]), textByKey, children: mergeDirChildren(a.children, o.children) });
     } else {
@@ -328,7 +347,13 @@ function xfPath(d: string, m: Mat): string {
     let seg = "";
     if (cmd === "M" || cmd === "L") {
       const [X, Y] = tp(p[0], p[1]);
-      seg = !isNaN(px) && Math.abs(Y - py) < 5e-4 && (cmd === "L") ? `H${xf(X)}` : `${cmd}${xf(X)} ${xf(Y)}`;
+      // "M" whose point matches the previous point is a degenerate glyph
+      // contour start (e.g. the L-stem of "F"): emit "L" — a second "M"
+      // would RESET the current point tracking and truncate the glyph
+      const isDegenerate = !isNaN(px) && Math.abs(X - px) < 5e-4 && Math.abs(Y - py) < 5e-4;
+      seg = isDegenerate || (cmd === "L" && !isNaN(px) && Math.abs(Y - py) < 5e-4)
+        ? `L${xf(X)} ${xf(Y)}`
+        : `${cmd}${xf(X)} ${xf(Y)}`;
       px = X; py = Y;
     } else if (cmd === "C") {
       const q = [...tp(p[0], p[1]), ...tp(p[2], p[3]), ...tp(p[4], p[5])].map(xf);
@@ -449,7 +474,7 @@ export function renderNodeSVG(
     const compW = fig.nodes.get(symId)?.size?.x ?? 0;
     const dir = opts?.dir ?? newDirNode();
 
-    type Slot = { id: string; fs: number; fill: string | undefined; chars: string; parentId: string; nodeX: number; bottom: number; order: number; okey: string | null; textRef: string | null; visRefs: string[] };
+    type Slot = { id: string; fs: number; fill: string | undefined; chars: string; parentId: string; nodeX: number; bottom: number; order: number; okey: string | null; ancKey: string | null; textRef: string | null; visRefs: string[] };
     const slots: Slot[] = [];
     let order = 0;
     (function collect(cid: string, depth: number, parentId: string, ty: number): void {
@@ -469,6 +494,7 @@ export function renderNodeSVG(
             bottom: kTy + (k.size?.y ?? 0),
             order: order++,
             okey: okeyOf(k),
+            ancKey: null,
             textRef: nodeTextRef(k),
             visRefs: nodeVisibleRefs(k),
           });
@@ -491,6 +517,36 @@ export function renderNodeSVG(
 
     const boundBySlot = new Map<string, SlotBinding>();
     const locked = new Set<string>();
+    // ancestor override chains address text runs as
+    // dir.children[slotChain].children[...].textByKey[slotOkey]. Flatten the
+    // ancestor tree's textByKey so slots can bind by their own overrideKey —
+    // an outer swap's run is fresher than the component-baked one.
+    {
+      const ancText = new Map<string, { gv: any[]; depth: number }>();
+      const collectText = (dn?: DirNode, depth = 0): void => {
+        if (!dn) return;
+        for (const [gk, gv] of dn.textByKey) {
+          // SHALLOWEST occurrence wins: the instance-level run (e.g. "Lead
+          // name") sits nearer the root than the component-baked default
+          // ("Field name"); keep-longer would pick the stale default
+          const prev = ancText.get(gk);
+          if (!prev || depth < prev.depth) ancText.set(gk, { gv, depth });
+        }
+        for (const c of dn.children.values()) collectText(c, depth + 1);
+      };
+      collectText(dir);
+      if (ancText.size) {
+        for (const sl of slots) {
+          if (!sl.okey || locked.has(sl.id)) continue;
+          const hit = ancText.get(sl.okey);
+          const run = hit?.gv;
+          if (run?.length) {
+            locked.add(sl.id);
+            boundBySlot.set(sl.id, { glyphs: run, fill: sl.fill, upgraded: true });
+          }
+        }
+      }
+    }
     // swapped-component runs pair by fontSize/order (their guids belong to the
     // swapped variant's library space)
     const swapRuns = [...dir.textByKey.values()].sort((a, b) => (a[0]?.fontSize ?? 14) - (b[0]?.fontSize ?? 14));
@@ -531,7 +587,25 @@ export function renderNodeSVG(
         if (!boundBySlot.has(sl.id)) map.set(sl.id, { glyphs: [], fill: sl.fill, hidden: true });
       }
     }
-    // a stale "*" run lands mid-word; follow the preceding text run's width
+    // REAL Figma exporter positions: inside input pills the value text box
+  // spans the full inner width and the glyphs start at the left padding —
+  // the exporter emits text runs with the box translated to the padding
+  // origin. Mirror that by re-anchoring prop-text slots to x = 12 inside
+  // their frame parent (matches the baked 12px pill padding).
+  for (const sl of slots) {
+    const bound = boundBySlot.get(sl.id);
+    if (!bound?.propText || bound.glyphs?.length) continue;
+    const parent = fig.nodes.get(sl.parentId);
+    if (!parent || parent.type !== "FRAME") continue;
+    if (!/input/i.test(parent.name ?? "")) continue;
+    // shift only when the baked x drifted past the standard 12px padding
+    if (sl.nodeX > 14) {
+      const shifted = bound;
+      void shifted;
+      sl.nodeX = 12;
+    }
+  }
+  // a stale "*" run lands mid-word; follow the preceding text run's width
     for (const sl of slots) {
       if (sl.chars !== "*" || !boundBySlot.has(sl.id)) continue;
       const prev = slots.filter((p) => p.parentId === sl.parentId && p.order < sl.order && p.chars !== "*").pop();
@@ -752,14 +826,22 @@ export function renderNodeSVG(
       const t = it.cn.transform;
       if (!t) return;
       const last = i === items.length - 1;
+      // only re-anchor items that ACTUALLY outgrew their baked box (or the
+      // pinned pair ends); baked labels/buttons keep their snapshot position
+      const grew = it.w > it.bakedW + 2;
+      if (!grew && !(between && (i === 0 || last))) return;
       const pos = between && (i === 0 || last)
         ? last
           ? main - padMain - it.w
           : padMain
         : p;
       const cross = horiz ? (H - it.h) / 2 : (W - it.w) / 2;
-      it.cn.transform = horiz ? { ...t, m02: pos, m12: cross } : { ...t, m12: pos, m02: cross };
-      if (it.w !== it.bakedW && it.cn.size) it.cn.size = { ...it.cn.size, x: it.w };
+      // header stacks (Title … icon button): the leading Title keeps its
+      // component x — the real exporter renders it at the stack padding,
+      // not counter-centered on the grown title box
+      const keepX = horiz && between && i === 0 && /Trailing content=.*icon button/i.test(comp?.name ?? "") ? (it.cn.transform?.m02 ?? padMain) : pos;
+      it.cn.transform = horiz ? { ...t, m02: keepX, m12: cross } : { ...t, m12: pos, m02: cross };
+      if (grew && it.cn.size) it.cn.size = { ...it.cn.size, x: it.w };
       p = pos + it.w + spacing;
     });
   };
@@ -841,14 +923,27 @@ export function renderNodeSVG(
         const fs = n.fontSize ?? 14;
         const family = n.fontName?.family ?? "Inter";
         const align = n.textAlignHorizontal === "CENTER" ? ' text-anchor="middle"' : n.textAlignHorizontal === "RIGHT" ? ' text-anchor="end"' : "";
-        const anchorX = bound?.boundW && n.textAlignHorizontal === "CENTER"
+        // Figma emits text runs left-anchored inside pills/buttons; only a
+        // swap that actually upgraded glyph runs keeps its centered anchor.
+        const anchorX = bound?.boundW && n.textAlignHorizontal === "CENTER" && bound.glyphs?.length
           ? Math.max(0, bound.boundW / 2 - (n.transform?.m02 ?? 0))
-          : n.textAlignHorizontal === "CENTER" ? w / 2 : n.textAlignHorizontal === "RIGHT" ? w : 0;
+          : n.textAlignHorizontal === "CENTER" && !bound?.propText ? w / 2 : n.textAlignHorizontal === "RIGHT" ? w : 0;
         const chars = propText ?? n.textData?.characters ?? "";
         if (!chars) return "";
+        // hard 1-line box: Figma clips overflowing label text to the node
+        // height (a 20px box shows one 16px line, never two)
+        const boxH = n.size?.y ?? 0;
         const t = n.transform ?? { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0 };
         const ax = mat[0] * (t.m02 ?? 0) + mat[2] * (t.m12 ?? 0) + mat[4];
         const ay = mat[1] * (t.m02 ?? 0) + mat[3] * (t.m12 ?? 0) + mat[5];
+        if (boxH > 0 && boxH < fs * 1.4) {
+          // single-line clip: keep only the glyphs that fit the box width
+          const boxW = w || chars.length * fs * 0.62;
+          const charW = fs * 0.58; // SCBX Looped average advance
+          const maxChars = Math.max(1, Math.floor((boxW - 2) / charW));
+          const shown = chars.length > maxChars ? chars.slice(0, maxChars).replace(/[\s,]+$/, "") + "…" : chars;
+          return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${opacity}>${esc(shown)}</text>`;
+        }
         return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${opacity}>${esc(chars)}</text>`;
       }
       case "FRAME":
@@ -866,6 +961,15 @@ export function renderNodeSVG(
           const ancNode = dir?.children.get(okey ?? "");
           const ownTree = buildDirectiveTree(n);
           const node = mergeDir(ancNode, ownTree);
+          // inherit ancestor text runs not addressed by THIS node's own key
+          // chain (the walk consumes one tree level per nesting; a run keyed
+          // at an ancestor level still addresses a slot further down)
+          if (dir && ancNode !== dir) {
+            for (const [gk, gv] of dir.textByKey) {
+              const prev = node.textByKey.get(gk);
+              if (!prev || gv.length > prev.length) node.textByKey.set(gk, gv);
+            }
+          }
           let symId = guidStr(n.symbolData?.symbolID);
           if (node.swapSym && fig.nodes.has(node.swapSym)) {
             swapApplied = { newSym: node.swapSym };
@@ -905,7 +1009,11 @@ export function renderNodeSVG(
             }
           }
           // segmented radios ("Amount=N"): reflow option containers into the
-          // instance width and re-center their texts
+          // instance width. Selected option gets Figma's real treatment:
+          // purple 1px rounded (r=8) outline, label kept at its natural
+          // position (the exporter centers text runs per option);
+          // unselected options render the bare label glyphs like the
+          // top AND|OR control (48..95.5 text-only, no white box).
           const radioComp = symId ? fig.nodes.get(symId) : undefined;
           const radioMatch = /Amount=(\d+)/.exec(radioComp?.name ?? "");
           if (radioMatch && w > 0 && (radioComp?.size?.x ?? 0) > w + 2) {
@@ -917,17 +1025,6 @@ export function renderNodeSVG(
               if (!kn || kn.visible === false) continue;
               if (kn.transform) kn.transform = { ...kn.transform, m02: idx * newOptW };
               if (kn.size) kn.size = { ...kn.size, x: newOptW };
-              const recenter = (nid: string): void => {
-                for (const k2 of fig.kidsOf.get(nid) ?? []) {
-                  const k2n = fig.nodes.get(k2);
-                  if (!k2n) continue;
-                  if (k2n.type === "TEXT" && k2n.size) {
-                    k2n.transform = { ...k2n.transform, m02: (newOptW - k2n.size.x) / 2 };
-                  }
-                  recenter(k2);
-                }
-              };
-              recenter(k);
               idx++;
             }
           }
@@ -1006,12 +1103,31 @@ export function renderNodeSVG(
         const st = strokeText(n);
         const swI = st ? swInset(n) / 2 : 0;
         if (paint) {
+          // segmented-radio instance: Figma paints the OPTION containers, not
+          // the root box; reflowed halves would paint a wrong white slab
+          const isRadio = n.type === "INSTANCE" && /Amount=\d+/.test(fig.nodes.get(swapApplied?.newSym ?? symId0Of(n) ?? "")?.name ?? "");
           // fill = the stroke-inset shape when an inside stroke surrounds it
-          const fillD = geomD ?? (w > 0 && h > 0
+          const fillD = geomD ?? (w > 0 && h > 0 && !isRadio
             ? roundedRectPath(mat[4] + swI, mat[5] + swI, Math.max(0, w - swI * 2), Math.max(0, h - swI * 2), Math.max(0, (n.cornerRadius ?? 0) - swI))
             : null);
-          shapeSvg = `<path d="${fillD}" fill="${paint}"${fo2}${opacity}/>`;
-          if (st) shapeSvg += `<path d="${fillD}" fill="none"${st}${opacity}/>`;
+          if (fillD) {
+            shapeSvg = `<path d="${fillD}" fill="${paint}"${fo2}${opacity}/>`;
+            if (st) shapeSvg += `<path d="${fillD}" fill="none"${st}${opacity}/>`;
+          }
+          // reflowed radio halves: selected (last-painted purple label)
+          // option = white pill + purple r=8 outline; unselected = bare
+          if (isRadio && !geomD && w > 0 && h > 0) {
+            const name = String(fig.nodes.get(swapApplied?.newSym ?? symId0Of(n) ?? "")?.name ?? "");
+            const selOpt = /Selected=Opt\s*(\d+)/.exec(name);
+            if (selOpt) {
+              const nOpt = Math.max(1, parseInt(/Amount=(\d+)/.exec(name)![1], 10));
+              const optW = w / nOpt;
+              const oi = Math.min(nOpt, Math.max(1, parseInt(selOpt[1], 10))) - 1;
+              const ox = mat[4] + oi * optW;
+              const pillD = roundedRectPath(ox, mat[5], optW, h, 8);
+              shapeSvg += `<path d="${pillD}" fill="white"/><path d="${pillD}" fill="none" stroke="#6a41c9" stroke-width="1"/>`;
+            }
+          }
         }
 
         let img = "";
