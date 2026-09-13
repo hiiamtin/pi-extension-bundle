@@ -1063,7 +1063,7 @@ export function renderNodeSVG(
           // stale icon remap: outdated circle-✕ instances render the real
           // glyph component (trash / plus / bare ✕) declared by the context
           const resolvedName0 = symId ? fig.nodes.get(symId)?.name ?? "" : "";
-          if (resolvedName0 === "Dismiss Circle" && w > 0 && w <= 32) {
+          if (resolvedName0 === "Dismiss Circle" && hint?.kind === "Dismiss" && hint.color !== "#FFFFFF" && w > 0 && w <= 32) {
             // clearable input ✕: Figma's "clear circle" = 1px ring + small ✕,
             // drawn procedurally (the baked instance geometry is stale/mangled)
             const cx = mat[4] + w / 2;
