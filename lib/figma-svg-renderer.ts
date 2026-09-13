@@ -559,7 +559,7 @@ export function renderNodeSVG(
       for (const b of map2.values()) {
         if (!b || b.hidden) continue;
         for (const gg of b.glyphs ?? []) ext = Math.max(ext, (gg.position?.x ?? 0) + (gg.fontSize ?? 16) * 0.62);
-        if (b.propText) propCap = Math.min(propCap, b.propText.length * 8.7 + 32);
+        if (b.propText) propCap = Math.min(propCap, b.propText.length * 7 + 32);
       }
       // glyph runs inherited from an ancestor scope can carry that scope's
       // positions; the prop text length is a safe upper bound on the true
