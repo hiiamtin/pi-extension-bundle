@@ -1096,10 +1096,32 @@ export function renderNodeSVG(
             const gy0 = (g.position?.y ?? 0) * unit;
             if (firstLineY === null || gy0 < firstLineY) firstLineY = gy0;
           }
+          // Figma truncates overflowing one-line labels with an ellipsis:
+          // drop glyphs past the box (minus room for the dots) and remember
+          // to draw the dots — hard-clipping used to cut a glyph in half.
+          // Only when the run REALLY overflowed (wrapped 2 lines in the bake,
+          // or ink clearly past the box) — tight auto-resize boxes must not
+          // lose their glyphs
+          let truncated = false;
+          const boxW = w || 0;
+          const dotsW = fs0 * 0.9;
+          let line1MaxX = 0;
+          let origLines = 1;
+          for (const g of glyphs) {
+            const gx0 = (g.position?.x ?? 0) * unit;
+            const gy0 = (g.position?.y ?? 0) * unit;
+            if (firstLineY !== null && gy0 <= firstLineY + fs0 * 0.5) line1MaxX = Math.max(line1MaxX, gx0 + (g.advance ?? 0.6) * fs0);
+            else if (gy0 > firstLineY + fs0 * 0.5) origLines = Math.max(origLines, 2);
+          }
+          const reallyOverflows = origLines >= 2 || line1MaxX > boxW + 4;
           for (const g of glyphs) {
             const gx = (g.position?.x ?? 0) * unit;
             const gy = (g.position?.y ?? 0) * unit;
             if (oneLineOnly && firstLineY !== null && gy > firstLineY + fs0 * 0.5) continue;
+            if (oneLineOnly && reallyOverflows && boxW > 0 && gx + (g.advance ?? 0.6) * fs0 > boxW - dotsW) {
+              truncated = true;
+              continue;
+            }
             const fs = g.fontSize ?? fs0;
             const d = glyphPathD(doc, g.commandsBlob);
             if (!d) continue;
@@ -1111,7 +1133,17 @@ export function renderNodeSVG(
           }
           let merged = "";
           for (const parts of [...lines.values()].sort((a, b) => a[0].localeCompare(b[0]))) merged += parts.join("");
-          if (merged) return `<path d="${merged}" fill="${fillC}"${opacity}/>`;
+          if (merged) {
+            const basePath = `<path d="${merged}" fill="${fillC}"${opacity}/>`;
+            if (truncated) {
+              // ellipsis dots at the box's right edge (fallback-font dots)
+              const t = n.transform ?? { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0 };
+              const dotsX = mat[0] * (t.m02 + w - dotsW - 2) + mat[4];
+              const dotsY = mat[5] + (firstLineY ?? 0);
+              return basePath + `<text x="${r(dotsX)}" y="${r(dotsY)}" font-family="SCBX Looped, sans-serif" font-size="${r(fs0)}" fill="${fillC}"${opacity}>...</text>`;
+            }
+            return basePath;
+          }
         }
         if (noText) return "";
         const propText = bound?.propText;
@@ -1196,7 +1228,7 @@ export function renderNodeSVG(
             const ring = ellipsePath(cx, cy, 6.67, 6.67);
             const k = 2.9;
             const cross = `M${xf(cx - k)} ${xf(cy - k)}L${xf(cx + k)} ${xf(cy + k)}M${xf(cx + k)} ${xf(cy - k)}L${xf(cx - k)} ${xf(cy + k)}`;
-            const col = hint?.color ?? "#1A152B";
+            const col = hint?.color ?? "#6A7187";
             return `<path d="${ring}" fill="none" stroke="${col}" stroke-width="1.1"/>` +
               `<path d="${cross}" fill="none" stroke="${col}" stroke-width="1.2" stroke-linecap="round"/>`;
           }
