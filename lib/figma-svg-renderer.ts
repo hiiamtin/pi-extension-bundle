@@ -1288,8 +1288,14 @@ export function renderNodeSVG(
           // a HEIGHT box inside a vertical auto-layout stack grows with its
           // content (dialog body wraps to its real lines); everywhere else
           // the fixed box clamps the text (sidebar rows truncate with "…")
-          const wrapAllowed = growH && pstack === "VERTICAL";
-          const oneLineOnly = boxH > 0 && boxH < fs0 * 1.6 && !wrapAllowed;
+          // the design tells us which cells truncate: Figma's
+          // textTruncation=ENDING is "Truncate text" on the node. Without it
+          // the text is meant to WRAP (the Lead table's Campaign cells carry a
+          // manual break and render two lines) — the old box-height guess
+          // dropped that second line and wrapped cells that truncate instead.
+          const wantsTrunc = n.textTruncation === "ENDING";
+          const wrapAllowed = growH && pstack === "VERTICAL" && !wantsTrunc;
+          const oneLineOnly = wantsTrunc && boxH > 0 && boxH < fs0 * 1.6 && !wrapAllowed;
           const reallyOverflows = origLines >= 2;
           // textAutoResize=HEIGHT runs baked on a single line but wider than
           // the box wrap at render time: split at the last word boundary
@@ -1364,6 +1370,7 @@ export function renderNodeSVG(
         const align = n.textAlignHorizontal === "CENTER" ? ' text-anchor="middle"' : n.textAlignHorizontal === "RIGHT" ? ' text-anchor="end"' : "";
         const fstyle = n.fontName?.style ?? "";
         const fweight = /bold/i.test(fstyle) ? ' font-weight="700"' : /semi/i.test(fstyle) ? ' font-weight="600"' : "";
+        const deco = /UNDERLINE/i.test(String(n.style?.textDecoration ?? "")) ? ' text-decoration="underline"' : "";
         // Figma emits text runs left-anchored inside pills/buttons; only a
         // swap that actually upgraded glyph runs keeps its centered anchor.
         const anchorX = bound?.boundW && n.textAlignHorizontal === "CENTER" && bound.glyphs?.length
@@ -1385,13 +1392,13 @@ export function renderNodeSVG(
           const shown = chars.length > maxChars ? chars.slice(0, maxChars).replace(/[\s,]+$/, "") + "…" : chars;
           const tl1 = propText && family !== "SCBX Looped" ? ` textLength="${r(textWidthEst(chars, fs))}" lengthAdjust="spacingAndGlyphs"` : "";
           fontFamilies.add(family);
-          return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${fweight}${tl1}${opacity}>${esc(shown)}</text>`;
+          return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${fweight}${deco}${tl1}${opacity}>${esc(shown)}</text>`;
         }
         // fallback-font runs are wider than SCBX Looped; force the reference
         // metrics so button labels stop overflowing their pills
         const tl = propText && family !== "SCBX Looped" ? ` textLength="${r(textWidthEst(chars, fs))}" lengthAdjust="spacingAndGlyphs"` : "";
         fontFamilies.add(family);
-        return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${fweight}${tl}${opacity}>${esc(chars)}</text>`;
+        return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${fweight}${deco}${tl}${opacity}>${esc(chars)}</text>`;
       }
       case "FRAME":
       case "SECTION":
@@ -1630,7 +1637,7 @@ export function renderNodeSVG(
             if (process.env.FIGMA_TRACE_TINT && childIsIcon && passTint) {
               console.error(`[tint] ${knName} @(${r(mat[4])},${r(mat[5])}) via=${n.name} tint=${passTint}`);
             }
-            if (successCtx) passTint = /checkmark/i.test(knName) ? "#0AC256" : /icon|dismiss/i.test(knName) ? "#C1C4CE" : undefined;
+            if (successCtx) passTint = /checkmark/i.test(knName) ? "#0AC256" : undefined;
             childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w, childHint, mulM(mat, nodeMat(kn ?? {})), n.stackMode, passTint);
           }
         }
@@ -1792,7 +1799,9 @@ export function renderNodeSVG(
           for (const p of paths.fill) {
             if (!p.svgPath) continue;
             const pf = p.paints?.find((pp: any) => pp?.type === "SOLID");
-            g.push(`<path d="${xfPath(p.svgPath, mat)}" fill="${tint ?? ((pf && hexFill(pf)) || fill || "none")}"${opacity}/>`);
+            const ownFill = (pf && hexFill(pf)) || fill;
+            const ownIsInk = !ownFill || /^#1a152b$/i.test(ownFill);
+            g.push(`<path d="${xfPath(p.svgPath, mat)}" fill="${tint && ownIsInk ? tint : ownFill || "none"}"${opacity}/>`);
           }
           for (const p of paths.stroke) {
             if (!p.svgPath) continue;
