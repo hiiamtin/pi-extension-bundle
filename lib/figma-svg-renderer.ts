@@ -543,6 +543,7 @@ export function renderNodeSVG(
   let nodeCount = 0;
   let clipSeq = 0;
   let gradSeq = 0;
+  let shadowSeq = 0;
   const defs: string[] = [];
   const images = doc.images as Map<string, Uint8Array>;
 
@@ -582,6 +583,13 @@ export function renderNodeSVG(
     const s = sp ? hexFill(sp) : null;
     const w = src?.strokeWeight ?? 0;
     return s && w > 0 ? ` stroke="${s}" stroke-width="${r(w)}"` : "";
+  };
+
+  /** first visible DROP_SHADOW of a node (or of its resolved component) */
+  const effectShadow = (n: RawChange, comp?: any): any => {
+    const eff = Array.isArray(n.effects) && n.effects.length ? n.effects : comp?.effects;
+    if (!Array.isArray(eff)) return null;
+    return eff.find((e: any) => e && e.visible !== false && e.type === "DROP_SHADOW") ?? null;
   };
 
   type SlotBinding = {
@@ -1654,6 +1662,32 @@ export function renderNodeSVG(
           const clipGeom = rectAbs(0, 0, w, h, radiusOf(n));
           defs.push(`<clipPath id="${cid}"><path d="${clipGeom}"/></clipPath>`);
           out = `<g clip-path="url(#${cid})">${out}</g>`;
+        }
+        // Figma drop shadow: a blurred copy of the node silhouette, drawn
+        // OUTSIDE the clip group so it can bleed past the box
+        {
+          const sh = effectShadow(n, compForVis);
+          const d2 = sh && w > 0 && h > 0 ? rectAbs(0, 0, w, h, radiusOf(n, compForVis)) : null;
+          if (sh && d2) {
+            const c = sh.color ?? {};
+            const hex = `#${[c.r ?? 0, c.g ?? 0, c.b ?? 0].map((v: number) => Math.round(v * 255).toString(16).padStart(2, "0")).join("")}`;
+            const alpha = typeof c.a === "number" ? c.a : 1;
+            const erode = typeof sh.spread === "number" && sh.spread < 0
+              ? `<feMorphology in="SourceAlpha" operator="erode" radius="${r(-sh.spread)}" result="shrunk"/>`
+              : "";
+            const base = erode ? "shrunk" : "SourceAlpha";
+            const fid = `sh${++shadowSeq}_${frameTag}`;
+            defs.push(
+              `<filter id="${fid}" x="-40%" y="-40%" width="180%" height="180%" color-interpolation-filters="sRGB">` +
+                erode +
+                `<feOffset in="${base}" dx="${r(sh.offset?.x ?? 0)}" dy="${r(sh.offset?.y ?? 0)}" result="off"/>` +
+                `<feGaussianBlur in="off" stdDeviation="${r((sh.radius ?? 0) / 2)}" result="blur"/>` +
+                `<feFlood flood-color="${hex}" flood-opacity="${r(alpha)}" result="col"/>` +
+                `<feComposite in="col" in2="blur" operator="in"/>` +
+                `</filter>`,
+            );
+            out = `<path d="${d2}" fill="${hex}" filter="url(#${fid})"/>` + out;
+          }
         }
         return out;
       }
