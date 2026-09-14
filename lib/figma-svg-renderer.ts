@@ -1096,24 +1096,20 @@ export function renderNodeSVG(
             const gy0 = (g.position?.y ?? 0) * unit;
             if (firstLineY === null || gy0 < firstLineY) firstLineY = gy0;
           }
-          // Figma truncates overflowing one-line labels with an ellipsis:
-          // drop glyphs past the box (minus room for the dots) and remember
-          // to draw the dots — hard-clipping used to cut a glyph in half.
-          // Only when the run REALLY overflowed (wrapped 2 lines in the bake,
-          // or ink clearly past the box) — tight auto-resize boxes must not
-          // lose their glyphs
+          // Figma truncates overflowing one-line labels with an ellipsis —
+          // but ONLY for runs that actually WRAPPED in the bake (2+ lines,
+          // e.g. the sidebar "Citizen ID/Business registrati..."). Auto-resize
+          // boxes whose ink is wider than a stale box width are fine and
+          // must keep every glyph
           let truncated = false;
           const boxW = w || 0;
           const dotsW = fs0 * 0.9;
-          let line1MaxX = 0;
           let origLines = 1;
           for (const g of glyphs) {
-            const gx0 = (g.position?.x ?? 0) * unit;
             const gy0 = (g.position?.y ?? 0) * unit;
-            if (firstLineY !== null && gy0 <= firstLineY + fs0 * 0.5) line1MaxX = Math.max(line1MaxX, gx0 + (g.advance ?? 0.6) * fs0);
-            else if (gy0 > firstLineY + fs0 * 0.5) origLines = Math.max(origLines, 2);
+            if (firstLineY !== null && gy0 > firstLineY + fs0 * 0.5) origLines = Math.max(origLines, 2);
           }
-          const reallyOverflows = origLines >= 2 || line1MaxX > boxW + 4;
+          const reallyOverflows = origLines >= 2;
           for (const g of glyphs) {
             const gx = (g.position?.x ?? 0) * unit;
             const gy = (g.position?.y ?? 0) * unit;
