@@ -897,8 +897,12 @@ export function renderNodeSVG(
       "Delete saved filters": 190,
       "Save & Search": 146,
       "Cancel": 90,
+      "Later": 79,
+      "Delete": 86,
     };
+    let extCal = false;
     const extOf = (cn: any): number => {
+      extCal = false;
 
       const merged = mergeDir(ancDir?.children.get(okeyOf(cn) ?? ""), buildDirectiveTree(cn));
       const symId2 = merged?.swapSym && fig.nodes.has(merged.swapSym) ? merged.swapSym : guidStr(cn.symbolData?.symbolID);
@@ -915,7 +919,11 @@ export function renderNodeSVG(
         const labelText = b.textChars ?? b.propText;
 
         // calibrated width wins outright — measured from the reference
-        if (labelText && CAL_W[labelText] !== undefined) return CAL_W[labelText] - 16;
+        // (may SHRINK a stale-wide bake, so the caller must not max() it)
+        if (labelText && CAL_W[labelText] !== undefined) {
+          extCal = true;
+          return CAL_W[labelText] - 16;
+        }
         if (b.propText) propCap = Math.min(propCap, textWidthEst(b.propText, b.glyphs?.[0]?.fontSize ?? 16) + 44);
       }
       // glyph runs inherited from an ancestor scope can carry that scope's
@@ -930,6 +938,7 @@ export function renderNodeSVG(
       const kids2 = fig.kidsOf.get(fid) ?? [];
       if (!kids2.length) return f.size?.x ?? 0;
       let sum = 0;
+      let widest = 0;
       let n2 = 0;
       for (const k2 of kids2) {
         const cn2 = fig.nodes.get(k2);
@@ -939,7 +948,12 @@ export function renderNodeSVG(
         if (cn2.type === "INSTANCE") w2 = Math.max(w2, Math.round(extOf(cn2)) + 16);
         else if (cn2.stackMode) w2 = estimateW(k2);
         sum += w2;
+        widest = Math.max(widest, w2);
       }
+      // vertical stacks flow DOWN — width hugs the widest child, not the
+      // sum (summing produced 848px dialog headers that then got centered
+      // at a half-size offset)
+      if (f.stackMode === "VERTICAL") return Math.round(widest + 2 * (f.stackHorizontalPadding ?? 0));
       return Math.round(sum + (f.stackSpacing ?? 0) * Math.max(0, n2 - 1) + 2 * (f.stackHorizontalPadding ?? 0));
     };
     const items: { cn: any; w: number; h: number; bakedW: number }[] = [];
@@ -950,7 +964,12 @@ export function renderNodeSVG(
       let w = bakedW;
       if (cn.type === "INSTANCE") {
         const ext = extOf(cn);
-        if (ext > 0) w = Math.max(bakedW, Math.round(ext) + 16);
+        if (ext > 0) {
+          const cand = Math.round(ext) + 16;
+          // calibrated widths may SHRINK a stale-wide bake; measured
+          // extents only ever grow one
+          w = extCal ? cand : Math.max(bakedW, cand);
+        }
       } else if (cn.stackMode) {
         w = Math.max(bakedW, estimateW(kid));
       } else {
@@ -976,6 +995,8 @@ export function renderNodeSVG(
     }
     if (items.length < 2) return;
     const total = items.reduce((a, it) => a + it.w, 0) + spacing * (items.length - 1);
+    // main-axis content size for VERTICAL stacks flows along heights
+    const totalV = items.reduce((a, it) => a + it.h, 0) + spacing * (items.length - 1);
     const t1 = items[1].cn.transform;
     const bakedGap = t1 ? (horiz ? t1.m02 : t1.m12) - (horiz ? items[0].cn.transform?.m02 ?? 0 : items[0].cn.transform?.m12 ?? 0) - items[0].bakedW : 0;
     const between = (total < main - 2 * padMain - 12 && bakedGap > spacing * 3 + 8)
@@ -983,8 +1004,19 @@ export function renderNodeSVG(
       // trailing button to the right edge regardless of baked positions
       || (horiz && items.length === 2 && /Trailing content=.*icon button/i.test(comp?.name ?? ""));
     const overflow = items.some((it) => it.w > it.bakedW + 2);
-    if (!(overflow || (between && items.length === 2))) return;
+    // stretched vertical stacks (dialog overlays): Figma keeps the first
+    // child at the top and pins the last to the bottom edge
+    const vBetween = !horiz && items.length === 2 && H > totalV + 2 * padMain + 4;
+    // horizontally centered rows (modal footer buttons) re-flow around the
+    // midpoint when a calibrated width changed an item's size
+    const centerRow = horiz && comp.stackPrimaryAlignItems === "CENTER";
+    const changed = items.some((it) => Math.abs(it.w - it.bakedW) > 2);
+    if (process.env.FIGMA_TRACE_STACK) {
+      console.error(`[stack] comp=${comp.name} compId=${compId} horiz=${horiz} W=${W} H=${H} main=${main} items=${items.map((it) => `${it.cn.name}:${it.w}/${it.bakedW}`).join(",")} overflow=${overflow} between=${between} vBetween=${vBetween} centerRow=${centerRow}`);
+    }
+    if (!(overflow || (between && items.length === 2) || vBetween || (centerRow && changed))) return;
     let p = padMain;
+    let cx = (main - total) / 2;
     items.forEach((it, i) => {
       const t = it.cn.transform;
       if (!t) return;
@@ -993,20 +1025,24 @@ export function renderNodeSVG(
       // advances past them (else a later grown item lands ON TOP of an
       // untouched sibling — the footer Save-on-Cancel collapse)
       const grew = it.w > it.bakedW + 2;
-      const pos = between && (i === 0 || last)
-        ? last
-          ? main - padMain - it.w
-          : padMain
-        : grew
-          ? p
-          : (horiz ? (t.m02 ?? p) : (t.m12 ?? p));
+      let pos: number;
+      if (vBetween && (i === 0 || last)) pos = last ? main - padMain - it.h : padMain;
+      else if (centerRow && changed) { pos = cx; cx += it.w + spacing; }
+      else if (between && (i === 0 || last))
+        pos = last ? main - padMain - it.w : padMain;
+      else if (grew) pos = p;
+      else pos = horiz ? (t.m02 ?? p) : (t.m12 ?? p);
       const cross = horiz ? (H - it.h) / 2 : (W - it.w) / 2;
       // header stacks (Title … icon button): the leading Title keeps its
       // component x — the real exporter renders it at the stack padding,
       // not counter-centered on the grown title box
       const keepX = horiz && between && i === 0 && /Trailing content=.*icon button/i.test(comp?.name ?? "") ? (t.m02 ?? padMain) : pos;
-      it.cn.transform = horiz ? { ...t, m02: keepX, m12: cross } : { ...t, m12: pos, m02: cross };
-      if (grew && it.cn.size) it.cn.size = { ...it.cn.size, x: it.w };
+      // centered rows keep their baked cross position (padV governs it,
+      // not counter-centering)
+      it.cn.transform = horiz
+        ? { ...t, m02: keepX, m12: centerRow && changed ? (t.m12 ?? cross) : cross }
+        : { ...t, m12: pos, m02: cross };
+      if (Math.abs(it.w - it.bakedW) > 2 && it.cn.size) it.cn.size = { ...it.cn.size, x: it.w };
       p = pos + it.w + spacing;
     });
   };
@@ -1025,6 +1061,9 @@ export function renderNodeSVG(
     const n = fig.nodes.get(id);
     if (!n || n.visible === false) return "";
     nodeCount++;
+    if (process.env.FIGMA_TRACE_WALK) {
+      console.error(`[walk] d${depth} ${n.name} [${n.type}] w=${Math.round(n.size?.x ?? -1)} h=${Math.round(n.size?.y ?? -1)} mat=(${r(mat[4])},${r(mat[5])})`);
+    }
 
     const opacity = typeof n.opacity === "number" && n.opacity < 1 ? ` opacity="${r(n.opacity)}"` : "";
 
@@ -1089,16 +1128,23 @@ export function renderNodeSVG(
           // px runs sit on a baseline ≈ fontSize*1.13 (y≈18 for 16px); em
           // runs on y≈1.1 — the baseline is the unambiguous discriminator
           const unit = maxY > 4 ? 1 : fs0;
-          // single-line node box: derived runs can carry a wrapped 2nd line
-          // (e.g. sidebar "Citizen ID…"); Figma truncates to the box — keep
-          // only the first baseline when the box fits exactly one line
           const boxH = n.size?.y ?? 0;
-          const oneLineOnly = boxH > 0 && boxH < fs0 * 1.6;
+          const growH = n.textAutoResize === "HEIGHT";
+          let origLines = 1;
           let firstLineY: number | null = null;
           for (const g of glyphs) {
             const gy0 = (g.position?.y ?? 0) * unit;
             if (firstLineY === null || gy0 < firstLineY) firstLineY = gy0;
           }
+          for (const g of glyphs) {
+            const gy0 = (g.position?.y ?? 0) * unit;
+            if (firstLineY !== null && gy0 > firstLineY + fs0 * 0.5) origLines = Math.max(origLines, 2);
+          }
+          // single-line node box: derived runs can carry a wrapped 2nd line
+          // (e.g. sidebar "Citizen ID…"); Figma truncates to the box — keep
+          // only the first baseline when the box fits exactly one line.
+          // HEIGHT boxes with single-line baked runs grow instead (the
+          // dialog body wraps at render time) — they never truncate
           // Figma truncates overflowing one-line labels with an ellipsis —
           // but ONLY for runs that actually WRAPPED in the bake (2+ lines,
           // e.g. the sidebar "Citizen ID/Business registrati..."). Auto-resize
@@ -1107,15 +1153,45 @@ export function renderNodeSVG(
           let truncated = false;
           const boxW = w || 0;
           const dotsW = fs0 * 0.9;
-          let origLines = 1;
-          for (const g of glyphs) {
-            const gy0 = (g.position?.y ?? 0) * unit;
-            if (firstLineY !== null && gy0 > firstLineY + fs0 * 0.5) origLines = Math.max(origLines, 2);
-          }
+          const oneLineOnly = boxH > 0 && boxH < fs0 * 1.6 && !(growH && origLines === 1);
           const reallyOverflows = origLines >= 2;
-          for (const g of glyphs) {
-            const gx = (g.position?.x ?? 0) * unit;
-            const gy = (g.position?.y ?? 0) * unit;
+          // textAutoResize=HEIGHT runs baked on a single line but wider than
+          // the box wrap at render time: split at the last word boundary
+          // (space-advance gap) that fits, center each line per the node's
+          // alignment, and stack lines at the node's line height
+          let placed: { g: any; gx: number; gy: number }[] | null = null;
+          if (growH && origLines === 1 && boxW > 0 && glyphs.length > 1) {
+            const adv = (g: any): number => (g.advance ?? 0.6) * unit;
+            const tot = glyphs.reduce((a: number, g: any) => a + adv(g), 0);
+            if (tot > boxW + 1) {
+              const lineH = typeof n.lineHeight?.value === "number" && n.lineHeight.value > 0 ? n.lineHeight.value : fs0 * 1.5;
+              const isSpace = (g: any): boolean => adv(g) > 0 && adv(g) < fs0 * 0.35;
+              let split = -1;
+              let cur = 0;
+              for (let i = 0; i < glyphs.length; i++) {
+                cur += adv(glyphs[i]);
+                if (cur > boxW && split < 0) {
+                  let j = i;
+                  while (j > 0 && !isSpace(glyphs[j - 1])) j--;
+                  split = j > 0 ? j : i;
+                  break;
+                }
+              }
+              if (split > 0 && split < glyphs.length) {
+                const lineW = (arr: any[]): number =>
+                  (arr[arr.length - 1].position?.x ?? 0) * unit + adv(arr[arr.length - 1]) - (arr[0].position?.x ?? 0) * unit;
+                const place = (arr: any[], line: number): void => {
+                  const off = (boxW - lineW(arr)) / 2 - (arr[0].position?.x ?? 0) * unit;
+                  for (const g of arr) placed!.push({ g, gx: (g.position?.x ?? 0) * unit + off, gy: (firstLineY ?? 0) + line * lineH });
+                };
+                placed = [];
+                place(glyphs.slice(0, split), 0);
+                place(glyphs.slice(split), 1);
+              }
+            }
+          }
+          const laid: { g: any; gx: number; gy: number }[] = placed ?? glyphs.map((g: any) => ({ g, gx: (g.position?.x ?? 0) * unit, gy: (g.position?.y ?? 0) * unit }));
+          for (const { g, gx, gy } of laid) {
             if (oneLineOnly && firstLineY !== null && gy > firstLineY + fs0 * 0.5) continue;
             if (oneLineOnly && reallyOverflows && boxW > 0 && gx + (g.advance ?? 0.6) * fs0 > boxW - dotsW) {
               truncated = true;
@@ -1297,6 +1373,24 @@ export function renderNodeSVG(
               }
             }
           }
+          // uniformly enlarged icon instances (constraints=SCALE): the
+          // component canvas renders scaled to the instance box (the alert
+          // Warning icon: 32px canvas in an 80px instance → ×2.5)
+          if (compNode0 && !compNode0.stackMode && childScaleOk(n, w, h, compW0, compNode0.size?.y ?? 0)) {
+            const sc = w / compW0;
+            for (const k of fig.kidsOf.get(symId) ?? []) {
+              const kn = fig.nodes.get(k);
+              if (!kn?.transform) continue;
+              kn.transform = {
+                m00: (kn.transform.m00 ?? 1) * sc,
+                m01: (kn.transform.m01 ?? 0) * sc,
+                m02: (kn.transform.m02 ?? 0) * sc,
+                m10: (kn.transform.m10 ?? 0) * sc,
+                m11: (kn.transform.m11 ?? 1) * sc,
+                m12: (kn.transform.m12 ?? 0) * sc,
+              };
+            }
+          }
         } else if (n.stackMode && dir) {
           applyStackLayout(id, n, dir);
         }
@@ -1472,6 +1566,15 @@ export function renderNodeSVG(
 
   function symId0Of(n: RawChange): string | null {
     return guidStr(n.symbolData?.symbolID);
+  }
+
+  /** uniform non-1 instance/component size ratio (constraints=SCALE case) */
+  function childScaleOk(n: RawChange, w: number, h: number, cw: number, ch: number): boolean {
+    if (!(cw > 0 && ch > 0 && w > 0 && h > 0)) return false;
+    if (Math.abs(w - cw) <= 2 && Math.abs(h - ch) <= 2) return false;
+    const sx = w / cw;
+    const sy = h / ch;
+    return Math.abs(sx - sy) < 0.02 && Math.abs(sx - 1) > 0.02;
   }
 
   const frameTag = rootId.replace(/[^0-9A-Za-z]/g, "_");
