@@ -1056,6 +1056,7 @@ export function renderNodeSVG(
     parentW?: number,
     hint?: IconHint,
     mat: Mat = M_ID,
+    pstack?: string,
   ): string => {
     if (depth > maxDepth || nodeCount >= maxNodes) return "";
     const n = fig.nodes.get(id);
@@ -1153,14 +1154,18 @@ export function renderNodeSVG(
           let truncated = false;
           const boxW = w || 0;
           const dotsW = fs0 * 0.9;
-          const oneLineOnly = boxH > 0 && boxH < fs0 * 1.6 && !(growH && origLines === 1);
+          // a HEIGHT box inside a vertical auto-layout stack grows with its
+          // content (dialog body wraps to its real lines); everywhere else
+          // the fixed box clamps the text (sidebar rows truncate with "…")
+          const wrapAllowed = growH && pstack === "VERTICAL";
+          const oneLineOnly = boxH > 0 && boxH < fs0 * 1.6 && !wrapAllowed;
           const reallyOverflows = origLines >= 2;
           // textAutoResize=HEIGHT runs baked on a single line but wider than
           // the box wrap at render time: split at the last word boundary
           // (space-advance gap) that fits, center each line per the node's
           // alignment, and stack lines at the node's line height
           let placed: { g: any; gx: number; gy: number }[] | null = null;
-          if (growH && origLines === 1 && boxW > 0 && glyphs.length > 1) {
+          if (wrapAllowed && origLines === 1 && boxW > 0 && glyphs.length > 1) {
             const adv = (g: any): number => (g.advance ?? 0.6) * unit;
             const tot = glyphs.reduce((a: number, g: any) => a + adv(g), 0);
             if (tot > boxW + 1) {
@@ -1420,17 +1425,20 @@ export function renderNodeSVG(
           const kidDir = n.type === "INSTANCE" ? (childDir ?? dir) : dir;
           for (const kid of childIds) {
             const kn = fig.nodes.get(kid);
-            childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w, childHint, mulM(mat, nodeMat(kn ?? {})));
+            childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w, childHint, mulM(mat, nodeMat(kn ?? {})), n.stackMode);
           }
         }
 
         // variant content wider than the instance compresses into it
-        // (segmented radios reflow per-option instead — see above)
+        // (segmented radios reflow per-option instead — see above);
+        // scale around the INSTANCE's left edge — a bare scale() would
+        // collapse everything toward the canvas origin (x=0)
         if (swapApplied) {
           const sc = fig.nodes.get(swapApplied.newSym);
           const cw = sc?.size?.x ?? 0;
           if (cw > w + 2 && cw > 0 && !/Amount=\d/.test(sc?.name ?? "")) {
-            childrenSvg = `<g transform="scale(${r(w / cw)},1)">${childrenSvg}</g>`;
+            const s2 = w / cw;
+            childrenSvg = `<g transform="translate(${r(mat[4] * (1 - s2))},0) scale(${r(s2)},1)">${childrenSvg}</g>`;
           }
         }
 
