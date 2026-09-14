@@ -396,6 +396,41 @@ function renderResolved(n: ResolvedNode, depth: number, lines: string[], budget:
   for (const c of n.children ?? []) renderResolved(c, depth + 1, lines, budget);
 }
 
+/** Build @font-face CSS for the families a render used, from font files in a
+ * directory. Family↔file matching is by slug (lowercase alphanumerics):
+ * family "SCBX Looped" ↔ SCBXLooped-Regular.woff2. The trailing token gives
+ * the weight (Regular=400, Bold=700, …); no token → 400. */
+function buildFontCSS(dir: string, families: string[]): string | null {
+  const WEIGHTS: Record<string, string> = {
+    thin: "100", extralight: "200", light: "300", regular: "400", medium: "500",
+    semibold: "600", bold: "700", extrabold: "800", black: "900",
+  };
+  const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const wanted = new Map(families.map((f) => [slug(f), f]));
+  if (!wanted.size) return null;
+  let files: string[] = [];
+  try {
+    files = readdirSync(dir).filter((f) => /\.(woff2?|ttf|otf)$/i.test(f));
+  } catch {
+    return null;
+  }
+  const faces: string[] = [];
+  for (const file of files) {
+    const stem = file.replace(/\.[^.]+$/, "");
+    const m = /^(.*)-([A-Za-z]+)$/.exec(stem);
+    const base = m && slug(m[2]) in WEIGHTS ? m[1] : stem;
+    const weight = m && slug(m[2]) in WEIGHTS ? WEIGHTS[slug(m[2])] : "400";
+    const family = wanted.get(slug(base));
+    if (!family) continue;
+    const fmt = /\.woff2$/i.test(file) ? "woff2" : /\.woff$/i.test(file) ? "woff" : /\.otf$/i.test(file) ? "opentype" : "truetype";
+    const data = readFileSync(path.join(dir, file)).toString("base64");
+    faces.push(
+      `@font-face{font-family:'${family.replace(/'/g, "")}';src:url(data:font/${fmt};base64,${data}) format('${fmt}');font-weight:${weight};font-style:normal;}`,
+    );
+  }
+  return faces.length ? faces.join("") : null;
+}
+
 async function runParseLocalFig(args: unknown[], cwd = process.cwd()): Promise<ToolResult> {
   const params = extractToolArgs(args);
   const embed = params.embed !== false;
@@ -531,7 +566,14 @@ async function runParseLocalFig(args: unknown[], cwd = process.cwd()): Promise<T
     // offline SVG render (structure/shapes/images; text via local fonts)
     if (params.svg !== false) {
       try {
-        const render = renderNodeSVG(doc, fig, rootId, { maxDepth: maxDepth + 4 });
+        const fontsDir = typeof params.fontsDir === "string" && params.fontsDir
+          ? params.fontsDir
+          : path.join(cwd, "fonts");
+        let render = renderNodeSVG(doc, fig, rootId, { maxDepth: maxDepth + 4 });
+        if (render && existsSync(fontsDir)) {
+          const fontCSS = buildFontCSS(fontsDir, render.fontFamilies);
+          if (fontCSS) render = renderNodeSVG(doc, fig, rootId, { maxDepth: maxDepth + 4, fontCSS });
+        }
         if (render) {
           const renderDir = path.join(assetsDir, "render");
           mkdirSync(renderDir, { recursive: true });
@@ -540,6 +582,9 @@ async function runParseLocalFig(args: unknown[], cwd = process.cwd()): Promise<T
           lines.push(
             `render (SVG) → ${svgPath} (${render.width}x${render.height}, ${render.nodeCount} nodes drawn)`,
           );
+          if (render.fontFamilies.length) {
+            lines.push(`  text families: ${render.fontFamilies.join(", ")} — embed matching fonts (fontsDir) if they look wrong in a browser`);
+          }
           if (render.warnings.length) {
             lines.push(`  render warnings: ${render.warnings.slice(0, 5).join(" | ")}`);
           }
@@ -731,6 +776,7 @@ export default function (pi: ExtensionAPI): void {
       depth: Type.Optional(Type.Number({ description: "Subtree depth limit (default 10, max 14)." })),
       max_json_chars: Type.Optional(Type.Number({ description: "Output character budget (default 20000, max 80000)." })),
       svg: Type.Optional(Type.Boolean({ description: "Also render the resolved node to an SVG file under assets (default true)." })),
+      fontsDir: Type.Optional(Type.String({ description: "Directory of font files (woff2/woff/ttf/otf) to embed as base64 @font-face so <text> runs render with the document's real fonts. Default: <project>/fonts when it exists. Files match families by name, e.g. SCBXLooped-Regular.woff2 registers family 'SCBX Looped' weight 400." })),
       embed: Type.Optional(Type.Boolean({ description: "Embed the page thumbnail inline (default true)." })),
     }),
     execute: async (...args: unknown[]) => runParseLocalFig(args, callCwd(args)),

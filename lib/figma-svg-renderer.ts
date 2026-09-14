@@ -31,6 +31,8 @@ export interface RenderResult {
   height: number;
   warnings: string[];
   nodeCount: number;
+  /** font-family names referenced by emitted <text> runs (for @font-face embedding) */
+  fontFamilies: string[];
 }
 
 function r(n: number): number {
@@ -521,6 +523,7 @@ export function renderNodeSVG(
   const maxDepth = Math.min(20, Math.max(1, opts?.maxDepth ?? 18));
   const maxNodes = Math.max(50, opts?.maxNodes ?? 4000);
   const warnings: string[] = [];
+  const fontFamilies = new Set<string>();
   let nodeCount = 0;
   let clipSeq = 0;
   let gradSeq = 0;
@@ -1136,6 +1139,7 @@ export function renderNodeSVG(
               const t = n.transform ?? { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0 };
               const dotsX = mat[0] * (t.m02 + w - dotsW - 2) + mat[4];
               const dotsY = mat[5] + (firstLineY ?? 0);
+              fontFamilies.add("SCBX Looped");
               return basePath + `<text x="${r(dotsX)}" y="${r(dotsY)}" font-family="SCBX Looped, sans-serif" font-size="${r(fs0)}" fill="${fillC}"${opacity}>...</text>`;
             }
             return basePath;
@@ -1168,11 +1172,13 @@ export function renderNodeSVG(
           const maxChars = Math.max(1, Math.floor((boxW - 2) / charW));
           const shown = chars.length > maxChars ? chars.slice(0, maxChars).replace(/[\s,]+$/, "") + "…" : chars;
           const tl1 = propText && family !== "SCBX Looped" ? ` textLength="${r(textWidthEst(chars, fs))}" lengthAdjust="spacingAndGlyphs"` : "";
+          fontFamilies.add(family);
           return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${fweight}${tl1}${opacity}>${esc(shown)}</text>`;
         }
         // fallback-font runs are wider than SCBX Looped; force the reference
         // metrics so button labels stop overflowing their pills
         const tl = propText && family !== "SCBX Looped" ? ` textLength="${r(textWidthEst(chars, fs))}" lengthAdjust="spacingAndGlyphs"` : "";
+        fontFamilies.add(family);
         return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${fweight}${tl}${opacity}>${esc(chars)}</text>`;
       }
       case "FRAME":
@@ -1480,7 +1486,7 @@ export function renderNodeSVG(
     inner +
     `\n</g>\n</svg>\n`;
 
-  return { svg, width: W, height: H, warnings, nodeCount };
+  return { svg, width: W, height: H, warnings, nodeCount, fontFamilies: [...fontFamilies] };
 }
 
 type RawChange = Record<string, any>;

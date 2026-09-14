@@ -44,6 +44,38 @@ decision procedure.
   instance shows no `texts:`, ask for a fresh download or fall back to the
   render (below).
 
+## Offline SVG render (built in)
+
+When `svg:true` (the default), the tool ALSO renders the resolved node to
+`<export-root>/fig-<file>/render/<node-id>.svg` — flattened absolute-
+coordinate paths in Figma's own serialization style: component instances
+resolved (overrides, swaps, constraints, slot texts), text drawn as real
+glyph outlines (no font needed), buttons/radios/clear-icons drawn
+procedurally to match Figma.
+
+- `<text>` runs (rare fallbacks + truncation dots) need the document's real
+  fonts: put woff2/woff/ttf files in `<project>/fonts/` and they are embedded
+  automatically as base64 `@font-face` (family matched by filename slug,
+  e.g. `SCBXLooped-Bold.woff2` → family "SCBX Looped" weight 700). Or pass
+  `fontsDir:` explicitly.
+- Preview: headless Chrome —
+  `chrome --headless --window-size=W,H --screenshot=out.png file://...svg`
+  (add a `?r=$RANDOM` query to bust Chrome's cache on re-renders).
+
+## Pixel-perfect loop (when "close" is not enough)
+
+To verify an implementation (or the render itself) against Figma bit-for-bit:
+
+1. Get the reference: select the frame in Figma → Copy as PNG (or the bridge
+   plugin) → save next to the render as `*-reference.png`.
+2. Screenshot our SVG at the same size, then per-pixel diff (PIL, threshold
+   ~30/px on the channel sum). Cluster residuals into regions and fix the
+   biggest class first — iterate.
+3. Reading the residuals: structural diffs (wrong position/width/color) are
+   real bugs — fix the renderer; ~1.5–2% scattered on glyph edges is the
+   cross-renderer anti-aliasing floor (Figma rasterizer vs Chrome/Skia) and
+   does not get better by editing the SVG.
+
 ## When to fall back to a render
 
 The .fig path gives structure + text; it does NOT render. For pixel-look
