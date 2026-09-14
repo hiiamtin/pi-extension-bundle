@@ -1132,6 +1132,13 @@ export function renderNodeSVG(
     let h = n.size ? Math.round(n.size.y) : 0;
     const fo = fill && fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : "";
 
+    /** a local rounded rect mapped through the accumulated matrix — a bare
+     * mat[4]/mat[5] placement ignores rotation (the vertical scrollbar is a
+     * 90deg-rotated 1128x16 instance) and clips its children away */
+    const rectAbs = (x: number, y: number, w2: number, h2: number, rad: number): string => {
+      const rotated = Math.abs(mat[1] ?? 0) > 1e-6 || Math.abs(mat[3] ?? 0) > 1e-6 || Math.abs((mat[0] ?? 1) - 1) > 1e-6;
+      return rotated ? xfPath(roundedRectPath(x, y, w2, h2, rad), mat) : roundedRectPath(mat[4] + x, mat[5] + y, w2, h2, rad);
+    };
     /** exact fill geometry of this node transformed to absolute space */
     const geomAbs = (): string | null => {
       // instance/frame boxes re-flow (stack layout, stretch, swap compress)
@@ -1140,7 +1147,7 @@ export function renderNodeSVG(
       if (n.type === "INSTANCE" || n.type === "FRAME" || n.type === "RECTANGLE" || n.type === "ROUNDED_RECTANGLE") {
         const rad = radiusOf(n);
         if (w > 0 && h > 0) {
-          return roundedRectPath(mat[4], mat[5], w, h, rad);
+          return rectAbs(0, 0, w, h, rad);
         }
         return null;
       }
@@ -1644,7 +1651,7 @@ export function renderNodeSVG(
         if (clips && childrenSvg && w > 0 && h > 0) {
           const cid = `clip${clipSeq + 1}_${frameTag}`;
           clipSeq++;
-          const clipGeom = roundedRectPath(mat[4], mat[5], w, h, radiusOf(n));
+          const clipGeom = rectAbs(0, 0, w, h, radiusOf(n));
           defs.push(`<clipPath id="${cid}"><path d="${clipGeom}"/></clipPath>`);
           out = `<g clip-path="url(#${cid})">${out}</g>`;
         }
