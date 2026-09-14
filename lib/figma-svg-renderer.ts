@@ -1442,7 +1442,7 @@ export function renderNodeSVG(
             const sibFill = sibText ? paintInfo(sibText.fillPaints).fill : undefined;
             const ownerName = fig.nodes.get(guidStr(n.symbolData?.symbolID))?.name ?? "";
             const assignedName = fig.nodes.get(propSym)?.name ?? "";
-            if (/^Alert$/i.test(assignedName)) childTint = "#6A41C9";
+            if (/^Alert$/i.test(assignedName)) childTint = "#663CC7";
             else if (hint?.color) childTint = hint.color;
             else if (sibFill) childTint = sibFill;
             else if (/Type=Primary/.test(ownerName)) childTint = "#FFFFFF";
@@ -1455,6 +1455,11 @@ export function renderNodeSVG(
           const hasIconAssign = [...ownAssigns.values()].some((v) => !!v.symbol);
           if (hasIconAssign && /Type=Primary/.test(fig.nodes.get(guidStr(n.symbolData?.symbolID))?.name ?? "")) {
             childTint = "#FFFFFF";
+          }
+          // a toast's close ✕ is the light 'onLight tertiary' grey
+          if (/overlay\.toast|Type=Success|Type=Info|Type=Warning|Type=Error/i.test(`${n.name ?? ""} ${fig.nodes.get(symId0Of(n) ?? "")?.name ?? ""}`)) {
+            const dismissChild = (fig.kidsOf.get(symId0Of(n) ?? "") ?? []).some((k) => /dismiss/i.test(fig.nodes.get(k)?.name ?? ""));
+            if (dismissChild) childTint = "#C1C4CE";
           }
           // status icons (success toast checkmark) take the state color —
           // the tint survives only to the checkmark, not to the close button
@@ -1476,14 +1481,14 @@ export function renderNodeSVG(
             const ring = ellipsePath(cx, cy, 6.67, 6.67);
             const k = 2.9;
             const cross = `M${xf(cx - k)} ${xf(cy - k)}L${xf(cx + k)} ${xf(cy + k)}M${xf(cx + k)} ${xf(cy - k)}L${xf(cx - k)} ${xf(cy + k)}`;
-            const col = hint?.color ?? "#6A7187";
+            const col = tint ?? hint?.color ?? "#6A7187";
             return `<path d="${ring}" fill="none" stroke="${col}" stroke-width="1.1"/>` +
               `<path d="${cross}" fill="none" stroke="${col}" stroke-width="1.2" stroke-linecap="round"/>`;
           }
           if ((resolvedName0 === "Dismiss Circle" || resolvedName0 === "Dismiss") && hint?.kind) {
             const mapped = iconIndexFor()[hint.kind];
             if (mapped) {
-              const color = hint.color ?? "#6A7187";
+              const color = tint ?? hint?.color ?? "#6A7187";
               const parts: string[] = [];
               const emitV = (nid: string): void => {
                 const cn = fig.nodes.get(nid);
@@ -1605,12 +1610,15 @@ export function renderNodeSVG(
             // a drawable child with no paint of its own is an icon slot: it may
             // inherit the container's foreground tint (Shape/Vector/Icon/…)
             const childIsIcon =
-              /^(Icon|Logo|Dismiss|Search|Panel Left Contract|Checkmark Circle|Icon Button|Shape|Vector)$/i.test(knName) ||
+              /^(Icon|Logo|Dismiss|Search|Search Icon|Chevron Icon|Icon Button|Icon Container|Panel Left Contract|Checkmark Circle|Shape|Vector)$/i.test(knName) ||
               !!nodeSymbolRef(kn ?? {});
             // an already-tinted context (icon inside a color-inheriting slot)
             // flows all the way down to the vector paths
             let passTint = tint !== undefined ? childTint : childIsIcon ? childTint : undefined;
-            if (successCtx && !/checkmark/i.test(knName)) passTint = undefined;
+            if (process.env.FIGMA_TRACE_TINT && childIsIcon && passTint) {
+              console.error(`[tint] ${knName} @(${r(mat[4])},${r(mat[5])}) via=${n.name} tint=${passTint}`);
+            }
+            if (successCtx) passTint = /checkmark/i.test(knName) ? "#0AC256" : /icon|dismiss/i.test(knName) ? "#C1C4CE" : undefined;
             childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w, childHint, mulM(mat, nodeMat(kn ?? {})), n.stackMode, passTint);
           }
         }
@@ -1788,6 +1796,24 @@ export function renderNodeSVG(
         return "";
     }
   };
+
+  /** a component made of vectors only = an icon slot (no text inside) */
+  function pureIconComp(id: string | undefined): boolean {
+    if (!id) return false;
+    const compId = guidStr(fig.nodes.get(id)?.symbolData?.symbolID) ?? id;
+    let hasText = false;
+    let hasVec = false;
+    const scan = (x: string, d: number): void => {
+      if (d > 4 || hasText) return;
+      const n = fig.nodes.get(x);
+      if (!n || n.visible === false) return;
+      if (n.type === "TEXT") { hasText = true; return; }
+      if (n.type === "VECTOR" || n.type === "BOOLEAN_OPERATION") hasVec = true;
+      for (const k of fig.kidsOf.get(x) ?? []) scan(k, d + 1);
+    };
+    scan(compId, 0);
+    return hasVec && !hasText;
+  }
 
   function symId0Of(n: RawChange): string | null {
     return guidStr(n.symbolData?.symbolID);
