@@ -980,7 +980,7 @@ export function renderNodeSVG(
       if (f.stackMode === "VERTICAL") return Math.round(widest + 2 * (f.stackHorizontalPadding ?? 0));
       return Math.round(sum + (f.stackSpacing ?? 0) * Math.max(0, n2 - 1) + 2 * (f.stackHorizontalPadding ?? 0));
     };
-    const items: { cn: any; w: number; h: number; bakedW: number; flowW?: number }[] = [];
+    const items: { cn: any; w: number; h: number; bakedW: number; flowW?: number; growW?: number }[] = [];
     const boundTextW = (cn: any): number => {
       const key = okeyOf(cn);
       const merged = mergeDir(ancDir?.children.get(key ?? ""), buildDirectiveTree(cn));
@@ -990,7 +990,12 @@ export function renderNodeSVG(
       }
       if (ext > 0) return ext;
       const chars = key ? merged?.textChars.get(key) : undefined;
-      return chars ? textWidthEst(chars, cn.fontSize ?? 16) : 0;
+      if (chars) return textWidthEst(chars, cn.fontSize ?? 16);
+      // prop-text slots carry no glyph run — read the component property
+      const tref = nodeTextRef(cn);
+      const assigns: AssignMap = new Map([...(ancDir?.assigns ?? []), ...(merged?.assigns ?? [])]);
+      const prop = tref ? assigns.get(tref)?.text : undefined;
+      return prop ? textWidthEst(prop, cn.fontSize ?? 16) : 0;
     };
     for (const kid of kids) {
       const cn = fig.nodes.get(kid);
@@ -998,12 +1003,18 @@ export function renderNodeSVG(
       const bakedW = cn.size?.x ?? 24;
       let w = bakedW;
       let flowW: number | undefined;
+      let growW: number | undefined;
       if (cn.type === "TEXT") {
         // a stale WIDE text box leaves the siblings that follow it too far
         // right; keep the measured width aside (flowW) and leave `w` alone so
         // every other layout rule sees exactly what it saw before
         const ext = boundTextW(cn);
         if (ext > 0) flowW = Math.max(8, Math.min(bakedW, Math.round(ext)));
+        // growth is only trusted from a component PROPERTY string (a run's
+        // last-glyph position can belong to an unrelated, longer string)
+        const tref2 = nodeTextRef(cn);
+        const prop2 = tref2 ? (ancDir?.assigns.get(tref2)?.text ?? assignMap(cn.componentPropAssignments).get(tref2)?.text) : undefined;
+        if (prop2) growW = Math.round(textWidthEst(prop2, cn.fontSize ?? 16));
       } else if (cn.type === "INSTANCE") {
         const ext = extOf(cn);
         if (ext > 0) {
@@ -1033,7 +1044,7 @@ export function renderNodeSVG(
           w = Math.max(bakedW, Math.round(end) + (cn.stackPaddingRight ?? 0));
         }
       }
-      items.push({ cn, w, h: cn.size?.y ?? 24, bakedW, flowW });
+      items.push({ cn, w, h: cn.size?.y ?? 24, bakedW, flowW, growW });
     }
     if (items.length < 2) return;
     const total = items.reduce((a, it) => a + it.w, 0) + spacing * (items.length - 1);
@@ -1068,15 +1079,49 @@ export function renderNodeSVG(
     const vBetween = !horiz && items.length === 2 && H > totalV + 2 * padMain + 4;
     // horizontally centered rows (modal footer buttons) re-flow around the
     // midpoint when a calibrated width changed an item's size
+    // a wider instance of a component whose LAST child sat at the component's
+    // right padding (chips: [Filter: value][+1][icon]) keeps that trailing
+    // icon pinned to the instance's right edge
+    const compW2 = comp.size?.x ?? 0;
+    const lastIt = items[items.length - 1];
+    const lastBaked = (horiz ? lastIt.cn.transform?.m02 : lastIt.cn.transform?.m12) ?? 0;
+    const stretchPin =
+      horiz &&
+      compW2 > 0 &&
+      items.length >= 3 &&
+      main > compW2 + 2 &&
+      Math.abs(lastBaked + (horiz ? lastIt.bakedW : lastIt.h) - (compW2 - padMain)) < 2;
+    // a bound label WIDER than its baked box pushes the siblings that follow
+    // it (chip: 'Lead owner' + ': You' + chevron). Centred labels (buttons)
+    // keep their baked position, and backgrounds never shift.
+    const growShifts = new Map<any, number>();
+    {
+      let acc = 0;
+      for (const it of items) {
+        // the shift an item receives comes from the growth of its PREDECESSORS
+        growShifts.set(it.cn, acc);
+        const isText = it.cn.type === "TEXT";
+        if (isText && it.growW !== undefined && it.growW > it.bakedW + 2 && it.cn.textAlignHorizontal !== "CENTER") {
+          acc += it.growW - it.bakedW;
+        }
+      }
+    }
+    const growFlow =
+      horiz &&
+      [...growShifts.values()].some((v) => v > 0) &&
+      !items.some((it) => it.cn.type === "TEXT" && it.growW !== undefined && it.growW > it.bakedW + 2 && it.cn.textAlignHorizontal === "CENTER");
+    if (growFlow && process.env.FIGMA_TRACE_FIRE) {
+      console.error(`[grow] ${comp.name} items=${items.map((it) => `${it.cn.name}:${it.growW ?? "-"}/${it.bakedW}`).join(" ")}`);
+    }
     const centerRow = horiz && comp.stackPrimaryAlignItems === "CENTER";
     const changed = items.some((it) => Math.abs(it.w - it.bakedW) > 2);
     if (process.env.FIGMA_TRACE_STACK2) {
-      console.error(`[st2] ${comp.name} horiz=${horiz} items=${items.map((it) => `${it.cn.name}[${it.cn.type}]:w${it.w}/b${it.bakedW}@${r(horiz ? it.cn.transform?.m02 ?? 0 : it.cn.transform?.m12 ?? 0)}`).join(" ")} spacing=${spacing} pad=${padMain} main=${main}`);
+      console.error(`[st2] ${comp.name} horiz=${horiz} items=${items.map((it) => `${it.cn.name}[${it.cn.type}]:w${it.w}/b${it.bakedW}/f${it.flowW ?? "-"}@${r(horiz ? it.cn.transform?.m02 ?? 0 : it.cn.transform?.m12 ?? 0)}`).join(" ")} spacing=${spacing} pad=${padMain} main=${main}`);
     }
     if (process.env.FIGMA_TRACE_STACK) {
       console.error(`[stack] comp=${comp.name} compId=${compId} horiz=${horiz} W=${W} H=${H} main=${main} items=${items.map((it) => `${it.cn.name}:${it.w}/${it.bakedW}`).join(",")} overflow=${overflow} between=${between} vBetween=${vBetween} centerRow=${centerRow}`);
     }
-    if (!(overflow || (between && items.length === 2) || vBetween || (centerRow && changed) || staleTextFlow)) return;
+    if (!(overflow || (between && items.length === 2) || vBetween || (centerRow && changed) || staleTextFlow || stretchPin || growFlow)) return;
     let p = staleTextFlow
       ? Math.max(padMain, horiz ? items[0].cn.transform?.m02 ?? padMain : items[0].cn.transform?.m12 ?? padMain)
       : padMain;
@@ -1090,12 +1135,14 @@ export function renderNodeSVG(
       // untouched sibling — the footer Save-on-Cancel collapse)
       const grew = it.w > it.bakedW + 2;
       let pos: number;
-      if (vBetween && (i === 0 || last)) pos = last ? main - padMain - it.h : padMain;
+      if (stretchPin && last) pos = main - padMain - it.w;
+      else if (vBetween && (i === 0 || last)) pos = last ? main - padMain - it.h : padMain;
       else if (staleTextFlow) pos = p;
       else if (centerRow && changed) { pos = cx; cx += it.w + spacing; }
       else if (between && (i === 0 || last))
         pos = last ? main - padMain - it.w : padMain;
-      else if (grew) pos = p;
+      else if (grew && !stretchPin) pos = p;
+      else if (growFlow && !/state-layer/i.test(it.cn.name ?? "")) pos = (horiz ? (t.m02 ?? p) : (t.m12 ?? p)) + (growShifts.get(it.cn) ?? 0);
       else pos = horiz ? (t.m02 ?? p) : (t.m12 ?? p);
       const cross = horiz ? (H - it.h) / 2 : (W - it.w) / 2;
       // header stacks (Title … icon button): the leading Title keeps its
@@ -1188,6 +1235,10 @@ export function renderNodeSVG(
           : (noText ? undefined : n.derivedTextData?.glyphs);
         if (process.env.FIGMA_TRACE === "3" && /Delete saved/.test(bound?.propText ?? n.textData?.characters ?? "")) {
           console.error(`[dbg] id=${id} propText=${JSON.stringify(bound?.propText)} nGlyphs=${bound?.glyphs?.length ?? 0} stale=${JSON.stringify(bound?.stale)} chars=${JSON.stringify(n.textData?.characters)} font=${n.fontName?.family}`);
+        }
+        if (process.env.FIGMA_TRACE_CHIP && mat[4] > 300 && mat[4] < 520 && mat[5] > 205 && mat[5] < 250) {
+          const gs = (bound?.glyphs ?? n.derivedTextData?.glyphs ?? []).slice(0, 12).map((g: any) => `${r(g.position?.x ?? 0)},${r(g.advance ?? 0)}`);
+          console.error(`[chip] id=${id} name=${n.name} boundChars=${JSON.stringify(bound?.textChars)} prop=${JSON.stringify(bound?.propText)} nGlyphs=${(bound?.glyphs ?? n.derivedTextData?.glyphs ?? []).length} pos=${gs.join(" ")}`);
         }
         if (process.env.FIGMA_TRACE_TABLE && mat[4] > 800 && mat[4] < 1100 && mat[5] > 700 && mat[5] < 850) {
           console.error(`[table] id=${id} name=${n.name} parent=${n.parentIndex?.guid ? guidStr(n.parentIndex.guid) : "-"} chars=${JSON.stringify(n.textData?.characters)} boundChars=${JSON.stringify(bound?.textChars)} prop=${JSON.stringify(bound?.propText)} glyphs=${bound?.glyphs?.length ?? 0} own=${n.derivedTextData?.glyphs?.length ?? 0} mat=(${r(mat[4])},${r(mat[5])})`);
