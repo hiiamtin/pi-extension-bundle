@@ -876,6 +876,7 @@ export function renderNodeSVG(
   const iconHintFor = (compId: string | undefined, nodeName: string | undefined, hint?: IconHint): IconHint | undefined => {
     const cname = (compId ? fig.nodes.get(compId)?.name : undefined) ?? nodeName;
     if (!cname) return undefined;
+    if (/Disabled=Yes/.test(cname)) return { color: "#C1C4CE", listCtx: hint?.listCtx };
     if (/Type=Danger/.test(cname)) return { kind: "Delete", color: "#E83F4F", listCtx: hint?.listCtx };
     if (/Type=Tertiary/.test(cname)) return { kind: "Dismiss", color: "#FFFFFF", listCtx: hint?.listCtx };
     if (/Type=Secondary/.test(cname)) {
@@ -884,8 +885,11 @@ export function renderNodeSVG(
       const sibText = (fig.kidsOf.get(compId ?? "") ?? [])
         .map((k) => fig.nodes.get(k))
         .find((k) => k?.type === "TEXT");
-      if (sibText) return { kind: "Add", color: paintInfo(sibText.fillPaints).fill ?? "#6A7187", listCtx: hint?.listCtx };
-      return { kind: hint?.listCtx ? "Add" : "Delete", color: "#6A7187", listCtx: hint?.listCtx };
+      const sibFill = sibText ? paintInfo(sibText.fillPaints).fill : undefined;
+      // a brand-purple label (a "Saved filters"-style button) keeps the
+      // icon on the library's Icon/Secondary grey
+      if (sibFill && !/^#6a41c9$/i.test(sibFill)) return { kind: "Add", color: sibFill, listCtx: hint?.listCtx };
+      return { kind: hint?.listCtx ? "Add" : undefined, color: "#6A7187", listCtx: hint?.listCtx };
     }
     if (/Add condition/i.test(cname)) return { kind: "Add", color: "#6A41C9" };
     return undefined;
@@ -1485,7 +1489,7 @@ export function renderNodeSVG(
             return `<path d="${ring}" fill="none" stroke="${col}" stroke-width="1.1"/>` +
               `<path d="${cross}" fill="none" stroke="${col}" stroke-width="1.2" stroke-linecap="round"/>`;
           }
-          if ((resolvedName0 === "Dismiss Circle" || resolvedName0 === "Dismiss") && hint?.kind) {
+          if (resolvedName0 === "Dismiss Circle" && hint?.kind) {
             const mapped = iconIndexFor()[hint.kind];
             if (mapped) {
               const color = tint ?? hint?.color ?? "#6A7187";
@@ -1588,12 +1592,20 @@ export function renderNodeSVG(
           // in the label's color (white menu glyphs on the dark sidebar, the
           // grey magnifier in the search field). Explicit icon hints
           // (Danger/Tertiary/Add) keep their own colors.
+          if (own?.color && childTint === undefined) childTint = own.color;
           if (!own) {
             const firstText = (fig.kidsOf.get(resId ?? id) ?? [])
               .map((k) => fig.nodes.get(k))
               .find((k) => k?.type === "TEXT");
-            const f = firstText ? paintInfo(firstText.fillPaints).fill : undefined;
-            if (f) childTint = f;
+            // a placeholder is the input's VALUE slot, not a label: its pale
+            // grey must not tint the field's leading icon (ref keeps the
+            // library's Icon/Secondary grey in the search field)
+            const isPlaceholder = /placeholder/i.test(firstText?.name ?? "");
+            const f = firstText && !isPlaceholder ? paintInfo(firstText.fillPaints).fill : undefined;
+            const brandBtn = !!f && /^#6a41c9$/i.test(f) && /button|dropdown/i.test(nameHere);
+            if (brandBtn) childTint = "#6A7187";
+            else if (f) childTint = f;
+            else if (isPlaceholder && childTint === undefined) childTint = "#6A7187";
           }
         }
 
