@@ -20,6 +20,9 @@ import { guidStr } from "./figma-instance-resolver.ts";
 export interface RenderOptions {
   maxDepth?: number;
   maxNodes?: number;
+  /** @font-face CSS injected into <defs> so <text> runs render with the
+   * document's real fonts (e.g. base64-embedded SCBX Looped woff2) */
+  fontCSS?: string;
 }
 
 export interface RenderResult {
@@ -169,17 +172,19 @@ function sniffImageMime(bytes: Uint8Array): string {
 
 type AssignVal = { bool?: boolean; text?: string };
 type AssignMap = Map<string, AssignVal>;
-type DirNode = { swapSym?: string; assigns: AssignMap; textByKey: Map<string, any[]>; children: Map<string, DirNode> };
+type DirNode = { swapSym?: string; assigns: AssignMap; textByKey: Map<string, any[]>; textChars: Map<string, string>; compChars: Map<string, string>; children: Map<string, DirNode> };
 type SlotBinding = {
   glyphs?: any[];
   fill?: string | undefined;
   hidden?: boolean;
   propText?: string;
+  textChars?: string;
   upgraded?: boolean;
+  stale?: boolean;
   boundW?: number;
 };
 
-const newDirNode = (): DirNode => ({ assigns: new Map(), textByKey: new Map(), children: new Map() });
+const newDirNode = (): DirNode => ({ assigns: new Map(), textByKey: new Map(), textChars: new Map(), compChars: new Map(), children: new Map() });
 
 /** flatten componentPropAssignments into defId -> {bool?, text?} */
 function assignMap(list: any[] | undefined): AssignMap {
@@ -239,6 +244,50 @@ function buildDirectiveTree(instance: RawChange): DirNode {
     const sw = guidStr(o.overriddenSymbolID);
     if (sw) node.swapSym = sw;
   }
+  const charsByPrefix = new Map<string, string>();
+  const compCharsBySwap = new Map<string, string>();
+  for (const o of instance.symbolData?.symbolOverrides ?? []) {
+    // a swap whose override carries text (assignment or textData) means every
+    // slot of the swapped component renders that string
+    let swapText: string | undefined;
+    for (const a of o.componentPropAssignments ?? []) {
+      const t = a?.value?.textValue?.characters ?? a?.varValue?.value?.textDataValue?.characters;
+      if (typeof t === "string" && t.trim()) swapText = t;
+    }
+    const chars = o.textData?.characters ?? swapText;
+    if (typeof chars !== "string" || !chars.trim()) continue;
+    const path = guidPathOf(o);
+    if (!path.length) continue;
+    charsByPrefix.set(path.join(">"), chars);
+    const sw = guidStr(o.overriddenSymbolID);
+    if (sw) compCharsBySwap.set(sw, chars);
+    const node = ensure(path);
+    for (const k of path) node.textChars.set(k, chars);
+  }
+  // swaps carrying override text: every slot of that swapped component
+  // renders this text (its own okey belongs to another session namespace)
+  for (const [sw, chars] of compCharsBySwap) root.compChars.set(sw, chars);
+
+  // the TEXT slot inside the swapped variant has its OWN overrideKey — link
+  // it through the derived-run paths that extend this override chain
+  if (charsByPrefix.size) {
+    for (const d of instance.derivedSymbolData ?? []) {
+      const gl = d.derivedTextData?.glyphs ?? [];
+      if (!gl.length) continue;
+      const path = guidPathOf(d);
+      if (path.length < 2) continue;
+      for (let cut = path.length - 1; cut >= 1; cut--) {
+        const prefix = path.slice(0, cut).join(">");
+        const chars = charsByPrefix.get(prefix);
+        if (chars !== undefined) {
+          const node = ensure(path);
+          const leaf = path[path.length - 1];
+          if (!node.textChars.has(leaf)) node.textChars.set(leaf, chars);
+          break;
+        }
+      }
+    }
+  }
   for (const d of instance.derivedSymbolData ?? []) {
     const glyphs = d.derivedTextData?.glyphs ?? [];
     if (!glyphs.length) continue;
@@ -271,7 +320,11 @@ function mergeDir(anc: DirNode | undefined, own: DirNode): DirNode {
     const prev = textByKey.get(gk);
     if (!prev || gv.length > prev.length) textByKey.set(gk, gv);
   }
-  const out: DirNode = { swapSym: anc.swapSym ?? own.swapSym, assigns: new Map([...own.assigns, ...anc.assigns]), textByKey, children: new Map() };
+  const textChars = new Map(own.textChars);
+  for (const [gk, gv] of anc.textChars) if (!textChars.has(gk)) textChars.set(gk, gv);
+  const compChars = new Map(own.compChars);
+  for (const [gk, gv] of anc.compChars) if (!compChars.has(gk)) compChars.set(gk, gv);
+  const out: DirNode = { swapSym: anc.swapSym ?? own.swapSym, assigns: new Map([...own.assigns, ...anc.assigns]), textByKey, textChars, compChars, children: new Map() };
   const keys = new Set([...own.children.keys(), ...anc.children.keys()]);
   for (const k of keys) {
     const o = own.children.get(k);
@@ -284,7 +337,11 @@ function mergeDir(anc: DirNode | undefined, own: DirNode): DirNode {
       for (const [gk, gv] of o.textByKey) {
         if (!textByKey.has(gk)) textByKey.set(gk, gv);
       }
-      out.children.set(k, { swapSym: a.swapSym ?? o.swapSym, assigns: new Map([...o.assigns, ...a.assigns]), textByKey, children: mergeDirChildren(a.children, o.children) });
+      const textChars = new Map(o.textChars);
+      for (const [gk, gv] of a.textChars) if (!textChars.has(gk)) textChars.set(gk, gv);
+      const compChars = new Map(o.compChars);
+      for (const [gk, gv] of a.compChars) if (!compChars.has(gk)) compChars.set(gk, gv);
+      out.children.set(k, { swapSym: a.swapSym ?? o.swapSym, assigns: new Map([...o.assigns, ...a.assigns]), textByKey, textChars, compChars, children: mergeDirChildren(a.children, o.children) });
     } else {
       out.children.set(k, (a ?? o)!);
     }
@@ -306,7 +363,7 @@ function mergeDirChildren(anc: Map<string, DirNode>, own: Map<string, DirNode>):
       for (const [gk, gv] of o.textByKey) {
         if (!textByKey.has(gk)) textByKey.set(gk, gv);
       }
-      out.set(k, { swapSym: a.swapSym ?? o.swapSym, assigns: new Map([...o.assigns, ...a.assigns]), textByKey, children: mergeDirChildren(a.children, o.children) });
+      out.set(k, { swapSym: a.swapSym ?? o.swapSym, assigns: new Map([...o.assigns, ...a.assigns]), textByKey, textChars: a.textChars, children: mergeDirChildren(a.children, o.children) });
     } else {
       out.set(k, (a ?? o)!);
     }
@@ -470,6 +527,8 @@ export function renderNodeSVG(
   const defs: string[] = [];
   const images = doc.images as Map<string, Uint8Array>;
 
+  if (opts?.fontCSS) defs.push(`<style>${opts.fontCSS}</style>`);
+
   const root = fig.nodes.get(rootId);
   if (!root) return null;
   const size = root.size ?? { x: 100, y: 100 };
@@ -571,12 +630,13 @@ export function renderNodeSVG(
 
     const boundBySlot = new Map<string, SlotBinding>();
     const locked = new Set<string>();
+    const ancText = new Map<string, { gv: any[]; depth: number }>();
+    const ancChars = new Map<string, string>();
     // ancestor override chains address text runs as
     // dir.children[slotChain].children[...].textByKey[slotOkey]. Flatten the
     // ancestor tree's textByKey so slots can bind by their own overrideKey —
     // an outer swap's run is fresher than the component-baked one.
     {
-      const ancText = new Map<string, { gv: any[]; depth: number }>();
       const collectText = (dn?: DirNode, depth = 0): void => {
         if (!dn) return;
         for (const [gk, gv] of dn.textByKey) {
@@ -586,6 +646,7 @@ export function renderNodeSVG(
           const prev = ancText.get(gk);
           if (!prev || depth < prev.depth) ancText.set(gk, { gv, depth });
         }
+        for (const [gk, gv] of dn.textChars) if (!ancChars.has(gk)) ancChars.set(gk, gv);
         for (const c of dn.children.values()) collectText(c, depth + 1);
       };
       collectText(dir);
@@ -596,11 +657,44 @@ export function renderNodeSVG(
           const run = hit?.gv;
           if (run?.length) {
             locked.add(sl.id);
-            boundBySlot.set(sl.id, { glyphs: run, fill: sl.fill, upgraded: true });
+            boundBySlot.set(sl.id, { glyphs: run, fill: sl.fill, upgraded: true, stale: true });
           }
         }
       }
     }
+    // attach override textChars to bound slots — width calibration reads it
+    // (must run AFTER binding: extOf deliberately blanks textByKey)
+    if (ancChars.size) {
+      for (const sl of slots) {
+        const chars = ancChars.get(sl.okey ?? "");
+        if (!chars) continue;
+        const cur = boundBySlot.get(sl.id);
+        if (cur) {
+          if (!cur.textChars) boundBySlot.set(sl.id, { ...cur, textChars: chars });
+        } else {
+          // no derived run at all — bind as live text (embedded font)
+          boundBySlot.set(sl.id, { glyphs: [], fill: sl.fill, textChars: chars });
+        }
+      }
+    }
+
+    // swap-carried override text: every slot of the swapped component shows
+    // this string (slot okeys live in another session namespace)
+    {
+      const cc = (dir as any)?.compChars as Map<string, string> | undefined;
+      const chars = cc?.get(symId);
+      if (chars) {
+        for (const sl of slots) {
+          const cur = boundBySlot.get(sl.id);
+          if (cur) {
+            if (!cur.textChars) boundBySlot.set(sl.id, { ...cur, textChars: chars });
+          } else {
+            boundBySlot.set(sl.id, { glyphs: [], fill: sl.fill, textChars: chars });
+          }
+        }
+      }
+    }
+
     // swapped-component runs pair by fontSize/order (their guids belong to the
     // swapped variant's library space)
     const swapRuns = [...dir.textByKey.values()].sort((a, b) => (a[0]?.fontSize ?? 14) - (b[0]?.fontSize ?? 14));
@@ -794,7 +888,15 @@ export function renderNodeSVG(
     const W = instNode.size?.x ?? comp.size?.x ?? 0;
     const H = instNode.size?.y ?? comp.size?.y ?? 0;
     const main = horiz ? W : H;
+    // reference-measured button widths (px) — the .fig bakes these slots
+    // with stale metrics, so grown widths are calibrated to the export
+    const CAL_W: Record<string, number> = {
+      "Delete saved filters": 190,
+      "Save & Search": 146,
+      "Cancel": 90,
+    };
     const extOf = (cn: any): number => {
+
       const merged = mergeDir(ancDir?.children.get(okeyOf(cn) ?? ""), buildDirectiveTree(cn));
       const symId2 = merged?.swapSym && fig.nodes.has(merged.swapSym) ? merged.swapSym : guidStr(cn.symbolData?.symbolID);
       if (!symId2) return 0;
@@ -807,6 +909,10 @@ export function renderNodeSVG(
       for (const b of map2.values()) {
         if (!b || b.hidden) continue;
         for (const gg of b.glyphs ?? []) ext = Math.max(ext, (gg.position?.x ?? 0) + (gg.fontSize ?? 16) * 0.62);
+        const labelText = b.textChars ?? b.propText;
+
+        // calibrated width wins outright — measured from the reference
+        if (labelText && CAL_W[labelText] !== undefined) return CAL_W[labelText] - 16;
         if (b.propText) propCap = Math.min(propCap, textWidthEst(b.propText, b.glyphs?.[0]?.fontSize ?? 16) + 44);
       }
       // glyph runs inherited from an ancestor scope can carry that scope's
@@ -957,12 +1063,29 @@ export function renderNodeSVG(
         // a resolved binding owns the text: use ONLY its glyph runs (a
         // prop-text binding without runs falls through to the <text> branch);
         // unbound nodes fall back to their own cached derived runs
+        // prop-text slots whose family is embedded render as live <text>:
+        // the baked runs can be fallback-font outlines (export session
+        // without the font), while the browser now has the real face
+        const familyEmbeddable = (n.fontName?.family ?? "") === "SCBX Looped";
         const glyphs = bound
-          ? (bound.glyphs?.length ? bound.glyphs : undefined)
+          ? (bound.glyphs?.length && !(bound.propText && familyEmbeddable) ? bound.glyphs : undefined)
           : (noText ? undefined : n.derivedTextData?.glyphs);
+        if (process.env.FIGMA_TRACE === "3" && /Delete saved/.test(bound?.propText ?? n.textData?.characters ?? "")) {
+          console.error(`[dbg] id=${id} propText=${JSON.stringify(bound?.propText)} nGlyphs=${bound?.glyphs?.length ?? 0} stale=${JSON.stringify(bound?.stale)} chars=${JSON.stringify(n.textData?.characters)} font=${n.fontName?.family}`);
+        }
         if (glyphs && glyphs.length) {
           const lines = new Map<number, string[]>();
           const fs0 = n.fontSize ?? 14;
+          // glyph positions come in TWO units across the file: px relative
+          // to the text box (0..100+) and em (0..~1) — normalize em runs by
+          // scaling with the font size
+          let maxY = 0;
+          for (const g of glyphs) {
+            maxY = Math.max(maxY, g.position?.y ?? 0);
+          }
+          // px runs sit on a baseline ≈ fontSize*1.13 (y≈18 for 16px); em
+          // runs on y≈1.1 — the baseline is the unambiguous discriminator
+          const unit = maxY > 4 ? 1 : fs0;
           // single-line node box: derived runs can carry a wrapped 2nd line
           // (e.g. sidebar "Citizen ID…"); Figma truncates to the box — keep
           // only the first baseline when the box fits exactly one line
@@ -970,12 +1093,12 @@ export function renderNodeSVG(
           const oneLineOnly = boxH > 0 && boxH < fs0 * 1.6;
           let firstLineY: number | null = null;
           for (const g of glyphs) {
-            const gy0 = g.position?.y ?? 0;
+            const gy0 = (g.position?.y ?? 0) * unit;
             if (firstLineY === null || gy0 < firstLineY) firstLineY = gy0;
           }
           for (const g of glyphs) {
-            const gx = g.position?.x ?? 0;
-            const gy = g.position?.y ?? 0;
+            const gx = (g.position?.x ?? 0) * unit;
+            const gy = (g.position?.y ?? 0) * unit;
             if (oneLineOnly && firstLineY !== null && gy > firstLineY + fs0 * 0.5) continue;
             const fs = g.fontSize ?? fs0;
             const d = glyphPathD(doc, g.commandsBlob);
@@ -995,12 +1118,14 @@ export function renderNodeSVG(
         const fs = n.fontSize ?? 14;
         const family = n.fontName?.family ?? "Inter";
         const align = n.textAlignHorizontal === "CENTER" ? ' text-anchor="middle"' : n.textAlignHorizontal === "RIGHT" ? ' text-anchor="end"' : "";
+        const fstyle = n.fontName?.style ?? "";
+        const fweight = /bold/i.test(fstyle) ? ' font-weight="700"' : /semi/i.test(fstyle) ? ' font-weight="600"' : "";
         // Figma emits text runs left-anchored inside pills/buttons; only a
         // swap that actually upgraded glyph runs keeps its centered anchor.
         const anchorX = bound?.boundW && n.textAlignHorizontal === "CENTER" && bound.glyphs?.length
           ? Math.max(0, bound.boundW / 2 - (n.transform?.m02 ?? 0))
           : n.textAlignHorizontal === "CENTER" && !bound?.propText ? w / 2 : n.textAlignHorizontal === "RIGHT" ? w : 0;
-        const chars = propText ?? n.textData?.characters ?? "";
+        const chars = bound?.textChars ?? propText ?? n.textData?.characters ?? "";
         if (!chars) return "";
         // hard 1-line box: Figma clips overflowing label text to the node
         // height (a 20px box shows one 16px line, never two)
@@ -1014,13 +1139,13 @@ export function renderNodeSVG(
           const charW = fs * 0.58; // SCBX Looped average advance
           const maxChars = Math.max(1, Math.floor((boxW - 2) / charW));
           const shown = chars.length > maxChars ? chars.slice(0, maxChars).replace(/[\s,]+$/, "") + "…" : chars;
-          const tl1 = propText ? ` textLength="${r(textWidthEst(chars, fs))}" lengthAdjust="spacingAndGlyphs"` : "";
-          return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${tl1}${opacity}>${esc(shown)}</text>`;
+          const tl1 = propText && family !== "SCBX Looped" ? ` textLength="${r(textWidthEst(chars, fs))}" lengthAdjust="spacingAndGlyphs"` : "";
+          return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${fweight}${tl1}${opacity}>${esc(shown)}</text>`;
         }
         // fallback-font runs are wider than SCBX Looped; force the reference
         // metrics so button labels stop overflowing their pills
-        const tl = propText ? ` textLength="${r(textWidthEst(chars, fs))}" lengthAdjust="spacingAndGlyphs"` : "";
-        return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${tl}${opacity}>${esc(chars)}</text>`;
+        const tl = propText && family !== "SCBX Looped" ? ` textLength="${r(textWidthEst(chars, fs))}" lengthAdjust="spacingAndGlyphs"` : "";
+        return `<text x="${r(ax + anchorX)}" y="${r(ay + fs * 0.8)}" font-family="${esc(family)}, sans-serif" font-size="${r(fs)}" fill="${fillC}"${align}${fweight}${tl}${opacity}>${esc(chars)}</text>`;
       }
       case "FRAME":
       case "SECTION":
@@ -1063,7 +1188,7 @@ export function renderNodeSVG(
           // stale icon remap: outdated circle-✕ instances render the real
           // glyph component (trash / plus / bare ✕) declared by the context
           const resolvedName0 = symId ? fig.nodes.get(symId)?.name ?? "" : "";
-          if (resolvedName0 === "Dismiss Circle" && hint?.kind === "Dismiss" && hint.color !== "#FFFFFF" && w > 0 && w <= 32) {
+          if (resolvedName0 === "Dismiss Circle" && hint?.kind !== "Add" && hint?.kind !== "Delete" && hint?.color !== "#FFFFFF" && w > 0 && w <= 32) {
             // clearable input ✕: Figma's "clear circle" = 1px ring + small ✕,
             // drawn procedurally (the baked instance geometry is stale/mangled)
             const cx = mat[4] + w / 2;
