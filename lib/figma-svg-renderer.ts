@@ -1133,6 +1133,9 @@ export function renderNodeSVG(
         if (process.env.FIGMA_TRACE === "3" && /Delete saved/.test(bound?.propText ?? n.textData?.characters ?? "")) {
           console.error(`[dbg] id=${id} propText=${JSON.stringify(bound?.propText)} nGlyphs=${bound?.glyphs?.length ?? 0} stale=${JSON.stringify(bound?.stale)} chars=${JSON.stringify(n.textData?.characters)} font=${n.fontName?.family}`);
         }
+        if (process.env.FIGMA_TRACE_TABLE && mat[4] > 800 && mat[4] < 1100 && mat[5] > 700 && mat[5] < 850) {
+          console.error(`[table] id=${id} name=${n.name} parent=${n.parentIndex?.guid ? guidStr(n.parentIndex.guid) : "-"} chars=${JSON.stringify(n.textData?.characters)} boundChars=${JSON.stringify(bound?.textChars)} prop=${JSON.stringify(bound?.propText)} glyphs=${bound?.glyphs?.length ?? 0} own=${n.derivedTextData?.glyphs?.length ?? 0} mat=(${r(mat[4])},${r(mat[5])})`);
+        }
         if (glyphs && glyphs.length) {
           const lines = new Map<number, string[]>();
           const fs0 = n.fontSize ?? 14;
@@ -1322,17 +1325,33 @@ export function renderNodeSVG(
           if (propSym && fig.nodes.has(propSym)) {
             swapApplied = { newSym: propSym };
             symId = propSym;
-            // the assigned icon slot inherits its context color: the enclosing
-            // icon-button variant (Danger → red, Tertiary → white) or the
-            // button's label fill (a Primary button's "+" renders white);
-            // icon-only buttons with no context keep the symbol's own ink
+            // The assigned icon slot inherits its context color. Prefer an
+            // explicit icon hint, then the enclosing button foreground; a
+            // standalone navbar Alert uses the brand purple from the design.
             const sibText = (fig.kidsOf.get(guidStr(n.symbolData?.symbolID)) ?? [])
               .map((k) => fig.nodes.get(k))
               .find((k) => k?.type === "TEXT");
             const sibFill = sibText ? paintInfo(sibText.fillPaints).fill : undefined;
-            if (hint?.color) childTint = hint.color;
+            const ownerName = fig.nodes.get(guidStr(n.symbolData?.symbolID))?.name ?? "";
+            const assignedName = fig.nodes.get(propSym)?.name ?? "";
+            if (/^Alert$/i.test(assignedName)) childTint = "#6A41C9";
+            else if (hint?.color) childTint = hint.color;
             else if (sibFill) childTint = sibFill;
+            else if (/Type=Primary/.test(ownerName)) childTint = "#FFFFFF";
           }
+          // Some button instances keep the OVERRIDDEN_SYMBOL_ID assignment
+          // on the owner while the ref is declared by its nested icon slot.
+          // Pass the primary foreground down to that slot without tinting
+          // sibling text/state-layer nodes.
+          const ownAssigns = assignMap(n.componentPropAssignments);
+          const hasIconAssign = [...ownAssigns.values()].some((v) => !!v.symbol);
+          if (hasIconAssign && /Type=Primary/.test(fig.nodes.get(guidStr(n.symbolData?.symbolID))?.name ?? "")) {
+            childTint = "#FFFFFF";
+          }
+          // status icons (success toast checkmark) take the state color —
+          // the tint survives only to the checkmark, not to the close button
+          const successCtx = /Type=Success/i.test(`${n.name ?? ""} ${fig.nodes.get(symId0Of(n) ?? "")?.name ?? ""}`);
+          if (successCtx) childTint = "#0AC256";
           if (symId) {
             childOverrideMap = buildSlotMap(n, symId, { dir: node, inheritedAssigns: new Map([...(dir?.assigns ?? [])]) });
             if (node) childDir = node;
@@ -1452,6 +1471,17 @@ export function renderNodeSVG(
           const listCtx = !!hint?.listCtx || /fieldselection|Available fields/i.test(nameHere);
           const own = iconHintFor(resId, n.type === "INSTANCE" ? undefined : n.name, hint);
           childHint = own ? { ...own, listCtx } : listCtx ? { ...(hint ?? {}), listCtx: true } : hint;
+          // generic foreground tint: an icon inside a labeled container draws
+          // in the label's color (white menu glyphs on the dark sidebar, the
+          // grey magnifier in the search field). Explicit icon hints
+          // (Danger/Tertiary/Add) keep their own colors.
+          if (!own) {
+            const firstText = (fig.kidsOf.get(resId ?? id) ?? [])
+              .map((k) => fig.nodes.get(k))
+              .find((k) => k?.type === "TEXT");
+            const f = firstText ? paintInfo(firstText.fillPaints).fill : undefined;
+            if (f) childTint = f;
+          }
         }
 
         if (depth < maxDepth && nodeCount < maxNodes) {
@@ -1463,7 +1493,17 @@ export function renderNodeSVG(
           const kidDir = n.type === "INSTANCE" ? (childDir ?? dir) : dir;
           for (const kid of childIds) {
             const kn = fig.nodes.get(kid);
-            childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w, childHint, mulM(mat, nodeMat(kn ?? {})), n.stackMode, childTint);
+            const knName = kn?.name ?? "";
+            // a drawable child with no paint of its own is an icon slot: it may
+            // inherit the container's foreground tint (Shape/Vector/Icon/…)
+            const childIsIcon =
+              /^(Icon|Logo|Dismiss|Search|Panel Left Contract|Checkmark Circle|Icon Button|Shape|Vector)$/i.test(knName) ||
+              !!nodeSymbolRef(kn ?? {});
+            // an already-tinted context (icon inside a color-inheriting slot)
+            // flows all the way down to the vector paths
+            let passTint = tint !== undefined ? childTint : childIsIcon ? childTint : undefined;
+            if (successCtx && !/checkmark/i.test(knName)) passTint = undefined;
+            childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w, childHint, mulM(mat, nodeMat(kn ?? {})), n.stackMode, passTint);
           }
         }
 
