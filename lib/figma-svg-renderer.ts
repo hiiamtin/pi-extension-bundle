@@ -1373,8 +1373,12 @@ export function renderNodeSVG(
               const oi = Math.min(nOpt, Math.max(1, parseInt(selOpt[1], 10))) - 1;
               const ox = mat[4] + oi * optW;
               const rOut = 8;
-              const x1 = ox, x2 = ox + optW, y1 = mat[5], y2 = mat[5] + h;
-              const kc = rOut * 0.5522847498;
+              // snap the 1px outline to .5 pixel boundaries so the stroke
+              // fills whole pixels (crisp like Figma) instead of straddling
+              // two columns at half opacity
+              const x1 = Math.round(ox) + 0.5, x2 = Math.round(ox + optW) - 0.5;
+              const y1 = Math.round(mat[5]) + 0.5, y2 = Math.round(mat[5] + h) - 0.5;
+              const kc = (rOut - 0.5) * 0.5522847498;
               // left option: round left corners; right option: round right
               let pillD: string;
               if (oi === 0) {
