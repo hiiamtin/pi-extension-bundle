@@ -972,13 +972,31 @@ export function renderNodeSVG(
       if (f.stackMode === "VERTICAL") return Math.round(widest + 2 * (f.stackHorizontalPadding ?? 0));
       return Math.round(sum + (f.stackSpacing ?? 0) * Math.max(0, n2 - 1) + 2 * (f.stackHorizontalPadding ?? 0));
     };
-    const items: { cn: any; w: number; h: number; bakedW: number }[] = [];
+    const items: { cn: any; w: number; h: number; bakedW: number; flowW?: number }[] = [];
+    const boundTextW = (cn: any): number => {
+      const key = okeyOf(cn);
+      const merged = mergeDir(ancDir?.children.get(key ?? ""), buildDirectiveTree(cn));
+      let ext = 0;
+      for (const run of merged?.textByKey.values() ?? []) {
+        for (const gg of run) ext = Math.max(ext, (gg.position?.x ?? 0) + (gg.fontSize ?? cn.fontSize ?? 16) * 0.6);
+      }
+      if (ext > 0) return ext;
+      const chars = key ? merged?.textChars.get(key) : undefined;
+      return chars ? textWidthEst(chars, cn.fontSize ?? 16) : 0;
+    };
     for (const kid of kids) {
       const cn = fig.nodes.get(kid);
       if (!cn || cn.visible === false) continue;
       const bakedW = cn.size?.x ?? 24;
       let w = bakedW;
-      if (cn.type === "INSTANCE") {
+      let flowW: number | undefined;
+      if (cn.type === "TEXT") {
+        // a stale WIDE text box leaves the siblings that follow it too far
+        // right; keep the measured width aside (flowW) and leave `w` alone so
+        // every other layout rule sees exactly what it saw before
+        const ext = boundTextW(cn);
+        if (ext > 0) flowW = Math.max(8, Math.min(bakedW, Math.round(ext)));
+      } else if (cn.type === "INSTANCE") {
         const ext = extOf(cn);
         if (ext > 0) {
           const cand = Math.round(ext) + 16;
@@ -1007,7 +1025,7 @@ export function renderNodeSVG(
           w = Math.max(bakedW, Math.round(end) + (cn.stackPaddingRight ?? 0));
         }
       }
-      items.push({ cn, w, h: cn.size?.y ?? 24, bakedW });
+      items.push({ cn, w, h: cn.size?.y ?? 24, bakedW, flowW });
     }
     if (items.length < 2) return;
     const total = items.reduce((a, it) => a + it.w, 0) + spacing * (items.length - 1);
@@ -1020,6 +1038,23 @@ export function renderNodeSVG(
       // trailing button to the right edge regardless of baked positions
       || (horiz && items.length === 2 && /Trailing content=.*icon button/i.test(comp?.name ?? ""));
     const overflow = items.some((it) => it.w > it.bakedW + 2);
+    const staleTextFlow =
+      horiz &&
+      !/Trailing content=.*icon button/i.test(comp?.name ?? "") &&
+      // buttons carry a full-size state-layer background as a child — their
+      // baked positions are the real ones, never a stale text flow
+      !items.some((it) => /state-layer/i.test(it.cn.name ?? "")) &&
+      items.length >= 2 &&
+      items.some((it, i) => it.flowW !== undefined && it.flowW < it.bakedW - 2 && i < items.length - 1) &&
+      items.every((it, i) => {
+        if (i === 0) return true;
+        const prev = items[i - 1];
+        const prevEnd = (prev.cn.transform?.m02 ?? 0) + prev.bakedW;
+        return Math.abs((it.cn.transform?.m02 ?? 0) - (prevEnd + spacing)) < 1.5;
+      });
+    if (staleTextFlow && process.env.FIGMA_TRACE_FIRE) {
+      console.error(`[fire] ${comp.name} items=${items.map((it) => `${it.cn.name}:${it.w}/${it.bakedW}`).join(" ")}`);
+    }
     // stretched vertical stacks (dialog overlays): Figma keeps the first
     // child at the top and pins the last to the bottom edge
     const vBetween = !horiz && items.length === 2 && H > totalV + 2 * padMain + 4;
@@ -1027,11 +1062,16 @@ export function renderNodeSVG(
     // midpoint when a calibrated width changed an item's size
     const centerRow = horiz && comp.stackPrimaryAlignItems === "CENTER";
     const changed = items.some((it) => Math.abs(it.w - it.bakedW) > 2);
+    if (process.env.FIGMA_TRACE_STACK2) {
+      console.error(`[st2] ${comp.name} horiz=${horiz} items=${items.map((it) => `${it.cn.name}[${it.cn.type}]:w${it.w}/b${it.bakedW}@${r(horiz ? it.cn.transform?.m02 ?? 0 : it.cn.transform?.m12 ?? 0)}`).join(" ")} spacing=${spacing} pad=${padMain} main=${main}`);
+    }
     if (process.env.FIGMA_TRACE_STACK) {
       console.error(`[stack] comp=${comp.name} compId=${compId} horiz=${horiz} W=${W} H=${H} main=${main} items=${items.map((it) => `${it.cn.name}:${it.w}/${it.bakedW}`).join(",")} overflow=${overflow} between=${between} vBetween=${vBetween} centerRow=${centerRow}`);
     }
-    if (!(overflow || (between && items.length === 2) || vBetween || (centerRow && changed))) return;
-    let p = padMain;
+    if (!(overflow || (between && items.length === 2) || vBetween || (centerRow && changed) || staleTextFlow)) return;
+    let p = staleTextFlow
+      ? Math.max(padMain, horiz ? items[0].cn.transform?.m02 ?? padMain : items[0].cn.transform?.m12 ?? padMain)
+      : padMain;
     let cx = (main - total) / 2;
     items.forEach((it, i) => {
       const t = it.cn.transform;
@@ -1043,6 +1083,7 @@ export function renderNodeSVG(
       const grew = it.w > it.bakedW + 2;
       let pos: number;
       if (vBetween && (i === 0 || last)) pos = last ? main - padMain - it.h : padMain;
+      else if (staleTextFlow) pos = p;
       else if (centerRow && changed) { pos = cx; cx += it.w + spacing; }
       else if (between && (i === 0 || last))
         pos = last ? main - padMain - it.w : padMain;
@@ -1058,8 +1099,8 @@ export function renderNodeSVG(
       it.cn.transform = horiz
         ? { ...t, m02: keepX, m12: centerRow && changed ? (t.m12 ?? cross) : cross }
         : { ...t, m12: pos, m02: cross };
-      if (Math.abs(it.w - it.bakedW) > 2 && it.cn.size) it.cn.size = { ...it.cn.size, x: it.w };
-      p = pos + it.w + spacing;
+      if (it.cn.type !== "TEXT" && Math.abs(it.w - it.bakedW) > 2 && it.cn.size) it.cn.size = { ...it.cn.size, x: it.w };
+      p = pos + (staleTextFlow ? it.flowW ?? it.w : it.w) + spacing;
     });
   };
 
