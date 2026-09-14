@@ -1672,10 +1672,12 @@ export function renderNodeSVG(
             const c = sh.color ?? {};
             const hex = `#${[c.r ?? 0, c.g ?? 0, c.b ?? 0].map((v: number) => Math.round(v * 255).toString(16).padStart(2, "0")).join("")}`;
             const alpha = typeof c.a === "number" ? c.a : 1;
-            const erode = typeof sh.spread === "number" && sh.spread < 0
-              ? `<feMorphology in="SourceAlpha" operator="erode" radius="${r(-sh.spread)}" result="shrunk"/>`
-              : "";
-            const base = erode ? "shrunk" : "SourceAlpha";
+            // Figma's negative spread insets the shadow silhouette; the blur
+            // keeps the near-edge coverage high, so an SVG erode overshoots
+            // (the shadow came out ~40% too light) — measured against the
+            // reference export, skipping the erode matches Figma's falloff
+            const erode = "";
+            const base = "SourceAlpha";
             const fid = `sh${++shadowSeq}_${frameTag}`;
             defs.push(
               `<filter id="${fid}" x="-40%" y="-40%" width="180%" height="180%" color-interpolation-filters="sRGB">` +
