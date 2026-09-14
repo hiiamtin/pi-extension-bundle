@@ -172,7 +172,7 @@ function sniffImageMime(bytes: Uint8Array): string {
   return "application/octet-stream";
 }
 
-type AssignVal = { bool?: boolean; text?: string };
+type AssignVal = { bool?: boolean; text?: string; symbol?: string };
 type AssignMap = Map<string, AssignVal>;
 type DirNode = { swapSym?: string; assigns: AssignMap; textByKey: Map<string, any[]>; textChars: Map<string, string>; compChars: Map<string, string>; children: Map<string, DirNode> };
 type SlotBinding = {
@@ -196,7 +196,14 @@ function assignMap(list: any[] | undefined): AssignMap {
     if (!defId) continue;
     const bool = a?.varValue?.value?.boolValue ?? a?.value?.boolValue;
     const text = a?.value?.textValue?.characters ?? a?.varValue?.value?.textDataValue?.characters;
-    m.set(defId, { bool: typeof bool === "boolean" ? bool : undefined, text: typeof text === "string" ? text : undefined });
+    // instance swaps travel as component properties too (symbolIdValue),
+    // e.g. an Icon Button's icon slot assigned to "Add"/"Alert"
+    const sym = a?.varValue?.value?.symbolIdValue?.guid ?? a?.value?.symbolIdValue?.guid;
+    m.set(defId, {
+      bool: typeof bool === "boolean" ? bool : undefined,
+      text: typeof text === "string" ? text : undefined,
+      symbol: sym ? guidStr(sym) ?? undefined : undefined,
+    });
   }
   return m;
 }
@@ -210,6 +217,12 @@ function nodeVisibleRefs(n: RawChange): string[] {
 
 function nodeTextRef(n: RawChange): string | null {
   const r = (n.componentPropRefs ?? []).find((r: any) => r?.componentPropNodeField === "TEXT_DATA");
+  return r ? guidStr(r.defID) : null;
+}
+
+/** component-property instance swap: an icon slot assigned to another symbol */
+function nodeSymbolRef(n: RawChange): string | null {
+  const r = (n.componentPropRefs ?? []).find((r: any) => r?.componentPropNodeField === "OVERRIDDEN_SYMBOL_ID");
   return r ? guidStr(r.defID) : null;
 }
 
@@ -246,6 +259,9 @@ function buildDirectiveTree(instance: RawChange): DirNode {
     const sw = guidStr(o.overriddenSymbolID);
     if (sw) node.swapSym = sw;
   }
+  // the INSTANCE's own componentPropAssignments (not inside symbolOverrides)
+  // carry the live property values — including icon swaps (symbolIdValue)
+  for (const [k, v] of assignMap(instance.componentPropAssignments)) root.assigns.set(k, v);
   const charsByPrefix = new Map<string, string>();
   const compCharsBySwap = new Map<string, string>();
   for (const o of instance.symbolData?.symbolOverrides ?? []) {
@@ -1057,6 +1073,7 @@ export function renderNodeSVG(
     hint?: IconHint,
     mat: Mat = M_ID,
     pstack?: string,
+    tint?: string,
   ): string => {
     if (depth > maxDepth || nodeCount >= maxNodes) return "";
     const n = fig.nodes.get(id);
@@ -1272,6 +1289,7 @@ export function renderNodeSVG(
         let childOverrideMap: Map<string, SlotBinding> | undefined;
         let swapApplied: { newSym: string } | undefined;
         let childDir: DirNode | undefined;
+        let childTint: string | undefined = tint;
         if (n.type === "INSTANCE") {
           // VISIBLE prop assigned false anywhere in the ancestor chain
           // (e.g. stale clear ✕ inside non-clearable variants) → hidden
@@ -1294,6 +1312,26 @@ export function renderNodeSVG(
           if (node.swapSym && fig.nodes.has(node.swapSym)) {
             swapApplied = { newSym: node.swapSym };
             symId = node.swapSym;
+          }
+          // instance swap declared as a component property (icon slots):
+          // the design's assigned symbol wins over the baked component icon
+          const symPropRef = nodeSymbolRef(n);
+          const propSym = symPropRef
+            ? node.assigns.get(symPropRef)?.symbol ?? dir?.assigns.get(symPropRef)?.symbol
+            : undefined;
+          if (propSym && fig.nodes.has(propSym)) {
+            swapApplied = { newSym: propSym };
+            symId = propSym;
+            // the assigned icon slot inherits its context color: the enclosing
+            // icon-button variant (Danger → red, Tertiary → white) or the
+            // button's label fill (a Primary button's "+" renders white);
+            // icon-only buttons with no context keep the symbol's own ink
+            const sibText = (fig.kidsOf.get(guidStr(n.symbolData?.symbolID)) ?? [])
+              .map((k) => fig.nodes.get(k))
+              .find((k) => k?.type === "TEXT");
+            const sibFill = sibText ? paintInfo(sibText.fillPaints).fill : undefined;
+            if (hint?.color) childTint = hint.color;
+            else if (sibFill) childTint = sibFill;
           }
           if (symId) {
             childOverrideMap = buildSlotMap(n, symId, { dir: node, inheritedAssigns: new Map([...(dir?.assigns ?? [])]) });
@@ -1425,7 +1463,7 @@ export function renderNodeSVG(
           const kidDir = n.type === "INSTANCE" ? (childDir ?? dir) : dir;
           for (const kid of childIds) {
             const kn = fig.nodes.get(kid);
-            childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w, childHint, mulM(mat, nodeMat(kn ?? {})), n.stackMode);
+            childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w, childHint, mulM(mat, nodeMat(kn ?? {})), n.stackMode, childTint);
           }
         }
 
@@ -1450,7 +1488,10 @@ export function renderNodeSVG(
         if (swapApplied) {
           const comp = fig.nodes.get(swapApplied.newSym);
           const ci = comp ? paintInfo(comp.fillPaints) : null;
-          if (ci?.fill) paint = ci.fill;
+          // the swapped variant owns its paint: an instance that was baked
+          // with the ORIGINAL variant's fill (e.g. a purple selected menu row)
+          // must not keep it after swapping to the default variant
+          paint = ci?.fill ?? undefined;
         }
         const fo2 = fill && fillOpacity < 0.999 ? ` fill-opacity="${r(fillOpacity)}"` : "";
         const compForVis = n.type === "INSTANCE" ? fig.nodes.get(swapApplied?.newSym ?? symId0Of(n) ?? "") : undefined;
@@ -1555,7 +1596,7 @@ export function renderNodeSVG(
           for (const p of paths.fill) {
             if (!p.svgPath) continue;
             const pf = p.paints?.find((pp: any) => pp?.type === "SOLID");
-            g.push(`<path d="${xfPath(p.svgPath, mat)}" fill="${(pf && hexFill(pf)) || fill || "none"}"${opacity}/>`);
+            g.push(`<path d="${xfPath(p.svgPath, mat)}" fill="${tint ?? ((pf && hexFill(pf)) || fill || "none")}"${opacity}/>`);
           }
           for (const p of paths.stroke) {
             if (!p.svgPath) continue;
