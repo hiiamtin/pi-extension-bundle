@@ -1293,6 +1293,7 @@ export function renderNodeSVG(
         let swapApplied: { newSym: string } | undefined;
         let childDir: DirNode | undefined;
         let childTint: string | undefined = tint;
+        let successCtx = false;
         if (n.type === "INSTANCE") {
           // VISIBLE prop assigned false anywhere in the ancestor chain
           // (e.g. stale clear ✕ inside non-clearable variants) → hidden
@@ -1350,7 +1351,7 @@ export function renderNodeSVG(
           }
           // status icons (success toast checkmark) take the state color —
           // the tint survives only to the checkmark, not to the close button
-          const successCtx = /Type=Success/i.test(`${n.name ?? ""} ${fig.nodes.get(symId0Of(n) ?? "")?.name ?? ""}`);
+          successCtx = /Type=Success/i.test(`${n.name ?? ""} ${fig.nodes.get(symId0Of(n) ?? "")?.name ?? ""}`);
           if (successCtx) childTint = "#0AC256";
           if (symId) {
             childOverrideMap = buildSlotMap(n, symId, { dir: node, inheritedAssigns: new Map([...(dir?.assigns ?? [])]) });
