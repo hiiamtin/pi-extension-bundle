@@ -608,12 +608,14 @@ export function renderNodeSVG(
     const w = src?.strokeWeight ?? 0;
     // independent weights with ONLY a bottom border = the table row hairline
     // (drawn separately); any other combination keeps the full outline
+    // a top-only independent border (the modal Footer) must not become a
+    // 4-sided outline — the bottom line bleeds past the viewport
     if (src?.borderStrokeWeightsIndependent) {
       const bw = src.borderBottomWeight ?? 0;
-      const tw = src.borderTopWeight ?? bw;
-      const lw = src.borderLeftWeight ?? bw;
-      const rw = src.borderRightWeight ?? bw;
-      if (bw > 0 && tw === 0 && lw === 0 && rw === 0) return "";
+      const tw = src.borderTopWeight ?? 0;
+      const lw = src.borderLeftWeight ?? 0;
+      const rw = src.borderRightWeight ?? 0;
+      if (bw === 0 && (tw > 0 || lw > 0 || rw > 0)) return "";
     }
     return s && w > 0 ? ` stroke="${s}" stroke-width="${r(w)}"` : "";
   };
