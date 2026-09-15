@@ -31,6 +31,25 @@ decision procedure.
    snapshot, the file is older than the node — fresh download needed.
 4. Iterate with `node:"<id>"` or `frame:"<name>"` for other parts of the file.
 
+## Different file → every node resolves but content is empty
+
+If the user shares links from a Figma file that has NO local snapshot, the
+tool may still fall back to whatever `.fig` exists and return empty or
+near-empty content for every node. Do not debug the renderer — get the
+right file first:
+
+1. Compare file keys. The URL carries the file key right after `/design/`
+   (`https://www.figma.com/design/<KEY>/<file-name>?node-id=…`). A snapshot's
+   own key is in its `originFileKey`; **library snapshots use `lk-…` keys** —
+   they are component libraries, not app screens.
+2. Ask the user to download the linked file itself: Figma → main menu →
+   **File → Save local copy…** (desktop) or **File → Download → .fig** (web),
+   then place the `.fig` in `.pi/figma-exports/` (or `~/Downloads`) and
+   re-run the same call. The tool matches by the file name in the URL.
+3. Gotcha: do not trust a hit that matched on `localID` only — node guids
+   are `(sessionID, localID)` and a different file can contain a coincidental
+   `localID` match of a completely unrelated node. The session must match.
+
 ## What the data means
 
 - INSTANCE nodes are resolved to their component (the `component` name encodes
@@ -89,5 +108,7 @@ for look.
 
 - The tool never invents data: "not present in this snapshot" means a
   re-download is required, not an approximation.
+- Empty content across ALL nodes of one file = wrong snapshot (see
+  "Different file" above), not a renderer bug.
 - Never mix texts from different snapshots; always report the `exported:`
   date alongside extracted content.
