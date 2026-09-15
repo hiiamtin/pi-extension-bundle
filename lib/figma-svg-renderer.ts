@@ -1726,6 +1726,23 @@ export function renderNodeSVG(
             shapeSvg += `<path d="M${xf(mat[4])} ${xf(y1)}L${xf(mat[4] + w)} ${xf(y1)}" fill="none" stroke="${sc}" stroke-width="${r(bw)}"${opacity}/>`;
           }
         }
+        // a top-only independent border (the table footer's separator rule):
+        // the suppressed outline would otherwise skip it entirely
+        if (n.borderStrokeWeightsIndependent && (n.borderBottomWeight ?? 0) === 0 && (n.borderTopWeight ?? 0) > 0 && w > 0 && h > 0) {
+          const spt2 = (Array.isArray(n.strokePaints) && n.strokePaints.length ? n.strokePaints : (compForVis?.strokePaints ?? [])).find((p: any) => p?.visible !== false);
+          const sc2 = spt2 ? hexFill(spt2) : null;
+          if (sc2) {
+            const tw2 = n.borderTopWeight ?? 1;
+            const y0 = mat[5] + tw2 / 2;
+            shapeSvg += `<path d="M${xf(mat[4])} ${xf(y0)}L${xf(mat[4] + w)} ${xf(y0)}" fill="none" stroke="${sc2}" stroke-width="${r(tw2)}"${opacity}/>`;
+          }
+        }
+        if (!paint && st && w > 400 && h > 400 && /content container/i.test(n.name ?? "")) {
+          // the Lead table's outer box: a fill-less frame whose uniform
+          // 1px stroke (#E6EAF2) IS the border the reference shows
+          const od = geomD ?? roundedRectPath(mat[4], mat[5], w, h, radiusOf(n, compForVis));
+          shapeSvg = `<path d="${od}" fill="none"${st}${opacity}/>`;
+        }
         if (paint) {
           // segmented-radio instance: Figma paints the OPTION containers, not
           // the root box; reflowed halves would paint a wrong white slab
