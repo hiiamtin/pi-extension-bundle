@@ -575,6 +575,30 @@ export function renderNodeSVG(
     }
   };
 
+  /** Figma keeps text decoration in TEXT style definitions; the node only
+   *  references them by styleIdForText. */
+  let textStyleDeco: Map<string, string> | undefined;
+  const textDecorationOf = (n: any): string => {
+    const direct = (n as any).textDecoration ?? (n.style as any)?.textDecoration;
+    if (direct) return String(direct);
+    const sid = (n as any).styleIdForText;
+    if (!sid) return "";
+    if (!textStyleDeco) {
+      textStyleDeco = new Map();
+      for (const sn of fig.nodes.values()) {
+        const s = sn as any;
+        if (s.styleType !== "TEXT") continue;
+        const dv = s.textDecoration ?? s.style?.textDecoration;
+        if (!dv) continue;
+        for (const k of [s.version, s.userFacingVersion, s.styleId]) {
+          if (k !== undefined && k !== null) textStyleDeco.set(String(k), String(dv));
+        }
+      }
+    }
+    const ver = (sid as any)?.assetRef?.version ?? sid;
+    return textStyleDeco.get(String(ver)) ?? "";
+  };
+
   const strokeText = (n: RawChange, compNode?: any): string => {
     const src = Array.isArray(n.strokePaints) && n.strokePaints.length ? n : compNode;
     const sp = Array.isArray(src?.strokePaints)
@@ -1098,12 +1122,19 @@ export function renderNodeSVG(
     const compW2 = comp.size?.x ?? 0;
     const lastIt = items[items.length - 1];
     const lastBaked = (horiz ? lastIt.cn.transform?.m02 : lastIt.cn.transform?.m12) ?? 0;
-    const stretchPin =
+    const dropdownPin =
       horiz &&
-      compW2 > 0 &&
-      items.length >= 3 &&
-      main > compW2 + 2 &&
-      Math.abs(lastBaked + (horiz ? lastIt.bakedW : lastIt.h) - (compW2 - padMain)) < 2;
+      items.length >= 2 &&
+      /button\.dropdown/i.test(comp.name ?? "") &&
+      !/state-layer/i.test(lastIt.cn.name ?? "") &&
+      /frame|chevron|icon/i.test(lastIt.cn.name ?? "");
+    const stretchPin =
+      dropdownPin ||
+      (horiz &&
+        compW2 > 0 &&
+        items.length >= 3 &&
+        main > compW2 + 2 &&
+        Math.abs(lastBaked + (horiz ? lastIt.bakedW : lastIt.h) - (compW2 - padMain)) < 2);
     // a bound label WIDER than its baked box pushes the siblings that follow
     // it (chip: 'Lead owner' + ': You' + chevron). Centred labels (buttons)
     // keep their baked position, and backgrounds never shift.
@@ -1379,7 +1410,7 @@ export function renderNodeSVG(
         const align = n.textAlignHorizontal === "CENTER" ? ' text-anchor="middle"' : n.textAlignHorizontal === "RIGHT" ? ' text-anchor="end"' : "";
         const fstyle = n.fontName?.style ?? "";
         const fweight = /bold/i.test(fstyle) ? ' font-weight="700"' : /semi/i.test(fstyle) ? ' font-weight="600"' : "";
-        const deco = /UNDERLINE/i.test(String(n.style?.textDecoration ?? "")) ? ' text-decoration="underline"' : "";
+        const deco = /UNDERLINE/i.test(textDecorationOf(n)) ? ' text-decoration="underline"' : "";
         // Figma emits text runs left-anchored inside pills/buttons; only a
         // swap that actually upgraded glyph runs keeps its centered anchor.
         const anchorX = bound?.boundW && n.textAlignHorizontal === "CENTER" && bound.glyphs?.length
@@ -1753,7 +1784,7 @@ export function renderNodeSVG(
         }
 
         // clip children to the instance/frame box
-        const clips = n.type === "INSTANCE" || (n.type === "FRAME" && n.clipsContent === true);
+        const clips = !n.frameMaskDisabled && (n.type === "INSTANCE" || (n.type === "FRAME" && n.clipsContent === true));
         let out = `${shapeSvg}${img}${childrenSvg}`;
         if (clips && childrenSvg && w > 0 && h > 0) {
           const cid = `clip${clipSeq + 1}_${frameTag}`;
