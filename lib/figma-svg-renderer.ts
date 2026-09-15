@@ -582,6 +582,15 @@ export function renderNodeSVG(
       : null;
     const s = sp ? hexFill(sp) : null;
     const w = src?.strokeWeight ?? 0;
+    // independent weights with ONLY a bottom border = the table row hairline
+    // (drawn separately); any other combination keeps the full outline
+    if (src?.borderStrokeWeightsIndependent) {
+      const bw = src.borderBottomWeight ?? 0;
+      const tw = src.borderTopWeight ?? bw;
+      const lw = src.borderLeftWeight ?? bw;
+      const rw = src.borderRightWeight ?? bw;
+      if (bw > 0 && tw === 0 && lw === 0 && rw === 0) return "";
+    }
     return s && w > 0 ? ` stroke="${s}" stroke-width="${r(w)}"` : "";
   };
 
@@ -1672,6 +1681,18 @@ export function renderNodeSVG(
         const compForVis = n.type === "INSTANCE" ? fig.nodes.get(swapApplied?.newSym ?? symId0Of(n) ?? "") : undefined;
         const st = strokeText(n, compForVis);
         const swI = st ? swInset(n) / 2 : 0;
+        // Figma's borderStrokeWeightsIndependent: the row separators of the
+        // Lead table are a bottom-only 1px hairline (#F6F7FA) on otherwise
+        // fill-less cells — the outline path above never draws them
+        if (n.borderStrokeWeightsIndependent && (n.borderBottomWeight ?? 0) > 0 && w > 0 && h > 0) {
+          const spt = (Array.isArray(n.strokePaints) ? n.strokePaints : (compForVis?.strokePaints ?? [])).find((p: any) => p?.visible !== false);
+          const sc = spt ? hexFill(spt) : null;
+          if (sc) {
+            const bw = n.borderBottomWeight ?? 1;
+            const y1 = mat[5] + h - bw / 2;
+            shapeSvg += `<path d="M${xf(mat[4])} ${xf(y1)}L${xf(mat[4] + w)} ${xf(y1)}" fill="none" stroke="${sc}" stroke-width="${r(bw)}"${opacity}/>`;
+          }
+        }
         if (paint) {
           // segmented-radio instance: Figma paints the OPTION containers, not
           // the root box; reflowed halves would paint a wrong white slab
