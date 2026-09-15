@@ -1397,7 +1397,11 @@ export function renderNodeSVG(
           }
           const laid: { g: any; gx: number; gy: number }[] = placed ?? glyphs.map((g: any) => ({ g, gx: (g.position?.x ?? 0) * unit, gy: (g.position?.y ?? 0) * unit }));
           for (const { g, gx, gy } of laid) {
-            if (oneLineOnly && bound && (line1Overflows || boxW < 200) && firstLineY !== null && gy > firstLineY + fs0 * 0.5) continue;
+            // clamp inherited runs to line 1 — EXCEPT the table cell's own
+            // "Content" text: its instance box is taller than the component's
+            // and the reference wraps the tail onto a second line
+            const keepTail = !line1Overflows && boxW >= 200 && n.name === "Content";
+            if (oneLineOnly && !keepTail && firstLineY !== null && gy > firstLineY + fs0 * 0.5) continue;
             if (oneLineOnly && reallyOverflows && boxW > 0 && gx + (g.advance ?? 0.6) * fs0 > boxW - dotsW) {
               truncated = true;
               continue;
