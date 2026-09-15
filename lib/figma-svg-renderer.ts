@@ -912,6 +912,7 @@ export function renderNodeSVG(
     const cname = (compId ? fig.nodes.get(compId)?.name : undefined) ?? nodeName;
     if (!cname) return undefined;
     if (/Disabled=Yes/.test(cname)) return { color: "#C1C4CE", listCtx: hint?.listCtx };
+
     if (/Type=Danger/.test(cname)) return { kind: "Delete", color: "#E83F4F", listCtx: hint?.listCtx };
     if (/Type=Tertiary/.test(cname)) return { kind: "Dismiss", color: "#FFFFFF", listCtx: hint?.listCtx };
     if (/Type=Secondary/.test(cname)) {
@@ -1382,7 +1383,7 @@ export function renderNodeSVG(
           }
           const laid: { g: any; gx: number; gy: number }[] = placed ?? glyphs.map((g: any) => ({ g, gx: (g.position?.x ?? 0) * unit, gy: (g.position?.y ?? 0) * unit }));
           for (const { g, gx, gy } of laid) {
-            if (oneLineOnly && firstLineY !== null && gy > firstLineY + fs0 * 0.5) continue;
+            if (oneLineOnly && bound && firstLineY !== null && gy > firstLineY + fs0 * 0.5) continue;
             if (oneLineOnly && reallyOverflows && boxW > 0 && gx + (g.advance ?? 0.6) * fs0 > boxW - dotsW) {
               truncated = true;
               continue;
@@ -1520,6 +1521,9 @@ export function renderNodeSVG(
             const dismissChild = (fig.kidsOf.get(symId0Of(n) ?? "") ?? []).some((k) => /dismiss/i.test(fig.nodes.get(k)?.name ?? ""));
             if (dismissChild) childTint = "#C1C4CE";
           }
+          // the navbar menu-button sits on the dark #303146 bar: its toggle
+          // icon paints in the on-dark foreground even without a text sibling
+          if (/menubutton/i.test(n.name ?? "") && childTint === undefined) childTint = "#FFFFFF";
           // status icons (success toast checkmark) take the state color —
           // the tint survives only to the checkmark, not to the close button
           successCtx = /Type=Success/i.test(`${n.name ?? ""} ${fig.nodes.get(symId0Of(n) ?? "")?.name ?? ""}`);
@@ -1678,6 +1682,7 @@ export function renderNodeSVG(
             // inherit the container's foreground tint (Shape/Vector/Icon/…)
             const childIsIcon =
               /^(Icon|Logo|Dismiss|Search|Search Icon|Chevron Icon|Icon Button|Icon Container|Panel Left Contract|Checkmark Circle|Shape|Vector)$/i.test(knName) ||
+              /menubutton/i.test(knName) ||
               !!nodeSymbolRef(kn ?? {});
             // an already-tinted context (icon inside a color-inheriting slot)
             // flows all the way down to the vector paths
@@ -1746,7 +1751,8 @@ export function renderNodeSVG(
         if (!paint && st && w > 400 && h > 400 && /content container/i.test(n.name ?? "")) {
           // the Lead table's outer box: a fill-less frame whose uniform
           // 1px stroke (#E6EAF2) IS the border the reference shows
-          const od = geomD ?? roundedRectPath(mat[4], mat[5], w, h, radiusOf(n, compForVis));
+          const swO = (n.strokeWeight ?? 1) / 2;
+          const od = roundedRectPath(mat[4] + swO, mat[5] + swO, Math.max(0, w - swO * 2), Math.max(0, h - swO * 2), Math.max(0, radiusOf(n, compForVis) - swO));
           shapeSvg = `<path d="${od}" fill="none"${st}${opacity}/>`;
         }
         if (paint) {
