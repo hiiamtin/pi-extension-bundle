@@ -261,6 +261,26 @@ async function readClipboardImage(): Promise<{ format: ExportFormat; bytes: Uint
   }
 }
 
+/** Raycast clipboard history saves images to its own store and may leave the
+ * system pasteboard empty — fall back to its newest capture (<= 10 min old). */
+function newestRaycastImage(): { format: ExportFormat; bytes: Uint8Array; path: string } | null {
+  if (process.platform !== "darwin") return null;
+  const dir = path.join(os.homedir(), "Library", "Application Support", "com.raycast.macos", "clipboard");
+  try {
+    const hits = readdirSync(dir)
+      .filter((f) => /\.(png|jpe?g)$/i.test(f))
+      .map((f) => ({ f, t: statSync(path.join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.t - a.t);
+    if (!hits.length) return null;
+    if (Date.now() - hits[0].t > 10 * 60_000) return null; // stale, not a fresh copy
+    const p = path.join(dir, hits[0].f);
+    const bytes = readFileSync(p);
+    return { format: /\.jpe?g$/i.test(hits[0].f) ? "jpg" : "png", bytes, path: p };
+  } catch {
+    return null;
+  }
+}
+
 /** Pull-based capture for files where the plugin cannot run (view-only):
  * the user right-clicks → Copy as PNG/SVG (free in every plan/mode), then we
  * persist whatever is on the clipboard through the same store/state/log path
@@ -282,10 +302,17 @@ async function runSaveClipboard(args: unknown[], cwd = process.cwd()): Promise<T
     return textResult(`error: clipboard read failed: ${e instanceof Error ? e.message : String(e)}`);
   }
   if (!clip) {
-    return textResult(
-      "clipboard has no Figma PNG/SVG. In Figma: right-click the node → Copy as → PNG (or SVG), " +
-        "then call figma_save_clipboard again. Copy as image works even in view-only files.",
-    );
+    // Raycast's clipboard history intercepts copies and can leave the system
+    // pasteboard empty — use its newest capture instead of failing.
+    const ray = newestRaycastImage();
+    if (ray) {
+      clip = { format: ray.format, bytes: ray.bytes };
+    } else {
+      return textResult(
+        "clipboard has no Figma PNG/SVG. In Figma: right-click the node → Copy as → PNG (or SVG), " +
+          "then call figma_save_clipboard again. Copy as image works even in view-only files.",
+      );
+    }
   }
   if (peek) {
     return textResult(
