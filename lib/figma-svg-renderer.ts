@@ -1152,8 +1152,14 @@ export function renderNodeSVG(
         }
       }
     }
+    // a stack made ENTIRELY of small text items (a form label plus its red
+    // required-mark) must not reflow: the estimated growth overshoots the
+    // real SCBX Looped width and shoves the asterisk ~40px past the label.
+    // Real growth re-flows (chips) always involve a non-text sibling.
+    const textOnlyStack = items.every((it) => it.cn.type === "TEXT");
     const growFlow =
       horiz &&
+      !textOnlyStack &&
       [...growShifts.values()].some((v) => v > 0) &&
       !items.some((it) => it.cn.type === "TEXT" && it.growW !== undefined && it.growW > it.bakedW + 2 && it.cn.textAlignHorizontal === "CENTER");
     if (growFlow && process.env.FIGMA_TRACE_FIRE) {
