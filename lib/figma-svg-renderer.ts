@@ -1702,7 +1702,16 @@ export function renderNodeSVG(
         if (swapApplied) {
           const sc = fig.nodes.get(swapApplied.newSym);
           const cw = sc?.size?.x ?? 0;
-          if (cw > w + 2 && cw > 0 && !/Amount=\d/.test(sc?.name ?? "")) {
+          // icon swaps (vector-only symbols) keep their natural aspect —
+          // squeezing the Light-bulb glyph into its 24px slot flattened it
+          const symbolHasText = (nid: string, d: number): boolean => {
+            if (d > 4) return false;
+            const cn = fig.nodes.get(nid);
+            if (!cn) return false;
+            if (cn.type === "TEXT") return true;
+            return (fig.kidsOf.get(nid) ?? []).some((k) => symbolHasText(k, d + 1));
+          };
+          if (cw > w + 2 && cw > 0 && !/Amount=\d/.test(sc?.name ?? "") && sc && symbolHasText(guidStr(sc.guid), 0)) {
             const s2 = w / cw;
             childrenSvg = `<g transform="translate(${r(mat[4] * (1 - s2))},0) scale(${r(s2)},1)">${childrenSvg}</g>`;
           }
