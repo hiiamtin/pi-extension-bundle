@@ -1346,6 +1346,20 @@ export function renderNodeSVG(
           const wrapAllowed = growH && pstack === "VERTICAL" && !wantsTrunc;
           const oneLineOnly = wantsTrunc && boxH > 0 && boxH < fs0 * 1.6 && !wrapAllowed;
           const reallyOverflows = origLines >= 2;
+          // clamp to one line ONLY when line 1 actually overflows the box —
+          // that is the ellipsis case (sidebar labels). A fitted line 1 with a
+          // baked second baseline means the real box wraps (the Lead table's
+          // Campaign cells carry the tail on line 2) and the tail must render.
+          let line1Overflows = false;
+          if (oneLineOnly && boxW > 0 && firstLineY !== null) {
+            for (const g of glyphs) {
+              const gy0 = (g.position?.y ?? 0) * unit;
+              if (gy0 <= firstLineY + fs0 * 0.5 && (g.position?.x ?? 0) * unit + (g.advance ?? 0.6) * unit > boxW - dotsW) {
+                line1Overflows = true;
+                break;
+              }
+            }
+          }
           // textAutoResize=HEIGHT runs baked on a single line but wider than
           // the box wrap at render time: split at the last word boundary
           // (space-advance gap) that fits, center each line per the node's
@@ -1383,7 +1397,7 @@ export function renderNodeSVG(
           }
           const laid: { g: any; gx: number; gy: number }[] = placed ?? glyphs.map((g: any) => ({ g, gx: (g.position?.x ?? 0) * unit, gy: (g.position?.y ?? 0) * unit }));
           for (const { g, gx, gy } of laid) {
-            if (oneLineOnly && bound && firstLineY !== null && gy > firstLineY + fs0 * 0.5) continue;
+            if (oneLineOnly && bound && (line1Overflows || boxW < 200) && firstLineY !== null && gy > firstLineY + fs0 * 0.5) continue;
             if (oneLineOnly && reallyOverflows && boxW > 0 && gx + (g.advance ?? 0.6) * fs0 > boxW - dotsW) {
               truncated = true;
               continue;
