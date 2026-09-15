@@ -927,6 +927,7 @@ export function renderNodeSVG(
       if (sibFill && !/^#6a41c9$/i.test(sibFill)) return { kind: "Add", color: sibFill, listCtx: hint?.listCtx };
       return { kind: hint?.listCtx ? "Add" : undefined, color: "#6A7187", listCtx: hint?.listCtx };
     }
+    if (/button\.dropdown/i.test(cname)) return { color: "#6A7187", listCtx: hint?.listCtx };
     if (/Add condition/i.test(cname)) return { kind: "Add", color: "#6A41C9" };
     return undefined;
   };
@@ -1545,7 +1546,7 @@ export function renderNodeSVG(
           // status icons (success toast checkmark) take the state color —
           // the tint survives only to the checkmark, not to the close button
           successCtx = /Type=Success/i.test(`${n.name ?? ""} ${fig.nodes.get(symId0Of(n) ?? "")?.name ?? ""}`);
-          if (successCtx) childTint = "#0AC256";
+          if (successCtx) childTint = "#23C867";
           if (symId) {
             childOverrideMap = buildSlotMap(n, symId, { dir: node, inheritedAssigns: new Map([...(dir?.assigns ?? [])]) });
             if (node) childDir = node;
@@ -1701,6 +1702,7 @@ export function renderNodeSVG(
             const childIsIcon =
               /^(Icon|Logo|Dismiss|Search|Search Icon|Chevron Icon|Icon Button|Icon Container|Panel Left Contract|Checkmark Circle|Shape|Vector)$/i.test(knName) ||
               /menubutton/i.test(knName) ||
+              /^Frame \d+$/i.test(knName) ||
               !!nodeSymbolRef(kn ?? {});
             // an already-tinted context (icon inside a color-inheriting slot)
             // flows all the way down to the vector paths
@@ -1708,7 +1710,7 @@ export function renderNodeSVG(
             if (process.env.FIGMA_TRACE_TINT && childIsIcon && passTint) {
               console.error(`[tint] ${knName} @(${r(mat[4])},${r(mat[5])}) via=${n.name} tint=${passTint}`);
             }
-            if (successCtx) passTint = /checkmark/i.test(knName) ? "#0AC256" : undefined;
+            if (successCtx) passTint = /checkmark/i.test(knName) ? "#23C867" : undefined;
             childrenSvg += walk(kid, depth + 1, false, childOverrideMap ?? overrideMap, kidDir, w, childHint, mulM(mat, nodeMat(kn ?? {})), n.stackMode, passTint);
           }
         }
