@@ -477,8 +477,18 @@ async function runParseLocalFig(args: unknown[], cwd = process.cwd()): Promise<T
       );
     }
     if (matches.length > 1) {
-      const list = matches.map((c) => `  - "${c.fileName}" (exported ${c.meta?.exported_at ?? "?"}) → ${c.path}`).join("\n");
-      return textResult(`multiple local .fig files match "${parsedUrl.slug}". Ask the user which one:\n${list}`);
+      // copies of the SAME design (e.g. Downloads + a project's export root)
+      // must not block: newest wins. Different names still ask the user.
+      const names = new Set(matches.map((c) => c.meta?.file_name ?? c.fileName));
+      if (names.size === 1) {
+        matches.sort((a, b) => (b.mtimeMs ?? 0) - (a.mtimeMs ?? 0));
+        figPath = matches[0].path;
+        urlMeta = matches[0].meta;
+        matchedBy = `newest of ${matches.length} same-file copies`;
+      } else {
+        const list = matches.map((c) => `  - "${c.fileName}" (exported ${c.meta?.exported_at ?? "?"}) → ${c.path}`).join("\n");
+        return textResult(`multiple local .fig files match "${parsedUrl.slug}". Ask the user which one:\n${list}`);
+      }
     }
     figPath = matches[0].path;
     urlMeta = matches[0].meta;
