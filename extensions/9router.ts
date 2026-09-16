@@ -317,6 +317,11 @@ export const KNOWN_COMBOS: Record<string, { name: string; contextWindow: number;
     contextWindow: 1000000,
     maxTokens: 128000,
   },
+  "smartmode-shared": {
+    name: "smartmode-shared (combo: muse-spark-1.3-contributor-free → muse-spark-1.3-contributor → smartmode)",
+    contextWindow: 1000000,
+    maxTokens: 131072,
+  },
 };
 
 export function transformToPiModel(item: RemoteModelItem): PiModelDef {
