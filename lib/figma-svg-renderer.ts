@@ -396,7 +396,9 @@ function mergeDirChildren(anc: Map<string, DirNode>, own: Map<string, DirNode>):
       for (const [gk, gv] of o.textByKey) {
         if (!textByKey.has(gk)) textByKey.set(gk, gv);
       }
-      out.set(k, { swapSym: a.swapSym ?? o.swapSym, assigns: new Map([...o.assigns, ...a.assigns]), textByKey, textChars: a.textChars, children: mergeDirChildren(a.children, o.children) });
+      const compChars = new Map(o.compChars);
+      for (const [gk, gv] of a.compChars) if (!compChars.has(gk)) compChars.set(gk, gv);
+      out.set(k, { swapSym: a.swapSym ?? o.swapSym, assigns: new Map([...o.assigns, ...a.assigns]), textByKey, textChars: a.textChars, compChars, children: mergeDirChildren(a.children, o.children) });
     } else {
       out.set(k, (a ?? o)!);
     }
@@ -683,7 +685,7 @@ export function renderNodeSVG(
             nodeX: k.transform?.m02 ?? 0,
             bottom: kTy + (k.size?.y ?? 0),
             order: order++,
-            okey: okeyOf(k),
+            okey: okeyOf(k) ?? kid,
             ancKey: null,
             textRef: nodeTextRef(k),
             visRefs: nodeVisibleRefs(k),
@@ -984,7 +986,7 @@ export function renderNodeSVG(
     const extOf = (cn: any): number => {
       extCal = false;
 
-      const merged = mergeDir(childDirOf(ancDir, okeyOf(cn)), buildDirectiveTree(cn));
+      const merged = mergeDir(childDirOf(ancDir, okeyOf(cn) ?? guidStr(cn.guid)), buildDirectiveTree(cn));
       const symId2 = merged?.swapSym && fig.nodes.has(merged.swapSym) ? merged.swapSym : guidStr(cn.symbolData?.symbolID);
       if (!symId2) return 0;
       // measure with the instance's OWN derived runs only — ancestor-composed
@@ -1015,6 +1017,11 @@ export function renderNodeSVG(
     const estimateW = (fid: string): number => {
       const f = fig.nodes.get(fid);
       if (!f?.stackMode) return f?.size?.x ?? 0;
+      // a stack container with FIXED sizing never hugs its children — they
+      // overflow and clip (the intent card's FIXED-width row with an
+      // overflowing scrollbar; growing it shoved the whole card off-canvas)
+      const wSizing = f.stackMode === "HORIZONTAL" ? f.stackPrimarySizing : (f.stackCounterSizing ?? f.stackPrimarySizing);
+      if (wSizing === "FIXED") return f.size?.x ?? 0;
       const kids2 = fig.kidsOf.get(fid) ?? [];
       if (!kids2.length) return f.size?.x ?? 0;
       let sum = 0;
@@ -1038,7 +1045,7 @@ export function renderNodeSVG(
     };
     const items: { cn: any; w: number; h: number; bakedW: number; flowW?: number; growW?: number }[] = [];
     const boundTextW = (cn: any): number => {
-      const key = okeyOf(cn);
+      const key = okeyOf(cn) ?? guidStr(cn.guid);
       const merged = mergeDir(childDirOf(ancDir, key), buildDirectiveTree(cn));
       let ext = 0;
       for (const run of merged?.textByKey.values() ?? []) {
@@ -1080,7 +1087,8 @@ export function renderNodeSVG(
           w = extCal ? cand : Math.max(bakedW, cand);
         }
       } else if (cn.stackMode) {
-        w = Math.max(bakedW, estimateW(kid));
+        const cSizing = cn.stackMode === "HORIZONTAL" ? cn.stackPrimarySizing : (cn.stackCounterSizing ?? cn.stackPrimarySizing);
+        w = cSizing === "FIXED" ? bakedW : Math.max(bakedW, estimateW(kid));
       } else {
         // plain frame: simulate its children flowing with their baked gaps
         const kids2 = (fig.kidsOf.get(kid) ?? []).map((k2) => fig.nodes.get(k2)).filter(Boolean) as any[];
@@ -1532,7 +1540,7 @@ export function renderNodeSVG(
           // (e.g. stale clear ✕ inside non-clearable variants) → hidden
           const visRefs = nodeVisibleRefs(n);
           if (visRefs.some((r) => dir?.assigns.get(r)?.bool === false)) return "";
-          const okey = okeyOf(n);
+          const okey = okeyOf(n) ?? guidStr(n.guid);
           const ancNode = childDirOf(dir, okey);
           const ownTree = buildDirectiveTree(n);
           const node = mergeDir(ancNode, ownTree);

@@ -10,7 +10,7 @@ const d = parseFig(new Uint8Array(readFileSync(FIG)));
 const fig = mergeNodeChanges(d.message.nodeChanges ?? []);
 console.log('nodes:', fig.nodes.size);
 const fontsDir = path.resolve('fonts');
-const ids = ['24112:19639','28097:11351','16201:5144','16201:7166','17538:12052','24112:19322'];
+const ids = ['24112:19639','28097:11351','16201:5144','16201:7325','17538:12052','24112:19322'];
 for (const id of ids) {
   const n = fig.nodes.get(id);
   if (!n) { console.log(id, '-> NOT FOUND'); continue; }
