@@ -1169,13 +1169,45 @@ export function renderNodeSVG(
     }
     const centerRow = horiz && comp.stackPrimaryAlignItems === "CENTER";
     const changed = items.some((it) => Math.abs(it.w - it.bakedW) > 2);
+    // Figma WRAP containers (vertical stack, items wrapped into rows): a row
+    // overflowing the container by >10% means layoutWrap=FILL — items shrink
+    // to the wrap width and re-flow (the customer-info card's 3-col rows:
+    // baked 264 -> (688-48-32)/3 = 202.67, exactly what the app renders).
+    // Mild overflows (the key-customer card, +7%) keep baked positions.
+    let wrapFill = false;
+    const wrapX = new Map<any, number>();
+    if (!horiz && W > 0) {
+      const rowKeys: number[] = [];
+      const rowMap = new Map<number, typeof items>();
+      for (const it of items) {
+        const y = it.cn.transform?.m12 ?? 0;
+        let k = rowKeys.find((rk) => Math.abs(rk - y) <= 2);
+        if (k === undefined) { k = y; rowKeys.push(k); }
+        if (!rowMap.has(k)) rowMap.set(k, []);
+        rowMap.get(k)!.push(it);
+      }
+      for (const [, row] of rowMap) {
+        if (row.length < 2) continue;
+        const rowRight = Math.max(...row.map((it) => (it.cn.transform?.m02 ?? 0) + it.w));
+        if (rowRight - (W - padMain) <= W * 0.1) continue;
+        const n = row.length;
+        const itemW = (W - padMain * 2 - spacing * (n - 1)) / n;
+        if (itemW <= 10) continue;
+        row.sort((a, b) => (a.cn.transform?.m02 ?? 0) - (b.cn.transform?.m02 ?? 0));
+        row.forEach((it, i) => {
+          it.w = itemW;
+          wrapX.set(it.cn, padMain + i * (itemW + spacing));
+        });
+        wrapFill = true;
+      }
+    }
     if (process.env.FIGMA_TRACE_STACK2) {
       console.error(`[st2] ${comp.name} horiz=${horiz} items=${items.map((it) => `${it.cn.name}[${it.cn.type}]:w${it.w}/b${it.bakedW}/f${it.flowW ?? "-"}@${r(horiz ? it.cn.transform?.m02 ?? 0 : it.cn.transform?.m12 ?? 0)}`).join(" ")} spacing=${spacing} pad=${padMain} main=${main}`);
     }
     if (process.env.FIGMA_TRACE_STACK) {
       console.error(`[stack] comp=${comp.name} compId=${compId} horiz=${horiz} W=${W} H=${H} main=${main} items=${items.map((it) => `${it.cn.name}:${it.w}/${it.bakedW}`).join(",")} overflow=${overflow} between=${between} vBetween=${vBetween} centerRow=${centerRow}`);
     }
-    if (!(overflow || (between && items.length === 2) || vBetween || (centerRow && changed) || staleTextFlow || stretchPin || growFlow)) return;
+    if (!(overflow || (between && items.length === 2) || vBetween || (centerRow && changed) || staleTextFlow || stretchPin || growFlow || wrapFill)) return;
     let p = staleTextFlow
       ? Math.max(padMain, horiz ? items[0].cn.transform?.m02 ?? padMain : items[0].cn.transform?.m12 ?? padMain)
       : padMain;
@@ -1207,7 +1239,7 @@ export function renderNodeSVG(
       // not counter-centering)
       it.cn.transform = horiz
         ? { ...t, m02: keepX, m12: centerRow && changed ? (t.m12 ?? cross) : cross }
-        : { ...t, m12: pos, m02: cross };
+        : { ...t, m12: pos, m02: wrapX.has(it.cn) ? wrapX.get(it.cn)! : cross };
       if (it.cn.type !== "TEXT" && Math.abs(it.w - it.bakedW) > 2 && it.cn.size) it.cn.size = { ...it.cn.size, x: it.w };
       p = pos + (staleTextFlow ? it.flowW ?? it.w : it.w) + spacing;
     });

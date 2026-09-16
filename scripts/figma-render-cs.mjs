@@ -1,9 +1,9 @@
 import { parseFig } from 'openfig-core';
 import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
-const { mergeNodeChanges, resolveSubtree, guidStr } = await import('./lib/figma-instance-resolver.ts');
-const { renderNodeSVG } = await import('./lib/figma-svg-renderer.ts');
-const FIG = '/Users/rattanarit.prasomsab/Downloads/[SONIC] Customer (Service).fig';
+const { mergeNodeChanges, resolveSubtree, guidStr } = await import('../lib/figma-instance-resolver.ts');
+const { renderNodeSVG } = await import('../lib/figma-svg-renderer.ts');
+const FIG = '/Users/rattanarit.prasomsab/Sonic/.pi/figma-exports/[SONIC] Customer (Service).fig';
 const OUT = '.pi/figma-exports/fig-_SONIC_Customer_Service/render';
 mkdirSync(OUT, { recursive: true });
 const d = parseFig(new Uint8Array(readFileSync(FIG)));
