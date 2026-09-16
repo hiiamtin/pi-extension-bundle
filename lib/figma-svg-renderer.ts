@@ -231,6 +231,21 @@ const okeyOf = (n: RawChange): string | null => {
   const o = n.overrideKey;
   return o ? `${o.sessionID}:${o.localID}` : null;
 };
+// Session-agnostic key matching: override chains recorded in one edit session
+// can reference nodes recreated in another (guidPath sessionIDs != the child
+// node's sessionID — the CS file's nodes were edited across many sessions),
+// so an exact `session:local` miss falls back to localID equality.
+const localKey = (k: string): string => k.split(":")[1] ?? k;
+const mapGetL = <T,>(m: Map<string, T> | undefined, key: string | null | undefined): T | undefined => {
+  if (!m || !key) return undefined;
+  const hit = m.get(key);
+  if (hit !== undefined) return hit;
+  const lk = localKey(key);
+  for (const [k, v] of m) if (localKey(k) === lk) return v;
+  return undefined;
+};
+const childDirOf = (d: DirNode | undefined, okey: string | null | undefined): DirNode | undefined =>
+  d && okey ? d.children.get(okey) ?? mapGetL(d.children, okey) : undefined;
 
 /**
  * Directive tree for one instance: symbolOverrides / derivedSymbolData paths
@@ -715,7 +730,7 @@ export function renderNodeSVG(
       if (ancText.size) {
         for (const sl of slots) {
           if (!sl.okey || locked.has(sl.id)) continue;
-          const hit = ancText.get(sl.okey);
+          const hit = mapGetL(ancText, sl.okey);
           const run = hit?.gv;
           if (run?.length) {
             locked.add(sl.id);
@@ -728,7 +743,7 @@ export function renderNodeSVG(
     // (must run AFTER binding: extOf deliberately blanks textByKey)
     if (ancChars.size) {
       for (const sl of slots) {
-        const chars = ancChars.get(sl.okey ?? "");
+        const chars = mapGetL(ancChars, sl.okey);
         if (!chars) continue;
         const cur = boundBySlot.get(sl.id);
         if (cur) {
@@ -969,7 +984,7 @@ export function renderNodeSVG(
     const extOf = (cn: any): number => {
       extCal = false;
 
-      const merged = mergeDir(ancDir?.children.get(okeyOf(cn) ?? ""), buildDirectiveTree(cn));
+      const merged = mergeDir(childDirOf(ancDir, okeyOf(cn)), buildDirectiveTree(cn));
       const symId2 = merged?.swapSym && fig.nodes.has(merged.swapSym) ? merged.swapSym : guidStr(cn.symbolData?.symbolID);
       if (!symId2) return 0;
       // measure with the instance's OWN derived runs only — ancestor-composed
@@ -1024,13 +1039,13 @@ export function renderNodeSVG(
     const items: { cn: any; w: number; h: number; bakedW: number; flowW?: number; growW?: number }[] = [];
     const boundTextW = (cn: any): number => {
       const key = okeyOf(cn);
-      const merged = mergeDir(ancDir?.children.get(key ?? ""), buildDirectiveTree(cn));
+      const merged = mergeDir(childDirOf(ancDir, key), buildDirectiveTree(cn));
       let ext = 0;
       for (const run of merged?.textByKey.values() ?? []) {
         for (const gg of run) ext = Math.max(ext, (gg.position?.x ?? 0) + (gg.fontSize ?? cn.fontSize ?? 16) * 0.6);
       }
       if (ext > 0) return ext;
-      const chars = key ? merged?.textChars.get(key) : undefined;
+      const chars = key ? mapGetL(merged?.textChars, key) : undefined;
       if (chars) return textWidthEst(chars, cn.fontSize ?? 16);
       // prop-text slots carry no glyph run — read the component property
       const tref = nodeTextRef(cn);
@@ -1518,7 +1533,7 @@ export function renderNodeSVG(
           const visRefs = nodeVisibleRefs(n);
           if (visRefs.some((r) => dir?.assigns.get(r)?.bool === false)) return "";
           const okey = okeyOf(n);
-          const ancNode = dir?.children.get(okey ?? "");
+          const ancNode = childDirOf(dir, okey);
           const ownTree = buildDirectiveTree(n);
           const node = mergeDir(ancNode, ownTree);
           // inherit ancestor text runs not addressed by THIS node's own key
