@@ -504,10 +504,15 @@ function updateContext(meta: RunMeta, event: Record<string, any>): void {
     : typeof event.responseModel === "string"
       ? event.responseModel
       : typeof event.message?.model === "string" ? event.message.model : undefined;
-  const model = responseModel || meta.model;
-  const window = contextWindowForModel(model) ?? contextWindowForModel(meta.model);
+  // Prefer the session model's window — that is what the child's
+  // auto-compaction threshold is computed against (AgentSession compacts at
+  // contextWindow - reserveTokens of the session model, regardless of which
+  // router member served the request). responseModel windows are unreliable
+  // for combos: member labels don't match what actually serves, and observed
+  // usage can already exceed the member's nominal window.
+  const window = contextWindowForModel(meta.model) ?? contextWindowForModel(responseModel);
   if (!window) return;
-  meta.context = { tokens, window, percent: (tokens / window) * 100, model };
+  meta.context = { tokens, window, percent: (tokens / window) * 100, model: meta.model ?? responseModel };
 }
 
 function formatContext(stats?: ContextStats, detailed = false): string {

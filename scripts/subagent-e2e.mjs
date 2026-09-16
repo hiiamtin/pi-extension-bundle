@@ -23,7 +23,10 @@ mkdirSync(path.join(agentDir, "npm", "node_modules", "pi-mcp-adapter"), { recurs
 mkdirSync(stateDir, { recursive: true });
 writeFileSync(
   path.join(agentDir, "agents", "scout.md"),
-  `---\nname: scout\ndescription: Read-only codebase recon. # delegation summary\nmodel: fake/fake-model\ntools:\n  - read\n  - grep\nextensions:\n  - code-search\nskills: []\ntimeout: 10\n---\n\nReturn compressed findings.\n`,
+  // Session model resolves via capabilities (base "kimi-k3" → 1,048,576) while the
+// fake child reports responseModel "gpt-5.6-luna" (400k) — the run context must
+// reflect the SESSION model's window, matching what auto-compaction uses.
+  `---\nname: scout\ndescription: Read-only codebase recon. # delegation summary\nmodel: fake/kimi-k3\ntools:\n  - read\n  - grep\nextensions:\n  - code-search\nskills: []\ntimeout: 10\n---\n\nReturn compressed findings.\n`,
 );
 writeFileSync(
   path.join(agentDir, "agents", "slow.md"),
@@ -140,7 +143,7 @@ assert.equal(result.isError, undefined);
 assert(result.details?.run?.id, "result must expose a run id");
 assert.equal(result.details.run.agent, "scout");
 assert.equal(result.details.run.state, "done");
-assert.deepEqual(result.details.run.context, { tokens: 115, window: 400000, percent: 115 / 400000 * 100, model: "gpt-5.6-luna" }, "run must expose latest prompt context usage");
+assert.deepEqual(result.details.run.context, { tokens: 115, window: 1048576, percent: 115 / 1048576 * 100, model: "fake/kimi-k3" }, "run context must use the session model's window (compaction threshold), not the responseModel's");
 assert.equal(result.details.run.usage.input, 101);
 assert.equal(result.details.run.usage.cost, 0.033);
 assert.equal(result.usage.input, 101);
@@ -170,7 +173,7 @@ assert(spawn.args.includes("--no-prompt-templates"));
 assert(spawn.args.includes("--no-themes"));
 assert(spawn.args.includes("--tools"));
 assert(spawn.args.includes("read,grep"));
-assert.equal(spawn.args[spawn.args.indexOf("--model") + 1], "fake/fake-model");
+assert.equal(spawn.args[spawn.args.indexOf("--model") + 1], "fake/kimi-k3");
 assert(spawn.args.includes("-e"));
 assert(spawn.args.some((arg) => arg.endsWith("/extensions/code-search.ts")));
 assert.equal(spawn.args.at(-1), "Task: find auth");
