@@ -14,8 +14,9 @@
 //   - No tool executor exists: provider.streamSimple() only completes text.
 //     A tool_call in the response cannot execute; we surface a notice instead.
 //
-// Modes: tui → fullscreen overlay (streaming, Esc abort, follow-up composer
-// via ui.input); rpc (pi-web) → answer via ui.notify, resume via ui.select,
+// Modes: tui → docked streaming panel (row-capped + internally scrollable,
+// Esc abort, follow-up via ui.input); rpc (pi-web) → answer via ui.notify,
+// resume via ui.select,
 // "/btw <q>" continues the latest thread; json/print → guarded no-op.
 //
 // Session purity: nothing is ever appended to the session file.
@@ -40,7 +41,7 @@ import type {
 	SimpleStreamOptions,
 	Tool,
 } from "@earendil-works/pi-ai";
-import { type Component, Key, matchesKey, type TUI } from "@earendil-works/pi-tui";
+import { type Component, Key, matchesKey, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -412,7 +413,9 @@ function describeUsage(response: AssistantMessage): string {
 }
 
 // ---------------------------------------------------------------------------
-// TUI streaming view (minimal component: header + streamed text, Esc aborts)
+// TUI streaming view — docks where the editor is, so the body is row-capped
+// and scrolls internally (same shape as the subagent viewer). An unbounded
+// body used to push the main chat out of the viewport entirely.
 // ---------------------------------------------------------------------------
 
 function wrapText(text: string, width: number): string[] {
@@ -437,10 +440,20 @@ function wrapText(text: string, width: number): string[] {
 	return lines;
 }
 
+// Body rows adapt to the terminal but stay well under it so the transcript
+// above keeps room; clamped for tiny and huge terminals.
+function bodyRowBudget(rows: number): number {
+	const safe = Number.isFinite(rows) && rows > 0 ? rows : 24;
+	return Math.max(6, Math.min(20, Math.floor(safe * 0.5) - 3));
+}
+
 class BtwStreamView implements Component {
 	private text = "";
 	private phase: "streaming" | "done" | "aborted" | "error" = "streaming";
 	private note = "";
+	private scrollTop = 0;
+	private follow = true; // stick to the tail while streaming
+	private lastMax = 0; // refreshed every render; scroll keys clamp against it
 	private readonly tui: TUI;
 	private readonly theme: Theme;
 	private readonly question: string;
@@ -472,29 +485,93 @@ class BtwStreamView implements Component {
 		this.tui.requestRender();
 	}
 
-	handleInput(data: string): void {
-		if (!matchesKey(data, Key.escape)) return;
-		if (this.phase === "streaming") this.onAbort();
-		else this.onClose();
+	// Terminal rows can change between renders; re-read so resize is respected.
+	private rows(): number {
+		const terminal = (this.tui as unknown as { terminal?: { rows?: number } } | undefined)?.terminal;
+		return bodyRowBudget(Number(terminal?.rows ?? 0));
 	}
 
+	private bodyLines(width: number): string[] {
+		if (this.phase === "error") return wrapText(this.note || "(error)", width);
+		if (this.text) return wrapText(this.text, width);
+		return [this.phase === "streaming" ? "…" : "(no text)"];
+	}
+
+	// pi hands focused components the raw input string ("j" is literally "j",
+	// legacy arrows are "\x1b[A"…). Key identity must go through matchesKey():
+	// under the Kitty keyboard protocol Escape arrives as a CSI-u sequence
+	// ("\x1b[27u"), NOT a bare byte.
+	handleInput = (raw: unknown): boolean => {
+		const data =
+			typeof raw === "string"
+				? raw
+				: String((raw as { sequence?: string; name?: string } | undefined)?.sequence ?? (raw as { name?: string } | undefined)?.name ?? "");
+		if (matchesKey(data, Key.escape)) {
+			if (this.phase === "streaming") this.onAbort();
+			else this.onClose();
+			return true;
+		}
+		const rows = this.rows();
+		const max = this.lastMax;
+		if (data === "j" || matchesKey(data, Key.down)) {
+			this.follow = false;
+			this.scrollTop = Math.min(max, this.scrollTop + 1);
+		} else if (data === "k" || matchesKey(data, Key.up)) {
+			this.follow = false;
+			this.scrollTop = Math.max(0, this.scrollTop - 1);
+		} else if (matchesKey(data, Key.pageDown) || data === "\x1b[6~" || data === " ") {
+			this.follow = false;
+			this.scrollTop = Math.min(max, this.scrollTop + rows);
+		} else if (matchesKey(data, Key.pageUp) || data === "\x1b[5~") {
+			this.follow = false;
+			this.scrollTop = Math.max(0, this.scrollTop - rows);
+		} else if (data === "g" || matchesKey(data, Key.home) || data === "\x1b[H") {
+			this.follow = false;
+			this.scrollTop = 0;
+		} else if (data === "G" || matchesKey(data, Key.end) || data === "\x1b[F") {
+			this.follow = true;
+			this.scrollTop = max;
+		} else {
+			return false; // unhandled — let pi's default handling see it
+		}
+		this.tui.requestRender();
+		return true;
+	};
+
 	render(width: number): string[] {
-		const header =
+		const rows = this.rows();
+		const body = this.bodyLines(width);
+		const max = Math.max(0, body.length - rows);
+		this.lastMax = max;
+		if (this.follow) this.scrollTop = max;
+		this.scrollTop = Math.max(0, Math.min(this.scrollTop, max));
+		const visible = body.slice(this.scrollTop, this.scrollTop + rows);
+		while (visible.length < rows) visible.push("");
+
+		const title =
 			this.phase === "streaming"
-				? "btw · thinking…  (esc to cancel)"
+				? "btw · thinking…"
 				: this.phase === "aborted"
-					? "btw · cancelled  (esc to close)"
+					? "btw · cancelled"
 					: this.phase === "error"
-						? "btw · error  (esc to close)"
-						: "btw · done  (esc to close / continue)";
-		const lines = [this.theme.fg("accent", header), this.theme.fg("dim", `Q: ${this.question}`), ""];
-		const body =
-			this.phase === "error"
-				? this.note
-				: this.text || (this.phase === "streaming" ? "…" : "(no text)");
-		for (const line of wrapText(body, width)) lines.push(line);
-		if (this.note && this.phase === "done") lines.push("", this.theme.fg("dim", this.note));
-		return lines;
+						? "btw · error"
+						: "btw · done";
+		const usage = this.note && this.phase === "done" ? this.theme.fg("dim", `  ${this.note}`) : "";
+		const position = max > 0
+			? this.theme.fg("dim", `  ${this.scrollTop + 1}-${Math.min(body.length, this.scrollTop + rows)}/${body.length}${this.follow ? " ↓tail" : ""}`)
+			: "";
+		const hint = this.follow ? "↑↓/jk scroll · g/G ends" : "G back to tail · g top";
+		return [
+			truncateToWidth(this.theme.fg("accent", title) + usage + position, width),
+			truncateToWidth(this.theme.fg("dim", `Q: ${this.question}`), width),
+			"",
+			...visible.map((line) => truncateToWidth(line, width)),
+			"",
+			truncateToWidth(
+				this.theme.fg("dim", `${this.phase === "streaming" ? "esc cancel" : "esc close / continue"} · ${hint}`),
+				width,
+			),
+		];
 	}
 }
 
@@ -918,4 +995,6 @@ export default function btwExtension(pi: ExtensionAPI) {
 	});
 }
 
-export { btwExtension };
+// BtwStreamView is exported for the UI regression test (scroll windowing +
+// row cap); keep it a pure component (no session/provider access).
+export { btwExtension, BtwStreamView, bodyRowBudget };

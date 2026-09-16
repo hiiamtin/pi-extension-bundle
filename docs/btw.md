@@ -24,7 +24,7 @@ loop is: edit → `/reload`. No new repo, no publishing step. pi-web shares
 ## 1. Goal
 
 A `/btw <question>` command: ask a quick side question **while the main agent is
-working (or right after a turn)** and get an answer in an overlay — without the
+working (or right after a turn)** and get an answer in a docked panel — without the
 question or answer ever entering the main conversation history.
 
 Non-goals (v1):
@@ -45,7 +45,7 @@ Non-goals (v1):
 - **Full tool schema is still sent to the API** (only execution is denied).
 - Injects a `<system-reminder>` after the question: no tools, one-off, never
   promise actions.
-- One-shot only (no follow-ups), uses the main model, overlay UI.
+- One-shot only (no follow-ups), uses the main model, docked panel UI.
 - `querySource`/`forkLabel: "side_question"` for telemetry.
 
 ### 2.2 `@narumitw/pi-btw` (npm, source read)
@@ -121,7 +121,7 @@ which also lets side-thread follow-ups cache-hit their own first turn.
 | D4 | Model / thinking | Default = current model + current thinking level. Settings overrides: `model: "provider/id"`, `thinkingLevel`. Validate credentials via `getApiKeyAndHeaders`, fall back gracefully; clamp level with `getSupportedThinkingLevels(model)` |
 | D5 | Follow-ups & threads | Yes. In-memory side threads (Map on the extension instance — pi rebuilds instances on session switch/reload, so threads are per-session by design). `/btw <question>` always **starts a new thread**; follow-ups go through the composer inside the thread; bare `/btw` opens a **resume menu** (newest first, pick manually — never auto-resume). First turn writes cache (+25% on suffix), follow-ups read it |
 | D6 | System prompt source | Capture the assembled prompt from the `before_agent_start` event (store on the extension instance). Fallback: rebuild via `getSystemPromptOptions()`. If the session never ran a request, proceed with rebuilt prompt + empty/short history |
-| D7 | UI | Mode split: `tui` → `ctx.ui.custom` fullscreen overlay (streaming answer, Esc abort, follow-up via `ui.input`); `rpc` (pi-web) → **persistent answer panel via `ui.setWidget`** (pi-web notify is a 5s auto-dismiss toast — unusable for long answers; widget dismissed via `/btw clear` or replaced by the next answer), resume via `ui.select`; `json`/`print` → guarded no-op |
+| D7 | UI | Mode split: `tui` → `ctx.ui.custom` **docked streaming panel** — the body is row-capped (`bodyRowBudget`: half the terminal, clamped 6–20 rows) and scrolls internally (↑↓/jk, PgUp/PgDn, g/G, follow-tail while streaming), so a long answer never pushes the main chat out of the viewport, Esc aborts, follow-up via `ui.input`; `rpc` (pi-web) → **persistent answer panel via `ui.setWidget`** (pi-web notify is a 5s auto-dismiss toast — unusable for long answers; widget dismissed via `/btw clear` or replaced by the next answer), resume via `ui.select`; `json`/`print` → guarded no-op |
 | D8 | Session purity | Zero writes to the session file. Nothing appended, nothing forked on disk. `/btw` traffic must not change session size |
 | D9 | "Bring to main" | **Implemented (v1.1)**: `/btw bring [latest\|all]` — formats Q&A (scope menu when bare) and appends to the main editor via `ui.getEditorText()`/`ui.setEditorText()` (sets directly when empty). Explicit user submit; no auto-send. Works in tui + rpc (both support editor text) |
 
@@ -204,7 +204,8 @@ opt/tintin/pi-extensions/
 ├── extensions/
 │   └── btw.ts                 registerCommand("btw"), thread registry,
 │                              context capture, message assembly, streamSimple
-│                              call, overlay UI (single file, bundle convention)
+│                              call, docked scrollable panel UI (single file,
+│                              bundle convention)
 └── lib/
     └── (only if btw.ts outgrows one file)
 ```
@@ -234,6 +235,7 @@ bring-to-main, text-range selector, and per-screen menu framework).
 | TTL expiry (asked >5 min after last main request) | One full-price call, then warm again. Acceptable |
 | Session replacement / extension reload | Thread Map resets (documented pi behavior); /btw degrades to fresh thread, never crashes |
 | Abort mid-stream | AbortSignal wired to view Esc; partial text discarded, thread turn not recorded |
+| Very long answer | Body window is row-capped and scrolls internally (↑↓/jk, PgUp/PgDn, g/G, follow-tail while streaming). The rendered frame never grows with the answer, so the main chat keeps its viewport instead of being pushed off-screen |
 | Cost display | Render from `usage` (cacheRead/cacheWrite/input/output) so savings are visible |
 
 ---
@@ -247,7 +249,10 @@ bring-to-main, text-range selector, and per-screen menu framework).
    and assert `tools`/`system`/`messages` are byte-identical to the main thread's
    last request; assert response `usage.cacheRead > 0` for same-model side query
    within TTL; assert follow-up reads cache.
-3. **Manual**: session file size unchanged after `/btw`; abort mid-stream;
+3. **UI regression** (no network): `node scripts/btw-view-e2e.mjs`
+   drives `BtwStreamView` with a fake TUI — row cap, follow-tail, scroll keys,
+   Esc semantics per phase, resize, and stable frame height.
+4. **Manual**: session file size unchanged after `/btw`; abort mid-stream;
    model fallback when configured model lacks credentials; resume menu after
    in-session reload; empty-session `/btw`.
 
@@ -275,7 +280,8 @@ Resolved 2025 (user-confirmed):
    assert prefix byte-identical to the main thread's last request and
    `usage.cacheRead > 0`) before adding any test runner.
 7. **Web/pi-web**: **/ext-style mode split** — one core, UI layer by mode:
-   `tui` → full overlay (streaming, composer, resume menu); `rpc` (pi-web) →
+   `tui` → docked scrollable panel (streaming, follow-up composer, resume
+   menu); `rpc` (pi-web) →
    answer via `ctx.ui.notify`, resume via `ctx.ui.select` (dialogs work in RPC),
    and in rpc mode `/btw <q>` continues the latest thread if one exists so
    follow-ups work without a persistent composer; `json`/`print` → guard + error.
